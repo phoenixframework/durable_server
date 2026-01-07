@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(mix test:*)",
+      "Bash(notify \"Testing notification system\" --continue)"
+    ]
+  }
+}
