@@ -690,15 +690,15 @@ defmodule DurableServer do
       #
       #   def code_change(1, old_state, 2) do
       #     # Migrate from v1 to v2
-      #     Map.put(old_state, :new_field, "default")
+      #     {:ok, Map.put(old_state, :new_field, "default")}
       #   end
       #
       #   def code_change(_, state, _) do
       #     # No migration for other versions
-      #     state
+      #     {:ok, state}
       #   end
       def code_change(_old_vsn, state, _new_vsn) do
-        state
+        {:ok, state}
       end
 
       defoverridable handle_call: 3,
@@ -1790,7 +1790,7 @@ defmodule DurableServer do
         "[DurableServer] Hot upgrade: #{state.key} migrating from v#{inspect(state.vsn)} to v#{inspect(current_vsn)}"
       )
 
-      new_user_state = state.module.code_change(state.vsn, state.user_state, current_vsn)
+      {:ok, new_user_state} = state.module.code_change(state.vsn, state.user_state, current_vsn)
 
       %{state | vsn: current_vsn, old_vsn: state.vsn, user_state: new_user_state}
     end

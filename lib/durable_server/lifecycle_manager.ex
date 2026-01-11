@@ -425,6 +425,7 @@ defmodule DurableServer.LifecycleManager do
   def handle_call(:get_heartbeat_metrics, _from, %LifecycleManager{} = state) do
     resources = calculate_resource_map(state.supervisor_name)
     capacity = DurableServer.Supervisor.current_capacity(state.supervisor_name)
+    heartbeat_meta = resolve_heartbeat_meta(state.heartbeat_meta)
 
     metrics = %{
       node: Node.self(),
@@ -433,7 +434,8 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_interval_ms: state.heartbeat_interval_ms,
       deadline_ms: heartbeat_hard_deadline_ms(),
       resources: resources,
-      capacity: capacity
+      capacity: capacity,
+      heartbeat_meta: heartbeat_meta
     }
 
     {:reply, metrics, state}

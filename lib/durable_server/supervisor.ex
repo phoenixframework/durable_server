@@ -219,6 +219,24 @@ defmodule DurableServer.Supervisor do
   end
 
   @doc """
+  Gets all cluster nodes from the heartbeat cache with their heartbeat metadata.
+
+  Returns a map of node names to node info maps containing heartbeat_meta.
+
+  ## Examples
+
+      iex> get_cluster_nodes(MyApp.DurableSupervisor)
+      %{
+        "node1@host" => %{heartbeat_meta: %{"region" => "ord"}},
+        "node2@host" => %{heartbeat_meta: nil}
+      }
+
+  """
+  def get_cluster_nodes(supervisor_name) when is_atom(supervisor_name) do
+    LifecycleManager.get_cluster_nodes(supervisor_name)
+  end
+
+  @doc """
   Gets detailed information about a server from storage.
 
   Returns a rich map with server information regardless of whether the server
@@ -241,6 +259,7 @@ defmodule DurableServer.Supervisor do
     * `:node` - The node where the server last ran (from storage)
     * `:sticky_placement` - Current placement values (where it last ran)
     * `:sticky_placement_history` - History of placement changes (most recent first)
+    * `:crash_history` - List of crash entries (most recent first), each with `:timestamp` and `:reason`
     * `:user_state` - The raw user state (JSON decoded from storage)
     * `:pid` - PID if currently running, `nil` otherwise
     * `:running` - Boolean indicating if server is currently running
@@ -311,6 +330,7 @@ defmodule DurableServer.Supervisor do
           node: meta.node_str,
           sticky_placement: meta.sticky_placement,
           sticky_placement_history: meta.sticky_placement_history,
+          crash_history: meta.crash_history,
           user_state: user_state,
           pid: pid,
           running: running
@@ -320,6 +340,50 @@ defmodule DurableServer.Supervisor do
 
       {:error, _reason} ->
         {:error, :not_found}
+    end
+  end
+
+  @doc """
+  Streams server info for all servers in storage.
+
+  Returns a Stream that yields info maps for each server found in storage.
+  Failed fetches are filtered out. Excludes internal node metadata objects.
+
+  This is useful for admin dashboards that need to iterate over all servers
+  without loading everything into memory at once.
+
+  ## Examples
+
+      # Stream all servers
+      DurableServer.Supervisor.stream_all_server_info(MySup)
+      |> Enum.to_list()
+
+      # Stream only permanently crashed servers
+      DurableServer.Supervisor.stream_all_server_info(MySup)
+      |> Stream.filter(fn info -> info.status == :permanently_crashed end)
+      |> Enum.to_list()
+
+  """
+  def stream_all_server_info(sup_name) when is_atom(sup_name) do
+    alias DurableServer.ObjectStore
+    %{object_store: object_store, prefix: prefix} = __get_config__(sup_name)
+
+    case ObjectStore.list_objects(object_store, prefix) do
+      {:ok, %{keys: keys}} ->
+        keys
+        |> Stream.reject(fn %{key: key} -> String.contains?(key, "/__nodes/") end)
+        |> Stream.map(fn %{key: storage_key} ->
+          key = String.trim_leading(storage_key, prefix)
+          get_server_info(sup_name, key)
+        end)
+        |> Stream.filter(fn
+          {:ok, _info} -> true
+          _ -> false
+        end)
+        |> Stream.map(fn {:ok, info} -> info end)
+
+      {:error, _reason} ->
+        Stream.map([], & &1)
     end
   end
 
