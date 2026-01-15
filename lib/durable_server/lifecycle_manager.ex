@@ -751,24 +751,28 @@ defmodule DurableServer.LifecycleManager do
 
   def lookup_node_health(%{supervisor: supervisor_name, node_str: node_str})
       when is_atom(supervisor_name) and is_binary(node_str) do
-    %{heartbeat_interval_ms: heartbeat_interval_ms} =
-      DurableServer.Supervisor.__get_config__(supervisor_name)
-
+    # Handle race condition where this is called via RPC on a node that just joined
+    # but hasn't fully initialized its supervisor/ETS tables yet
     table_name = heartbeat_table_name(supervisor_name)
 
-    case :ets.lookup(table_name, node_str) do
-      [{^node_str, node_ref, timestamp, capacity, resources, _env_vars, _heartbeat_meta}] ->
-        current_time = System.system_time(:millisecond)
+    with %{heartbeat_interval_ms: heartbeat_interval_ms} <-
+           DurableServer.Supervisor.__get_config__(supervisor_name),
+         [{^node_str, node_ref, timestamp, capacity, resources, _env_vars, _heartbeat_meta}] <-
+           :ets.lookup(table_name, node_str) do
+      current_time = System.system_time(:millisecond)
 
-        if current_time - timestamp > heartbeat_interval_ms * 2 do
-          :stale
-        else
-          {:healthy, %{node_ref: node_ref, capacity: capacity, resources: resources}}
-        end
-
-      [] ->
-        :unknown
+      if current_time - timestamp > heartbeat_interval_ms * 2 do
+        :stale
+      else
+        {:healthy, %{node_ref: node_ref, capacity: capacity, resources: resources}}
+      end
+    else
+      # Config not ready, or node not found in heartbeat table
+      _ -> :unknown
     end
+  rescue
+    # ETS table doesn't exist yet (node still initializing)
+    ArgumentError -> :unknown
   end
 
   defp discover_and_restart_servers(%LifecycleManager{} = state) do

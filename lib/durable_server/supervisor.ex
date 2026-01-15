@@ -845,7 +845,18 @@ defmodule DurableServer.Supervisor do
           try_nodes(supervisor, child_spec, rest)
 
         {:error, other} ->
-          Logger.error("Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node")
+          case other do
+            {:already_started, _} ->
+              Logger.warning(
+                "Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node"
+              )
+
+            _ ->
+              Logger.error(
+                "Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node"
+              )
+          end
+
           try_nodes(supervisor, child_spec, rest)
       end
     catch
@@ -858,6 +869,11 @@ defmodule DurableServer.Supervisor do
         Logger.warning(
           "ERPC to #{inspect(node)} failed: #{inspect(erpc_reason)}, trying next node"
         )
+
+        try_nodes(supervisor, child_spec, rest)
+
+      :exit, {:exception, {:shutdown, _}} ->
+        Logger.warning("Node #{inspect(node)} is shutting down, trying next node")
 
         try_nodes(supervisor, child_spec, rest)
     end
