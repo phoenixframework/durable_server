@@ -135,6 +135,7 @@ defmodule DurableServer.Supervisor do
 
   @max_start_child_tries 10
   @default_ready_timeout 5_000
+  @shutdown_placement_attempt_wait_timeout :timer.seconds(1)
 
   @doc """
   Checks if the DurableServer.Supervisor is ready to handle requests.
@@ -816,11 +817,15 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp try_nodes(_supervisor, _child_spec, []) do
+  defp try_nodes(supervisor, child_spec, nodes) do
+    try_nodes(supervisor, child_spec, nodes, _shutdown_retries = 0)
+  end
+
+  defp try_nodes(_supervisor, _child_spec, [], _shutdown_retries) do
     {:error, {:capacity_limit, :all_placement_attempts_failed}}
   end
 
-  defp try_nodes(supervisor, {module, _init_arg} = child_spec, [node | rest]) do
+  defp try_nodes(supervisor, {module, _init_arg} = child_spec, [node | rest], shutdown_retries) do
     Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
 
     # NOTE: we MUST pass max_placement_retries: 0 to prevent recursive retry on the other side
@@ -842,7 +847,7 @@ defmodule DurableServer.Supervisor do
             "Node #{inspect(node)} also at capacity: #{inspect(reason)}, trying next node"
           )
 
-          try_nodes(supervisor, child_spec, rest)
+          try_nodes(supervisor, child_spec, rest, shutdown_retries)
 
         {:error, other} ->
           case other do
@@ -857,25 +862,47 @@ defmodule DurableServer.Supervisor do
               )
           end
 
-          try_nodes(supervisor, child_spec, rest)
+          try_nodes(supervisor, child_spec, rest, shutdown_retries)
       end
     catch
       :throw, {:error, :not_ready} ->
         Logger.warning("Node #{inspect(node)} not ready (still starting up), trying next node")
 
-        try_nodes(supervisor, child_spec, rest)
+        try_nodes(supervisor, child_spec, rest, shutdown_retries)
 
       :error, {:erpc, erpc_reason} ->
         Logger.warning(
           "ERPC to #{inspect(node)} failed: #{inspect(erpc_reason)}, trying next node"
         )
 
-        try_nodes(supervisor, child_spec, rest)
+        try_nodes(supervisor, child_spec, rest, shutdown_retries)
+
+      :exit, {:exception, {:shutdown, _}} when rest == [] and shutdown_retries < 1 ->
+        # All nodes exhausted due to shutdown - wait briefly and retry with fresh node list
+        Logger.warning(
+          "Node #{inspect(node)} is shutting down and no nodes left, waiting for cluster to stabilize"
+        )
+
+        Process.sleep(@shutdown_placement_attempt_wait_timeout)
+
+        fresh_nodes =
+          LifecycleManager.find_eligible_nodes(supervisor, module,
+            limit: 3,
+            exclude_nodes: [node]
+          )
+
+        case fresh_nodes do
+          [] ->
+            {:error, {:capacity_limit, :all_placement_attempts_failed}}
+
+          nodes ->
+            try_nodes(supervisor, child_spec, nodes, shutdown_retries + 1)
+        end
 
       :exit, {:exception, {:shutdown, _}} ->
         Logger.warning("Node #{inspect(node)} is shutting down, trying next node")
 
-        try_nodes(supervisor, child_spec, rest)
+        try_nodes(supervisor, child_spec, rest, shutdown_retries)
     end
   end
 
