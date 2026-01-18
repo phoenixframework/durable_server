@@ -782,7 +782,7 @@ defmodule DurableServer.ObjectStore do
     opts = validate_opts!(opts)
     consistent = Keyword.get(opts, :consistent, true)
     req = new_req(client, consistent: consistent)
-    max_results = Keyword.get(opts, :max_results, 100)
+    max_results = Keyword.get(opts, :max_results, 1000)
     continuation_token = Keyword.get(opts, :continuation_token)
 
     params = %{
