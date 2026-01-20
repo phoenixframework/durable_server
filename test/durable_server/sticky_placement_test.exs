@@ -518,4 +518,247 @@ defmodule DurableServer.StickyPlacementTest do
       assert message =~ "heartbeat_meta must be a map or a zero-arity function"
     end
   end
+
+  describe "find_my_matching_level behavior" do
+    # These tests verify the sticky placement level matching logic:
+    # - nil/empty config -> level 0 (any node matches)
+    # - config with :any -> all nodes match at some level (never nil)
+    # - config WITHOUT :any -> non-matching nodes get nil (can never claim)
+
+    test "no sticky config returns level 0 for any node", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      # No sticky_placement configured at all
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()}
+      )
+
+      # Start a server to create storage state
+      System.put_env("FLY_REGION", "ord")
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {StickyPlacementTestServer, %{key: "no-sticky-test"}}
+        )
+
+      assert is_pid(pid)
+
+      # Get the augmented sticky placement - should be nil (no config)
+      augmented =
+        DurableServer.Supervisor.__get_augmented_sticky_placement__(
+          supervisor_name,
+          StickyPlacementTestServer,
+          "no-sticky-test"
+        )
+
+      # With no sticky config, augmented should be nil
+      assert augmented == nil
+
+      System.delete_env("FLY_REGION")
+    end
+
+    test "sticky config with :any allows all nodes to match", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      System.put_env("FLY_REGION", "ord")
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         sticky_placement: %{
+           StickyPlacementTestServer => [
+             FLY_REGION: 20_000,
+             any: 50_000
+           ]
+         }}
+      )
+
+      {:ok, {_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {StickyPlacementTestServer, %{key: "with-any-test"}}
+        )
+
+      # Get the augmented sticky placement
+      augmented =
+        DurableServer.Supervisor.__get_augmented_sticky_placement__(
+          supervisor_name,
+          StickyPlacementTestServer,
+          "with-any-test"
+        )
+
+      # Should have both FLY_REGION entry and :any entry
+      assert length(augmented) == 2
+      assert Enum.any?(augmented, fn p -> p.env_var == "FLY_REGION" and p.value == "ord" end)
+      assert Enum.any?(augmented, fn p -> p.env_var == :any and p.value == :any end)
+
+      System.delete_env("FLY_REGION")
+    end
+
+    test "sticky config WITHOUT :any does not include :any fallback", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      System.put_env("FLY_REGION", "ord")
+
+      start_supervised!({DurableServer.Supervisor,
+       name: supervisor_name,
+       prefix: prefix,
+       object_store: test_object_store_opts(),
+       sticky_placement: %{
+         # Note: NO :any here - only FLY_REGION
+         StickyPlacementTestServer => [
+           FLY_REGION: 20_000
+         ]
+       }})
+
+      {:ok, {_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {StickyPlacementTestServer, %{key: "without-any-test"}}
+        )
+
+      # Get the augmented sticky placement
+      augmented =
+        DurableServer.Supervisor.__get_augmented_sticky_placement__(
+          supervisor_name,
+          StickyPlacementTestServer,
+          "without-any-test"
+        )
+
+      # Should ONLY have FLY_REGION entry, NO :any
+      assert length(augmented) == 1
+      assert Enum.any?(augmented, fn p -> p.env_var == "FLY_REGION" and p.value == "ord" end)
+      refute Enum.any?(augmented, fn p -> p.env_var == :any end)
+
+      System.delete_env("FLY_REGION")
+    end
+
+    test "non-matching node returns nil level when :any not configured", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      # Server was started in region "ord"
+      System.put_env("FLY_REGION", "ord")
+
+      start_supervised!({DurableServer.Supervisor,
+       name: supervisor_name,
+       prefix: prefix,
+       object_store: test_object_store_opts(),
+       sticky_placement: %{
+         # NO :any - only matching region can claim
+         StickyPlacementTestServer => [
+           FLY_REGION: 20_000
+         ]
+       }})
+
+      {:ok, {_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {StickyPlacementTestServer, %{key: "non-matching-test"}}
+        )
+
+      # Get the stored sticky_placement (persisted with "ord")
+      augmented =
+        DurableServer.Supervisor.__get_augmented_sticky_placement__(
+          supervisor_name,
+          StickyPlacementTestServer,
+          "non-matching-test"
+        )
+
+      # The persisted sticky_placement has FLY_REGION: "ord"
+      assert augmented == [%{env_var: "FLY_REGION", value: "ord"}]
+
+      # Now simulate a different node (FLY_REGION = "sjc")
+      # This node should NOT be able to claim because:
+      # 1. It doesn't match FLY_REGION: "ord"
+      # 2. There's no :any fallback
+      System.put_env("FLY_REGION", "sjc")
+
+      my_env_vars = %{"FLY_REGION" => "sjc"}
+
+      # Manually test find_my_matching_level logic:
+      # With augmented = [%{env_var: "FLY_REGION", value: "ord"}]
+      # and my_env_vars = %{"FLY_REGION" => "sjc"}
+      # The node does NOT match any level, so should return nil
+      matching_level =
+        Enum.find_index(augmented, fn preference ->
+          case preference do
+            %{env_var: :any, value: :any} ->
+              true
+
+            %{env_var: env_var, value: expected_value} ->
+              Map.get(my_env_vars, env_var) == expected_value
+
+            _ ->
+              false
+          end
+        end)
+
+      # Non-matching node with no :any should get nil
+      assert matching_level == nil
+
+      System.delete_env("FLY_REGION")
+    end
+
+    test "matching node returns level 0 for sticky placement", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      System.put_env("FLY_REGION", "ord")
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         sticky_placement: %{
+           StickyPlacementTestServer => [
+             FLY_REGION: 20_000
+           ]
+         }}
+      )
+
+      {:ok, {_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {StickyPlacementTestServer, %{key: "matching-test"}}
+        )
+
+      augmented =
+        DurableServer.Supervisor.__get_augmented_sticky_placement__(
+          supervisor_name,
+          StickyPlacementTestServer,
+          "matching-test"
+        )
+
+      # Same region - should match level 0
+      my_env_vars = %{"FLY_REGION" => "ord"}
+
+      matching_level =
+        Enum.find_index(augmented, fn preference ->
+          case preference do
+            %{env_var: :any, value: :any} ->
+              true
+
+            %{env_var: env_var, value: expected_value} ->
+              Map.get(my_env_vars, env_var) == expected_value
+
+            _ ->
+              false
+          end
+        end)
+
+      # Matching node should get level 0
+      assert matching_level == 0
+
+      System.delete_env("FLY_REGION")
+    end
+  end
 end

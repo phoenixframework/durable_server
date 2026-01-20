@@ -293,44 +293,50 @@ defmodule DurableServer do
          MyDatabaseServer => [
            FLY_MACHINE_ID: 10_000,
            FLY_REGION: 20_000,
-           any: 30_000
+           any: 0
          ]
        }}
 
   Sticky placement uses environment variables to create a progressive fallback strategy
-  with cumulative time windows, for example from the above configuration:
+  with cumulative time windows. Each delay value specifies how much time to add before
+  the **next** level can claim. From the above configuration:
 
-  1. **Level 0** (0-10s): Only nodes matching `FLY_MACHINE_ID` can claim the server
-  2. **Level 1** (10-30s): Nodes matching `FLY_REGION` (including level 0) can claim
-  3. **Level 2** (30-60s): Any node (`:any`) can claim the server
+  1. **Level 0** (immediate): Only nodes matching `FLY_MACHINE_ID` can claim
+  2. **Level 1** (after 10s): Nodes matching `FLY_REGION` can claim
+  3. **Level 2** (after 30s): Any node (`:any`) can claim
 
   The delays are **cumulative** - each level unlocks at the sum of all previous delays:
-  - Level 0 unlocks at 0ms (immediately)
-  - Level 1 unlocks at 10,000ms (10s)
+  - Level 0 unlocks at 0ms (always immediate)
+  - Level 1 unlocks at 10,000ms (sum of delays before level 1)
   - Level 2 unlocks at 30,000ms (10s + 20s)
-  - Level 3 would unlock at 60,000ms (10s + 20s + 30s)
 
+  The **last** level's delay value is unused (no subsequent level), so `0` is conventional.
   Earlier levels remain eligible even after later levels unlock, maintaining preference order.
 
   ### Common Patterns
 
-  **Machine stickiness with same region fallback:**
+  **Machine stickiness with region fallback (no `:any`):**
 
       sticky_placement: %{
         MyServer => [
           FLY_MACHINE_ID: 20_000,
-          FLY_REGION: 30_000,
+          FLY_REGION: 0
         ]
       }
 
-  **Region stickiness, falling back to any available instance:**
+  Same machine claims immediately, same region claims after 20s. Without `:any`, nodes
+  in other regions can **never** claim - the server will only run in its original region.
+
+  **Region stickiness, falling back to any node:**
 
       sticky_placement: %{
         MyServer => [
           FLY_REGION: 20_000,
-          any: 30_000
+          any: 0
         ]
       }
+
+  Same region claims immediately, any node can claim after 20s.
 
   **Custom environment variables:**
 
@@ -338,9 +344,25 @@ defmodule DurableServer do
         MyServer => [
           DATACENTER: 15_000,
           AVAILABILITY_ZONE: 30_000,
-          any: 45_000
+          any: 0
         ]
       }
+
+  Same datacenter claims immediately, same availability zone after 15s, any node after 45s.
+
+  **Strict region pinning (no fallback):**
+
+      sticky_placement: %{
+        MyServer => [
+          FLY_REGION: 0
+        ]
+      }
+
+  Only nodes with matching `FLY_REGION` can claim, and they can claim immediately.
+  Without `:any`, non-matching nodes can **never** claim the server - it will only run
+  on nodes with the same `FLY_REGION` as where it was originally started. Use this when
+  data locality is critical and you'd rather the server stay down than run in the wrong
+  location.
 
   ### Default Sticky Placement
 
@@ -351,7 +373,7 @@ defmodule DurableServer do
        prefix: "durable/",
        default_sticky_placement: [
          FLY_REGION: 20_000,
-         any: 50_000
+         any: 0
        ]}
 
   Per-module configurations override the default.
@@ -369,11 +391,11 @@ defmodule DurableServer do
 
   For example, if you change from:
 
-      sticky_placement: %{MyServer => [FLY_MACHINE_ID: 60_000, FLY_REGION: 120_000]}
+      sticky_placement: %{MyServer => [FLY_MACHINE_ID: 60_000, FLY_REGION: 0]}
 
   To:
 
-      sticky_placement: %{MyServer => [FLY_MACHINE_ID: 60_000, FLY_REGION: 120_000, any: 300_000]}
+      sticky_placement: %{MyServer => [FLY_MACHINE_ID: 60_000, FLY_REGION: 120_000, any: 0]}
 
   Servers started before the change will have their persisted placement augmented with the
   `:any` level at runtime. This ensures they can still be claimed by any node after their
@@ -426,19 +448,19 @@ defmodule DurableServer do
        sticky_placement: %{
          MyDatabaseServer => [
            FLY_MACHINE_ID: 20_000,
-           FLY_REGION: 20_000,
+           FLY_REGION: 0
          ]
        }}
 
   With this setup:
   - The owner_ref persists in object storage and is used to detect stale on-disk databases
-  - Same machine tries to restart first (0-20s window)
+  - Same machine tries to restart first (immediate)
     - On-disk DB owner matches old owner_ref - reuse local database (no S3 restore)
     - Litestream generates new owner_ref, updates owner file, returns to caller
   - After 20s, any machine in same region can restart
     - On-disk DB owner doesn't match (or missing) - restore from S3
     - Litestream generates new owner_ref, writes owner file, returns to caller
-  - After 20s, any machine in the region can restart (full failover)
+  - Without `:any`, machines outside the region can never claim (strict region pinning)
   - A new owner_ref is generated on every start to detect future staleness
 
   ### Important Notes

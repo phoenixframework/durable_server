@@ -135,8 +135,10 @@ defmodule DurableServer.LifecycleManager do
   @shuffle_batch_size 20_000
   # parallel processing batch size - how many restart attempts to run concurrently
   @parallel_restart_batch_size 50
-  @cross_region_orphan_claimable_after :timer.seconds(50)
-  @same_region_orphan_claimable_after :timer.seconds(20)
+  # Threshold for considering a node's heartbeat stale (used in heartbeat validation/deadline)
+  @heartbeat_staleness_threshold_ms :timer.seconds(20)
+  # Threshold for considering a node unhealthy when finding eligible placement nodes
+  @node_health_staleness_threshold_ms :timer.seconds(50)
   @resource_check_interval_ms :timer.seconds(60)
 
   def start_link(opts) do
@@ -183,18 +185,17 @@ defmodule DurableServer.LifecycleManager do
       })
 
     # Validate heartbeat timing config
-    # Nodes are considered stale at 2x heartbeat_interval, and orphan claiming uses
-    # @same_region_orphan_claimable_after. If heartbeat_interval is too long, nodes
-    # would be claimable before they even miss a heartbeat.
-    max_heartbeat_interval = div(@same_region_orphan_claimable_after, 2)
+    # Nodes are considered stale at 2x heartbeat_interval. If heartbeat_interval is too long,
+    # nodes would be considered stale before they even miss a heartbeat.
+    max_heartbeat_interval = div(@heartbeat_staleness_threshold_ms, 2)
 
     if config.heartbeat_interval_ms > max_heartbeat_interval do
       raise ArgumentError, """
       Invalid heartbeat_interval_ms configuration: #{config.heartbeat_interval_ms}ms
 
-      heartbeat_interval_ms must be <= #{max_heartbeat_interval}ms (half of orphan_claimable_after: #{@same_region_orphan_claimable_after}ms).
+      heartbeat_interval_ms must be <= #{max_heartbeat_interval}ms (half of heartbeat_staleness_threshold: #{@heartbeat_staleness_threshold_ms}ms).
 
-      With the current value, nodes would be claimable as orphans before they even
+      With the current value, nodes would be considered stale before they even
       have a chance to send their next heartbeat, causing unnecessary failovers.
       """
     end
@@ -504,7 +505,7 @@ defmodule DurableServer.LifecycleManager do
   # Calculate the hard deadline for heartbeat operations.
   # We must complete heartbeat before other nodes consider us stale (orphan claimable).
   defp heartbeat_hard_deadline_ms do
-    @same_region_orphan_claimable_after - @heartbeat_deadline_buffer_ms
+    @heartbeat_staleness_threshold_ms - @heartbeat_deadline_buffer_ms
   end
 
   # this gets run async inside a task
@@ -947,8 +948,12 @@ defmodule DurableServer.LifecycleManager do
         can_claim_at_level?(meta, my_matching_level, delays)
 
       Meta.crashed?(meta) && my_matching_level == nil ->
-        # We don't match any sticky level, wait for cross-region delay (fallback)
-        !Meta.last_heartbeat_within_ms(meta, @cross_region_orphan_claimable_after)
+        # We don't match any sticky level. Since my_matching_level is nil, this means:
+        # 1. There IS a sticky config (otherwise find_my_matching_level returns 0)
+        # 2. :any is NOT in the config (otherwise we'd match :any)
+        # 3. We don't match any specific env var
+        # Therefore, this node can NEVER claim this orphan.
+        false
 
       Meta.restart_attempt_expired?(meta) ->
         true
@@ -957,19 +962,12 @@ defmodule DurableServer.LifecycleManager do
         # Node is unhealthy/full, check sticky placement
         case my_matching_level do
           nil ->
-            # We don't match sticky preferences, wait longer
-            can_claim_reason = capacity_rejection_reason(node_health, meta.module)
-
-            if !Meta.last_heartbeat_within_ms(meta, @cross_region_orphan_claimable_after) do
-              Logger.info("""
-              Claiming orphan #{meta.key} from #{meta.node_str} (no sticky match)
-              Reason: #{can_claim_reason}
-              """)
-
-              true
-            else
-              false
-            end
+            # We don't match any sticky level. Since my_matching_level is nil, this means:
+            # 1. There IS a sticky config (otherwise find_my_matching_level returns 0)
+            # 2. :any is NOT in the config (otherwise we'd match :any)
+            # 3. We don't match any specific env var
+            # Therefore, this node can NEVER claim this orphan.
+            false
 
           level ->
             # We match a sticky level, check timing
@@ -1024,11 +1022,9 @@ defmodule DurableServer.LifecycleManager do
   defp get_sticky_placement_delays(supervisor, module) do
     case DurableServer.Supervisor.__get_sticky_placement_for_module__(supervisor, module) do
       nil ->
-        # No sticky config, use default delays
-        [@same_region_orphan_claimable_after, @cross_region_orphan_claimable_after]
+        []
 
       list ->
-        # Keyword list format: [FLY_MACHINE_ID: 10_000, FLY_REGION: 20_000]
         Enum.map(list, fn {_env_var_atom, delay} -> delay end)
     end
   end
@@ -1513,7 +1509,7 @@ defmodule DurableServer.LifecycleManager do
         heartbeat_age_ms = now - timestamp
 
         health =
-          if heartbeat_age_ms <= @cross_region_orphan_claimable_after do
+          if heartbeat_age_ms <= @node_health_staleness_threshold_ms do
             {:healthy, %{node_ref: node_ref, capacity: capacity, resources: resources}}
           else
             :stale
