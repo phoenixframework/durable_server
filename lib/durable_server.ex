@@ -1452,7 +1452,7 @@ defmodule DurableServer do
           new_state
 
         {:error, sync_reason} ->
-          Logger.warning(
+          Logger.error(
             "Failed to sync state for #{state.key} during shutdown: #{inspect(sync_reason)}"
           )
 

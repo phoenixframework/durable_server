@@ -3,12 +3,12 @@ defmodule DurableServer.Terminator do
   Terminator GenServer that coordinates graceful shutdown of DurableServer processes.
 
   The Terminator is placed at the bottom of the DurableServer.Supervisor supervision
-  tree and traps exits. When the supervisor is shutting down, the Terminator's 
+  tree and traps exits. When the supervisor is shutting down, the Terminator's
   terminate/2 callback is called, which:
 
-  1. Sends sync_and_stop messages to all DurableServer children
-  2. Monitors each child process for DOWN messages  
-  3. Waits up to a configurable timeout for all children to sync and terminate
+  1. Sends sync_and_stop messages to DurableServer children (with limited concurrency)
+  2. Monitors each child process for DOWN messages
+  3. Waits up to a configurable timeout for each child to sync and terminate
   4. Returns to continue the shutdown process
 
   This ensures that DurableServer processes have an opportunity to persist their
@@ -18,18 +18,24 @@ defmodule DurableServer.Terminator do
   ## Configuration
 
   The Terminator uses the same configuration as its parent DurableServer.Supervisor:
-  - `:graceful_shutdown_timeout_ms` - Maximum time to wait for graceful shutdown 
+  - `:graceful_shutdown_timeout_ms` - Maximum time to wait for each child to shutdown
     (default: 30_000ms)
+  - `:graceful_shutdown_concurrency` - Maximum concurrent shutdown operations
+    (default: 50, should match Finch pool size to avoid connection exhaustion)
 
   ## Graceful Shutdown Protocol
 
   1. Supervisor begins shutdown process
   2. Terminator's terminate/2 is called with reason and state
-  3. Terminator sends {:durable, {:sync_and_stop, reason}} to all DurableServer children
+  3. Terminator uses Task.async_stream with limited concurrency to:
+     a. Send {:durable, {:sync_and_stop, reason}} to each DurableServer
+     b. Wait for each child to terminate (up to timeout)
   4. Each DurableServer calls sync_state/1 then stops normally
-  5. Terminator monitors for DOWN messages from each child
-  6. After all children stop or timeout is reached, terminate/2 returns
-  7. Supervisor continues shutdown process
+  5. After all children stop or timeout is reached, terminate/2 returns
+  6. Supervisor continues shutdown process
+
+  The concurrency limit prevents overwhelming the Finch connection pool when many
+  DurableServers try to persist their state simultaneously during shutdown.
 
   The graceful shutdown only applies to normal shutdown scenarios (e.g., application
   stop, supervisor shutdown). For abnormal termination (crashes, kills), the normal
@@ -40,6 +46,7 @@ defmodule DurableServer.Terminator do
   require Logger
 
   @graceful_shutdown_timeout_ms 30_000
+  @graceful_shutdown_concurrency 50
 
   def start_link(opts) do
     supervisor_name = Keyword.fetch!(opts, :supervisor_name)
@@ -55,7 +62,9 @@ defmodule DurableServer.Terminator do
       supervisor_name: supervisor_name,
       config: config,
       graceful_shutdown_timeout_ms:
-        Map.get(config, :graceful_shutdown_timeout_ms, @graceful_shutdown_timeout_ms)
+        Map.get(config, :graceful_shutdown_timeout_ms, @graceful_shutdown_timeout_ms),
+      graceful_shutdown_concurrency:
+        Map.get(config, :graceful_shutdown_concurrency, @graceful_shutdown_concurrency)
     }
 
     {:ok, state}
@@ -72,26 +81,50 @@ defmodule DurableServer.Terminator do
   defp perform_graceful_shutdown(state) do
     case get_durable_server_children(state.supervisor_name) do
       [_ | _] = children ->
+        child_count = length(children)
+
         Logger.info(
-          "Coordinating graceful shutdown of #{length(children)} DurableServer processes"
+          "Coordinating graceful shutdown of #{child_count} DurableServer processes " <>
+            "(concurrency: #{state.graceful_shutdown_concurrency})"
         )
 
-        # send sync_and_stop message to all children and monitor them
-        monitored_children =
-          children
-          |> Enum.map(fn {_id, pid, _type, _modules} ->
-            ref = Process.monitor(pid)
-            send(pid, {:durable, {:sync_and_stop, :shutdown}})
-            {ref, pid}
-          end)
-          |> Map.new()
+        # Use Task.async_stream to limit concurrent shutdown operations.
+        # This prevents overwhelming the Finch connection pool when many
+        # DurableServers try to persist their state simultaneously.
+        per_child_timeout = state.graceful_shutdown_timeout_ms
 
-        # wait for all children to terminate or timeout
-        wait_for_children(monitored_children, state.graceful_shutdown_timeout_ms)
+        children
+        |> Task.async_stream(
+          fn {_id, pid, _type, _modules} ->
+            shutdown_child(pid, per_child_timeout)
+          end,
+          max_concurrency: state.graceful_shutdown_concurrency,
+          timeout: :infinity,
+          ordered: false
+        )
+        |> Stream.run()
+
+        Logger.debug("All DurableServer children have been signaled for shutdown")
+        :ok
 
       [] ->
         Logger.debug("No DurableServer children to shutdown gracefully")
         :ok
+    end
+  end
+
+  defp shutdown_child(pid, timeout) do
+    ref = Process.monitor(pid)
+    send(pid, {:durable, {:sync_and_stop, :shutdown}})
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} ->
+        :ok
+    after
+      timeout ->
+        Process.demonitor(ref, [:flush])
+        Logger.warning("Child #{inspect(pid)} did not terminate within timeout")
+        :timeout
     end
   end
 
@@ -114,43 +147,6 @@ defmodule DurableServer.Terminator do
       :exit, {:noproc, _} ->
         # supervisor already gone
         []
-    end
-  end
-
-  defp wait_for_children(monitored_children, _timeout_ms)
-       when map_size(monitored_children) == 0 do
-    Logger.debug("All DurableServer children have terminated gracefully")
-    :ok
-  end
-
-  defp wait_for_children(monitored_children, timeout_ms)
-       when map_size(monitored_children) > 0 and timeout_ms <= 0 do
-    Logger.warning(
-      "Graceful shutdown timeout reached, #{map_size(monitored_children)} children may not have synced"
-    )
-
-    :ok
-  end
-
-  defp wait_for_children(monitored_children, timeout_ms) do
-    start_time = System.monotonic_time(:millisecond)
-
-    receive do
-      {:DOWN, ref, :process, _pid, _reason} ->
-        # child terminated, remove from monitoring map - O(1) operation
-        remaining_children = Map.delete(monitored_children, ref)
-
-        elapsed_time = System.monotonic_time(:millisecond) - start_time
-        remaining_timeout = max(0, timeout_ms - elapsed_time)
-
-        wait_for_children(remaining_children, remaining_timeout)
-    after
-      timeout_ms ->
-        Logger.warning(
-          "Graceful shutdown timeout reached, #{map_size(monitored_children)} children may not have synced"
-        )
-
-        :ok
     end
   end
 end

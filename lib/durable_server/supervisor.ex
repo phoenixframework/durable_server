@@ -1514,6 +1514,7 @@ defmodule DurableServer.Supervisor do
       discovery_interval_ms: Keyword.get(opts, :discovery_interval_ms, 60_000),
       heartbeat_interval_ms: Keyword.get(opts, :heartbeat_interval_ms, 10_000),
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),
+      graceful_shutdown_concurrency: Keyword.get(opts, :graceful_shutdown_concurrency, 50),
       dead_node_threshold_ms: Keyword.get(opts, :dead_node_threshold_ms, 5 * 60 * 1000),
       sticky_placement_history_limit: Keyword.get(opts, :sticky_placement_history_limit, 5),
       circuit_breaker: circuit_breaker,
