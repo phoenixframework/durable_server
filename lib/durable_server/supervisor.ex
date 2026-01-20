@@ -1515,6 +1515,7 @@ defmodule DurableServer.Supervisor do
       heartbeat_interval_ms: Keyword.get(opts, :heartbeat_interval_ms, 10_000),
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),
       graceful_shutdown_concurrency: Keyword.get(opts, :graceful_shutdown_concurrency, 50),
+      supervisor_shutdown_timeout_ms: Keyword.get(opts, :supervisor_shutdown_timeout_ms, 60_000),
       dead_node_threshold_ms: Keyword.get(opts, :dead_node_threshold_ms, 5 * 60 * 1000),
       sticky_placement_history_limit: Keyword.get(opts, :sticky_placement_history_limit, 5),
       circuit_breaker: circuit_breaker,
@@ -1535,6 +1536,8 @@ defmodule DurableServer.Supervisor do
     dynamic_sup_name = get_dynamic_supervisor(name)
     task_sup_name = get_task_supervisor(name)
 
+    shutdown_timeout = config.supervisor_shutdown_timeout_ms
+
     children = [
       {Task.Supervisor, name: task_sup_name},
       {DynamicSupervisor,
@@ -1543,7 +1546,7 @@ defmodule DurableServer.Supervisor do
        max_children: max_children,
        max_restarts: 1000,
        max_seconds: 5,
-       shutdown: 60_000},
+       shutdown: shutdown_timeout},
       {LifecycleManager,
        supervisor_name: name,
        task_supervisor: task_sup_name,
@@ -1552,8 +1555,8 @@ defmodule DurableServer.Supervisor do
        circuit_breaker: circuit_breaker,
        capacity_limits: capacity_limits,
        heartbeat_meta: heartbeat_meta,
-       shutdown: 60_000},
-      {Terminator, supervisor_name: name, config: config, shutdown: 60_000}
+       shutdown: shutdown_timeout},
+      {Terminator, supervisor_name: name, config: config, shutdown: shutdown_timeout}
     ]
 
     Supervisor.init(children, strategy: :one_for_all)
