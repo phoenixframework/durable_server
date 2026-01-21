@@ -122,9 +122,17 @@ defmodule DurableServer.Terminator do
         :ok
     after
       timeout ->
-        Process.demonitor(ref, [:flush])
-        Logger.warning("Child #{inspect(pid)} did not terminate within timeout")
-        :timeout
+        # Didn't finish in time - kill to avoid blocking DynamicSupervisor shutdown
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+        after
+          1000 -> Process.demonitor(ref, [:flush])
+        end
+
+        Logger.warning("Child #{inspect(pid)} did not terminate within #{timeout}ms, killed")
+        :killed
     end
   end
 
