@@ -592,10 +592,19 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp do_start_child(supervisor, {module, _init_arg}, retries)
+  defp do_start_child(supervisor, {module, init_arg}, retries)
        when retries > @max_start_child_tries do
+    key =
+      case init_arg do
+        {:restart, %{key: key}} ->
+          key
+
+        %{key: key} ->
+          key
+      end
+
     raise RuntimeError,
-          "#{inspect(supervisor)} failed to `DurableServer.Supervisor.start_child` for #{inspect(module)} after #{@max_start_child_tries} tries"
+          "#{inspect(supervisor)} failed to `DurableServer.Supervisor.start_child` for #{inspect(module)} (key=#{key}) after #{@max_start_child_tries} tries"
   end
 
   defp do_start_child(supervisor, {module, init_arg}, retries) do
