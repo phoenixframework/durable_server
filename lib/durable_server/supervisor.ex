@@ -698,20 +698,25 @@ defmodule DurableServer.Supervisor do
                        node_str: to_string(remote_node)
                      }) do
                   {:healthy, _node_ref} ->
-                    case :erpc.call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
-                      {pid, meta} when is_pid(pid) ->
-                        {:error, {:already_started, {pid, meta}}}
+                    try do
+                      case :erpc.call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
+                        {pid, meta} when is_pid(pid) ->
+                          {:error, {:already_started, {pid, meta}}}
 
-                      nil ->
+                        nil ->
+                          Logger.info(
+                            "node-local metadata missing from #{inspect(node(pid))} so assuming raced pid is gone. Retrying start for #{inspect(key)}"
+                          )
+
+                          do_start_child(supervisor, {module, init_arg}, retries + 1)
+                      end
+                    catch
+                      # erpc infrastructure failures (noconnection, timeout, etc.)
+                      # Node appeared healthy but RPC failed - retry start since the
+                      # "winning" process is likely gone
+                      :error, {:erpc, erpc_reason} ->
                         Logger.info(
-                          "node-local metadata missing from #{inspect(node(pid))} so assuming raced pid is gone. Retrying start for #{inspect(key)}"
-                        )
-
-                        do_start_child(supervisor, {module, init_arg}, retries + 1)
-
-                      {:error, {:erpc, erpc_reason}} ->
-                        Logger.info(
-                          "still waiting on metadata replication from #{inspect(node(pid))} (#{inspect(erpc_reason)}). Retrying start for #{inspect(key)}"
+                          "erpc to #{inspect(node(pid))} failed (#{inspect(erpc_reason)}), retrying start for #{inspect(key)}"
                         )
 
                         do_start_child(supervisor, {module, init_arg}, retries + 1)
