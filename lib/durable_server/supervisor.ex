@@ -621,6 +621,26 @@ defmodule DurableServer.Supervisor do
                 "start_child expects a map with :key field, got: #{inspect(init_arg)}"
       end
 
+    # Check syn first to avoid spawning a process that will just fail at registration
+    case lookup(supervisor, key) do
+      {pid, meta} when node(pid) == node() ->
+        # Local pid - verify it's actually alive before returning already_started
+        if Process.alive?(pid) do
+          {:error, {:already_started, {pid, meta}}}
+        else
+          do_start_child_inner(supervisor, module, init_arg, key, retries)
+        end
+
+      {pid, meta} ->
+        # Remote pid - trust syn
+        {:error, {:already_started, {pid, meta}}}
+
+      nil ->
+        do_start_child_inner(supervisor, module, init_arg, key, retries)
+    end
+  end
+
+  defp do_start_child_inner(supervisor, module, init_arg, key, retries) do
     dynamic_sup = get_dynamic_supervisor(supervisor)
     config = __get_config__(supervisor)
     init_ref = make_ref()
