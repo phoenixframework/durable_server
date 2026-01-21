@@ -92,19 +92,29 @@ defmodule DurableServer.Terminator do
         # This prevents overwhelming the Finch connection pool when many
         # DurableServers try to persist their state simultaneously.
         per_child_timeout = state.graceful_shutdown_timeout_ms
+        start_time = System.monotonic_time(:millisecond)
 
-        children
-        |> Task.async_stream(
-          fn {_id, pid, _type, _modules} ->
-            shutdown_child(pid, per_child_timeout)
-          end,
-          max_concurrency: state.graceful_shutdown_concurrency,
-          timeout: :infinity,
-          ordered: false
+        killed_count =
+          children
+          |> Task.async_stream(
+            fn {_id, pid, _type, _modules} ->
+              shutdown_child(pid, per_child_timeout)
+            end,
+            max_concurrency: state.graceful_shutdown_concurrency,
+            timeout: :infinity,
+            ordered: false
+          )
+          |> Enum.reduce(0, fn {:ok, result}, acc ->
+            if result == :killed, do: acc + 1, else: acc
+          end)
+
+        elapsed_ms = System.monotonic_time(:millisecond) - start_time
+
+        Logger.info(
+          "Graceful shutdown completed in #{elapsed_ms}ms " <>
+            "(#{child_count} children, #{killed_count} killed due to timeout)"
         )
-        |> Stream.run()
 
-        Logger.debug("All DurableServer children have been signaled for shutdown")
         :ok
 
       [] ->
