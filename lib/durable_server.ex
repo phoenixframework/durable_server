@@ -1054,7 +1054,14 @@ defmodule DurableServer do
         {:ok, new_state}
 
       {:error, reason} ->
-        Logger.error("Failed to initialize DurableServer: #{inspect(reason)}")
+        case reason do
+          {:already_started, _} ->
+            Logger.warning("Failed to initialize DurableServer: #{inspect(reason)}")
+
+          _ ->
+            Logger.error("Failed to initialize DurableServer: #{inspect(reason)}")
+        end
+
         {:error, reason}
     end
   end
