@@ -1,8 +1,8 @@
 defmodule DurableServer.PubSub do
   @moduledoc """
-  Pub/sub system for DurableServer registry events.
+  Pubsub system for DurableServer registry events.
 
-  This module provides a pub/sub interface for DurableServer lifecycle events,
+  This module provides a pubsub interface for DurableServer lifecycle events,
   wrapping syn's event handler callbacks. It also allows non-DurableServer processes
   to join/leave keys to participate in the pubsub system and be discoverable
   cluster-wide.

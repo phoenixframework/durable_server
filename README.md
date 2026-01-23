@@ -12,7 +12,7 @@ It implements fault-tolerant, stateful processes that can survive node failures,
 - **Sticky placement**: Environment variable-based placement preferences (e.g., same machine, same region, etc.) with time-gated fallback to ensure servers restart on preferred nodes when possible
 - **Automatic recovery**: Failed processes are detected and restarted across the cluster
 - **Graceful shutdown**: Ensures state is synchronized before termination
-- **PubSub**: Subscribe to lifecycle events and broadcast messages between DurableServers and other processes (e.g., Phoenix Channels)
+- **PubSub**: Subscribe to lifecycle events and broadcast messages between DurableServers and other processes
 
 ## Installation
 
@@ -110,7 +110,7 @@ State is synchronized to storage in these scenarios:
 
 ## PubSub
 
-`DurableServer.PubSub` provides a pub/sub system for DurableServer lifecycle events and enables coordination between DurableServers and other processes (like Phoenix Channels).
+`DurableServer.PubSub` provides a pubsub system for DurableServer lifecycle events and enables coordination between DurableServers and other processes.
 
 ### Subscribing to Events
 

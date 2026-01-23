@@ -10,8 +10,8 @@ defmodule DurableServer.Application do
 
     children = [
       {Finch, name: DurableServer.Finch},
-      {Task.Supervisor, name: DurableServer.TaskSupervisor},
-      {Registry, keys: :duplicate, name: DurableServer.PubSub.Registry}
+      {Registry, keys: :duplicate, name: DurableServer.PubSub.Registry},
+      {Task.Supervisor, name: DurableServer.TaskSupervisor}
     ]
 
     opts = [strategy: :one_for_one, name: DurableServer.AppSupervisor]
