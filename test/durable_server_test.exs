@@ -223,11 +223,9 @@ defmodule DurableServerTest do
       DurableServerTest.atomify_keys(persisted_state)
     end
 
-    def init(%{key: _key, __meta__: _meta} = state) do
-      {:ok, Map.delete(state, :__meta__)}
-    end
-
     def init(%{key: key}) do
+      # assert that we have a task sup in pdict by the time we get to init
+      _ = DurableServer.get_task_supervisor!()
       {:ok, %{key: key, count: 0}, auto_sync: true}
     end
 

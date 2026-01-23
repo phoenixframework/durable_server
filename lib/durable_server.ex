@@ -743,12 +743,16 @@ defmodule DurableServer do
   end
 
   @doc """
-  Gets the task supervisor of the DurableServer from meta stored within user state.
+  Gets the task supervisor of the current DurableServer process.
+
+  Can only be called from a durable server process as the data is stored in the pdict.
+
+  Raises RuntimeError if not set.
   """
-  def get_task_supervisor(%{} = user_state) do
-    case user_state do
-      %{__meta__: %{task_supervisor: name}} when is_atom(name) -> name
-      _ -> raise(ArgumentError, "no task supervisor found in metadata")
+  def get_task_supervisor! do
+    case Process.get(:durable_meta) do
+      %{task_supervisor: name} when is_atom(name) -> name
+      _ -> raise "no task supervisor found in metadata"
     end
   end
 
@@ -825,11 +829,7 @@ defmodule DurableServer do
                 # found existing state - existing state wins over init args
                 # pass through load_state for user customization
                 loaded_state = load_user_state(module, old_vsn, raw_existing_state)
-
-                # add metadata to indicate this is a restarted server
-                loaded_state_with_meta = Map.put(loaded_state, :__meta__, meta)
-
-                {:ok, {loaded_state_with_meta, old_vsn, etag, meta}}
+                {:ok, {loaded_state, old_vsn, etag, meta}}
             end
 
           :error ->
@@ -2114,7 +2114,8 @@ defmodule DurableServer do
 
   defp put_meta(%__MODULE__{} = state) do
     %Meta{} = meta = dump_meta(state)
-    %{state | user_state: Map.put(state.user_state, :__meta__, meta)}
+    Process.put(:durable_meta, meta)
+    state
   end
 
   defp validate_user_state!(%{} = user_state), do: user_state
@@ -2126,7 +2127,7 @@ defmodule DurableServer do
 
   defp update_state(%__MODULE__{} = state, new_user_state) do
     new_user_state = validate_user_state!(new_user_state)
-    # ensure user state always has __meta__
+    # ensure user state always has meta
     put_meta(%{state | user_state: new_user_state})
   end
 
@@ -2481,7 +2482,7 @@ defmodule DurableServer do
   end
 
   defp dump_user_state(%DurableServer{} = state) do
-    dumped_state = state.module.dump_state(Map.delete(state.user_state, :__meta__))
+    dumped_state = state.module.dump_state(state.user_state)
 
     if is_struct(dumped_state) do
       raise ArgumentError, """
