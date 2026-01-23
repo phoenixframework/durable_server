@@ -267,6 +267,127 @@ defmodule DurableServer.PubSubTest do
       key = "nonexistent/key"
       assert {:error, :not_in_group} = PubSub.leave(sup, key)
     end
+
+    test "join/3 returns error if already a member", %{supervisor_name: sup} do
+      key = "double/join/#{DurableServer.UUID.uuid4()}"
+
+      # First join succeeds
+      assert :ok = PubSub.join(sup, key, %{v: 1})
+
+      # Second join fails
+      assert {:error, :already_member} = PubSub.join(sup, key, %{v: 2})
+
+      # Metadata unchanged
+      [{_pid, %{v: 1}}] = PubSub.members(sup, key)
+    end
+  end
+
+  describe "update/4" do
+    test "updates member metadata and triggers :updated event", %{supervisor_name: sup} do
+      key = "update/test/#{DurableServer.UUID.uuid4()}"
+      initial_meta = %{status: :idle, count: 0}
+      updated_meta = %{status: :active, count: 5}
+
+      # Subscribe to receive events
+      :ok = PubSub.subscribe(sup, key)
+
+      # Join with initial metadata
+      :ok = PubSub.join(sup, key, initial_meta)
+      assert_receive {:durable_server, :joined, _}, 1000
+
+      # Verify initial metadata
+      [{pid, ^initial_meta}] = PubSub.members(sup, key)
+      assert pid == self()
+
+      # Update metadata
+      :ok = PubSub.update(sup, key, updated_meta)
+
+      # Should receive :updated event
+      assert_receive {:durable_server, :updated, payload}, 1000
+      assert payload.supervisor == sup
+      assert payload.key == key
+      assert payload.pid == self()
+      assert payload.meta == updated_meta
+      assert payload.previous_meta == initial_meta
+
+      # members/2 should return updated metadata
+      [{^pid, ^updated_meta}] = PubSub.members(sup, key)
+    end
+
+    test "update/4 returns error when not a member", %{supervisor_name: sup} do
+      key = "update/not_member/#{DurableServer.UUID.uuid4()}"
+
+      assert {:error, :not_a_member} = PubSub.update(sup, key, %{new: :meta})
+    end
+
+    test "update/4 can update another process's metadata", %{supervisor_name: sup} do
+      key = "update/other_pid/#{DurableServer.UUID.uuid4()}"
+      test_pid = self()
+
+      # Subscribe to events
+      :ok = PubSub.subscribe(sup, key)
+
+      # Spawn a process to join
+      other_pid =
+        spawn(fn ->
+          :ok = PubSub.join(sup, key, %{role: :worker, status: :starting})
+          send(test_pid, :joined)
+
+          receive do
+            :exit -> :ok
+          end
+        end)
+
+      receive do
+        :joined -> :ok
+      after
+        1000 -> flunk("Process didn't join in time")
+      end
+
+      assert_receive {:durable_server, :joined, %{pid: ^other_pid}}, 1000
+
+      # Update the other process's metadata from this process
+      :ok = PubSub.update(sup, key, %{role: :worker, status: :ready}, other_pid)
+
+      # Should receive :updated event
+      assert_receive {:durable_server, :updated, payload}, 1000
+      assert payload.pid == other_pid
+      assert payload.meta == %{role: :worker, status: :ready}
+      assert payload.previous_meta == %{role: :worker, status: :starting}
+
+      # Verify updated in members
+      [{^other_pid, %{role: :worker, status: :ready}}] = PubSub.members(sup, key)
+
+      # Cleanup
+      Process.exit(other_pid, :kill)
+    end
+
+    test "multiple updates in sequence", %{supervisor_name: sup} do
+      key = "update/sequence/#{DurableServer.UUID.uuid4()}"
+
+      :ok = PubSub.subscribe(sup, key)
+      :ok = PubSub.join(sup, key, %{v: 1})
+      assert_receive {:durable_server, :joined, _}, 1000
+
+      # Update multiple times
+      :ok = PubSub.update(sup, key, %{v: 2})
+
+      assert_receive {:durable_server, :updated, %{meta: %{v: 2}, previous_meta: %{v: 1}}},
+                     1000
+
+      :ok = PubSub.update(sup, key, %{v: 3})
+
+      assert_receive {:durable_server, :updated, %{meta: %{v: 3}, previous_meta: %{v: 2}}},
+                     1000
+
+      :ok = PubSub.update(sup, key, %{v: 4})
+
+      assert_receive {:durable_server, :updated, %{meta: %{v: 4}, previous_meta: %{v: 3}}},
+                     1000
+
+      # Final state
+      [{_pid, %{v: 4}}] = PubSub.members(sup, key)
+    end
   end
 
   describe "members/2" do
@@ -411,11 +532,6 @@ defmodule DurableServer.PubSubTest do
 
       # Use the same key for both supervisors
       key = "shared/key/#{DurableServer.UUID.uuid4()}"
-
-      # Subscribe to events on supervisor 1 (from setup)
-      sup1 = supervisor_name_2
-      # Actually let's use the one from setup context - we need to get it
-      # We'll create subscriptions on both and verify isolation
 
       # Subscribe to sup2 only
       :ok = PubSub.subscribe(supervisor_name_2, :all)

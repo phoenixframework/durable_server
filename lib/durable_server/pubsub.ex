@@ -27,13 +27,13 @@ defmodule DurableServer.PubSub do
 
       {:durable_server, event_type, payload}
 
-  | Event Type      | Trigger                                    | Extra Fields        |
-  |-----------------|--------------------------------------------|--------------------|
-  | `:registered`   | DurableServer started                      | -                   |
-  | `:unregistered` | DurableServer stopped                      | `:reason`           |
-  | `:updated`      | DurableServer metadata changed             | `:previous_meta`    |
-  | `:joined`       | Process joined via `join/3`                | -                   |
-  | `:left`         | Process left via `leave/2` or died         | `:reason`           |
+  | Event Type      | Trigger                                        | Extra Fields        |
+  |-----------------|------------------------------------------------|---------------------|
+  | `:registered`   | DurableServer started                          | -                   |
+  | `:unregistered` | DurableServer stopped                          | `:reason`           |
+  | `:updated`      | Metadata changed (DurableServer or member)     | `:previous_meta`    |
+  | `:joined`       | Process joined via `join/3`                    | -                   |
+  | `:left`         | Process left via `leave/2` or died             | `:reason`           |
 
   All payloads include: `:supervisor`, `:key`, `:pid`, `:meta`
 
@@ -280,16 +280,24 @@ defmodule DurableServer.PubSub do
   ## Returns
 
   - `:ok` on success
-  - `{:error, reason}` on failure
+  - `{:error, :already_member}` if already a member (use `update/4` to change metadata)
+  - `{:error, reason}` on other failures
   """
   def join(supervisor_name, key, meta \\ %{})
       when is_atom(supervisor_name) and is_binary(key) and is_map(meta) do
     scope = DurableServer.Supervisor.syn_scope(supervisor_name)
     pid = self()
 
-    case :syn.join(scope, key, pid, meta) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
+    # Check if already a member - must use update/4 to change metadata
+    case get_group_member_meta(scope, key, pid) do
+      {:ok, _existing_meta} ->
+        {:error, :already_member}
+
+      :error ->
+        case :syn.join(scope, key, pid, meta) do
+          :ok -> :ok
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
 
@@ -308,6 +316,80 @@ defmodule DurableServer.PubSub do
     case :syn.leave(scope, key, pid) do
       :ok -> :ok
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Update metadata for a process's membership in a key.
+
+  This updates the metadata associated with the process in the given key's
+  member list and broadcasts an `:updated` event to subscribers.
+
+  Syn's process groups don't natively fire callbacks on metadata updates,
+  so this function manually broadcasts the event after updating the metadata
+  in syn. The order of operations is:
+
+  1. Fetch the current metadata for the process
+  2. Update the metadata in syn (via re-join)
+  3. Broadcast `:updated` event to subscribers
+
+  This ensures that `members/2` will return the new metadata before subscribers
+  receive the event.
+
+  Note: The `:updated` event is the same type used for DurableServer metadata
+  changes. If you need to distinguish between DurableServer and member updates,
+  you can check if the pid is registered in the syn registry (DurableServer) or
+  only in the process group (member).
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `key` - The exact key the process has joined
+  - `new_meta` - The new metadata map
+  - `pid` - The pid to update (defaults to `self()`)
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, :not_a_member}` if the process is not a member of the key
+  - `{:error, reason}` on other failures
+  """
+  def update(supervisor_name, key, new_meta, pid \\ self())
+      when is_atom(supervisor_name) and is_binary(key) and is_map(new_meta) and is_pid(pid) do
+    scope = DurableServer.Supervisor.syn_scope(supervisor_name)
+
+    # Get current metadata before updating
+    case get_group_member_meta(scope, key, pid) do
+      {:ok, old_meta} ->
+        # Update metadata in syn (re-join updates in place, no callback fired)
+        case :syn.join(scope, key, pid, new_meta) do
+          :ok ->
+            # Broadcast the update event
+            __broadcast__(supervisor_name, :updated, key, pid, new_meta, %{
+              previous_meta: old_meta
+            })
+
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      :error ->
+        {:error, :not_a_member}
+    end
+  end
+
+  # Get metadata for a specific pid in a process group
+  defp get_group_member_meta(scope, key, pid) do
+    try do
+      case Enum.find(:syn.members(scope, key), fn {p, _meta} -> p == pid end) do
+        {^pid, meta} -> {:ok, meta}
+        nil -> :error
+      end
+    rescue
+      # syn raises ArgumentError if the group doesn't exist
+      ArgumentError -> :error
     end
   end
 
