@@ -12,6 +12,7 @@ It implements fault-tolerant, stateful processes that can survive node failures,
 - **Sticky placement**: Environment variable-based placement preferences (e.g., same machine, same region, etc.) with time-gated fallback to ensure servers restart on preferred nodes when possible
 - **Automatic recovery**: Failed processes are detected and restarted across the cluster
 - **Graceful shutdown**: Ensures state is synchronized before termination
+- **PubSub**: Subscribe to lifecycle events and broadcast messages between DurableServers and other processes (e.g., Phoenix Channels)
 
 ## Installation
 
@@ -106,6 +107,71 @@ State is synchronized to storage in these scenarios:
 1. **Manual sync**: Return `:sync` from any callback: `{:noreply, state, :sync}`
 2. **Automatic sync**: When `:auto_sync` is enabled, changes sync on the `:sync_every_ms` interval
 3. **Graceful shutdown**: State is always synced before termination
+
+## PubSub
+
+`DurableServer.PubSub` provides a pub/sub system for DurableServer lifecycle events and enables coordination between DurableServers and other processes (like Phoenix Channels).
+
+### Subscribing to Events
+
+Subscribe to lifecycle events for DurableServers:
+
+```elixir
+# Subscribe to a specific key
+:ok = DurableServer.PubSub.subscribe(MyDurableSup, "user/123")
+
+# Subscribe to all keys with a prefix
+:ok = DurableServer.PubSub.subscribe(MyDurableSup, "user/")
+
+# Subscribe to all events
+:ok = DurableServer.PubSub.subscribe(MyDurableSup, :all)
+```
+
+Subscribers receive messages in their mailbox:
+
+```elixir
+def handle_info({:durable_server, :registered, %{key: key, pid: pid}}, state) do
+  # A DurableServer started
+end
+
+def handle_info({:durable_server, :unregistered, %{key: key, reason: reason}}, state) do
+  # A DurableServer stopped
+end
+```
+
+Event types: `:registered`, `:unregistered`, `:updated`, `:joined`, `:left`
+
+### Joining as a Member
+
+Non-DurableServer processes can join keys to be discoverable and receive broadcasts:
+
+```elixir
+# Join a key (e.g., from a Phoenix Channel)
+:ok = DurableServer.PubSub.join(MyDurableSup, "room/123", %{type: :channel})
+
+# Query all members of a key (DurableServers + joined processes)
+members = DurableServer.PubSub.members(MyDurableSup, "room/123")
+# => [{#PID<0.150.0>, %{...}}, {#PID<0.200.0>, %{type: :channel}}]
+
+# Leave when done (also happens automatically on process death)
+:ok = DurableServer.PubSub.leave(MyDurableSup, "room/123")
+```
+
+### Broadcasting to Members
+
+Send messages to all members of a key:
+
+```elixir
+# From a DurableServer, broadcast to all connected channels
+DurableServer.PubSub.broadcast(MyDurableSup, state.key, {:new_message, message})
+```
+
+### Subscribe vs Join
+
+- **`subscribe/2`**: Receive lifecycle events (`:registered`, `:unregistered`, etc.) - system-generated
+- **`join/3`**: Be discoverable via `members/2` and receive `broadcast/3` messages - application-level
+
+These are independent - joining does not subscribe you to events, and subscribing does not make you discoverable.
 
 ## Running Tests
 
