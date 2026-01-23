@@ -941,13 +941,17 @@ defmodule DurableServer.LifecycleManager do
     # Get delays for this module
     delays = get_sticky_placement_delays(meta.supervisor, meta.module)
 
+    # Server needs restart if it crashed OR was gracefully stopped while permanent
+    # (e.g., by Terminator during deploy). Non-permanent stopped_graceful servers stay stopped.
+    needs_restart = Meta.crashed?(meta) or (Meta.stopped_graceful?(meta) and meta.permanent)
+
     cond do
-      # Crashed servers: immediate claim if we match a sticky level, or after delay
-      Meta.crashed?(meta) && my_matching_level != nil ->
+      # Crashed or gracefully stopped permanent servers: claim if we match a sticky level (respecting timing)
+      needs_restart && my_matching_level != nil ->
         # We match some level, check if enough time has passed for our level
         can_claim_at_level?(meta, my_matching_level, delays)
 
-      Meta.crashed?(meta) && my_matching_level == nil ->
+      needs_restart && my_matching_level == nil ->
         # We don't match any sticky level. Since my_matching_level is nil, this means:
         # 1. There IS a sticky config (otherwise find_my_matching_level returns 0)
         # 2. :any is NOT in the config (otherwise we'd match :any)
