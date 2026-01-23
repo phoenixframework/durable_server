@@ -296,7 +296,9 @@ defmodule DurableServer.SynEventHandler do
     scope
     |> to_string()
     |> String.trim_leading("durable_")
-    |> String.to_existing_atom()
+    # We already verified it's a durable scope, so we are fine without to_existing_atom.
+    # It's possible to race dynamic supervisor name creation, so we need to convert
+    |> String.to_atom()
   end
 
   defp extract_user_meta(%{user_meta: user_meta}), do: user_meta
