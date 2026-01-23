@@ -5,8 +5,12 @@ defmodule DurableServer.Application do
 
   @impl true
   def start(_type, _args) do
+    # Configure syn event handler for DurableServer conflict resolution and pubsub
+    Application.put_env(:syn, :event_handler, DurableServer.SynEventHandler)
+
     children = [
       {Finch, name: DurableServer.Finch},
+      {Registry, keys: :duplicate, name: DurableServer.PubSub.Registry},
       {Task.Supervisor, name: DurableServer.TaskSupervisor}
     ]
 

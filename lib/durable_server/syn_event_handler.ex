@@ -210,4 +210,95 @@ defmodule DurableServer.SynEventHandler do
       "[#{trace_ref}]: #{inspect(__MODULE__)}: " <> msg_func.()
     end)
   end
+
+  # Registry callbacks for DurableServer lifecycle events
+  # These fire on ALL cluster nodes when a DurableServer registers/unregisters
+
+  @impl true
+  def on_process_registered(scope, key, pid, meta, _reason) do
+    if durable_scope?(scope) and is_binary(key) do
+      supervisor_name = scope_to_supervisor(scope)
+      DurableServer.PubSub.__broadcast__(supervisor_name, :registered, key, pid, meta)
+    end
+
+    :ok
+  end
+
+  @impl true
+  def on_process_unregistered(scope, key, pid, meta, reason) do
+    if durable_scope?(scope) and is_binary(key) do
+      supervisor_name = scope_to_supervisor(scope)
+
+      DurableServer.PubSub.__broadcast__(supervisor_name, :unregistered, key, pid, meta, %{
+        reason: reason
+      })
+    end
+
+    :ok
+  end
+
+  @impl true
+  def on_registry_process_updated(scope, key, pid, meta, _reason) do
+    # 5-arity version without previous_meta
+    if durable_scope?(scope) and is_binary(key) do
+      supervisor_name = scope_to_supervisor(scope)
+      DurableServer.PubSub.__broadcast__(supervisor_name, :updated, key, pid, meta)
+    end
+
+    :ok
+  end
+
+  @impl true
+  def on_registry_process_updated(scope, key, pid, previous_meta, meta, _reason) do
+    # 6-arity version with previous_meta
+    if durable_scope?(scope) and is_binary(key) do
+      supervisor_name = scope_to_supervisor(scope)
+
+      DurableServer.PubSub.__broadcast__(supervisor_name, :updated, key, pid, meta, %{
+        previous_meta: extract_user_meta(previous_meta)
+      })
+    end
+
+    :ok
+  end
+
+  # Process group callbacks for joined pids
+  # These fire on ALL cluster nodes when a non-DurableServer process joins/leaves a key
+
+  @impl true
+  def on_process_joined(scope, group, pid, meta, _reason) do
+    # Only dispatch for string keys (actual keys), not atom groups (sup_name, module)
+    if durable_scope?(scope) and is_binary(group) do
+      supervisor_name = scope_to_supervisor(scope)
+      DurableServer.PubSub.__broadcast__(supervisor_name, :joined, group, pid, meta)
+    end
+
+    :ok
+  end
+
+  @impl true
+  def on_process_left(scope, group, pid, meta, reason) do
+    # Only dispatch for string keys (actual keys), not atom groups (sup_name, module)
+    if durable_scope?(scope) and is_binary(group) do
+      supervisor_name = scope_to_supervisor(scope)
+
+      DurableServer.PubSub.__broadcast__(supervisor_name, :left, group, pid, meta, %{
+        reason: reason
+      })
+    end
+
+    :ok
+  end
+
+  defp durable_scope?(scope), do: String.starts_with?(to_string(scope), "durable_")
+
+  defp scope_to_supervisor(scope) do
+    scope
+    |> to_string()
+    |> String.trim_leading("durable_")
+    |> String.to_existing_atom()
+  end
+
+  defp extract_user_meta(%{user_meta: user_meta}), do: user_meta
+  defp extract_user_meta(meta) when is_map(meta), do: meta
 end
