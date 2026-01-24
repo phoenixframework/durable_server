@@ -941,9 +941,16 @@ defmodule DurableServer.LifecycleManager do
     # Get delays for this module
     delays = get_sticky_placement_delays(meta.supervisor, meta.module)
 
-    # Server needs restart if it crashed OR was gracefully stopped while permanent
-    # (e.g., by Terminator during deploy). Non-permanent stopped_graceful servers stay stopped.
-    needs_restart = Meta.crashed?(meta) or (Meta.stopped_graceful?(meta) and meta.permanent)
+    # Server needs restart if:
+    # - It crashed (status: :crashed)
+    # - It was gracefully stopped while permanent (e.g., by Terminator during deploy)
+    # - It has :running status but we're in orphan_claimable? (meaning the process died
+    #   without updating storage - an abnormal crash that bypassed termination callbacks)
+    # Non-permanent servers stay stopped.
+    needs_restart =
+      Meta.crashed?(meta) or
+        (Meta.running?(meta) and meta.permanent) or
+        (Meta.stopped_graceful?(meta) and meta.permanent)
 
     cond do
       # Crashed or gracefully stopped permanent servers: claim if we match a sticky level (respecting timing)
