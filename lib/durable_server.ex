@@ -743,6 +743,20 @@ defmodule DurableServer do
   end
 
   @doc """
+  Gets the supervisor of the current DurableServer process.
+
+  Can only be called from a durable server process as the data is stored in the pdict.
+
+  Raises RuntimeError if not set.
+  """
+  def get_supervisor! do
+    case Process.get(:durable_meta) do
+      %{supervisor: name} when is_atom(name) -> name
+      _ -> raise "no supervisor found in metadata"
+    end
+  end
+
+  @doc """
   Gets the task supervisor of the current DurableServer process.
 
   Can only be called from a durable server process as the data is stored in the pdict.
