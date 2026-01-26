@@ -2363,9 +2363,40 @@ defmodule DurableServer do
       :stale ->
         :expired
 
-      # no heartbeat data, treat as expired
+      # no heartbeat data in local cache - fetch directly from storage as fallback
+      # this prevents incorrectly treating a node as expired just because we haven't
+      # refreshed our cache since that node joined the cluster
       :unknown ->
+        check_lock_via_storage_heartbeat(meta)
+    end
+  end
+
+  # Fallback when local heartbeat cache returns :unknown - fetch heartbeat directly from storage
+  defp check_lock_via_storage_heartbeat(
+         %Meta{supervisor: supervisor_name, node_str: node_str, node_ref: stored_node_ref} = meta
+       ) do
+    case LifecycleManager.fetch_node_heartbeat_from_storage(supervisor_name, node_str) do
+      {:healthy, %{node_ref: ^stored_node_ref}} ->
+        {:locked, meta.pid}
+
+      {:healthy, %{node_ref: new_node_ref}} when new_node_ref > stored_node_ref ->
         :expired
+
+      {:healthy, %{node_ref: new_node_ref}} when new_node_ref < stored_node_ref ->
+        {:locked, meta.pid}
+
+      :stale ->
+        :expired
+
+      # No heartbeat in storage - node may have crashed before writing any heartbeat,
+      # or heartbeat was cleaned up. Treat as expired.
+      :not_found ->
+        :expired
+
+      # Storage fetch failed - be conservative and assume lock is held to avoid
+      # incorrectly stealing a lock due to transient storage errors
+      {:error, _reason} ->
+        {:locked, meta.pid}
     end
   end
 
