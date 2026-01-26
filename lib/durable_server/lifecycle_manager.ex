@@ -476,16 +476,22 @@ defmodule DurableServer.LifecycleManager do
 
     put_duration = System.monotonic_time(:millisecond) - put_start
 
-    # Wait for cache refresh (non-critical, just log)
+    # Wait for cache refresh
     {cache_result, cache_duration} = Task.await(cache_task, :timer.seconds(15))
 
     case cache_result do
-      {:ok, count, cleaned_count} when cleaned_count > 0 ->
+      {:ok, _count, _cleaned_count, error_count} when error_count > 0 ->
+        # A partial view of the cluster is dangerous - we could incorrectly treat
+        # healthy nodes as expired and steal their locks
+        raise RuntimeError,
+              "failed to refresh heartbeat cache: #{error_count} heartbeat fetch errors"
+
+      {:ok, count, cleaned_count, _error_count} when cleaned_count > 0 ->
         log(state, :debug, fn ->
           "Refreshed heartbeat cache with #{count} nodes, cleaned up #{cleaned_count} dead nodes in #{cache_duration}ms"
         end)
 
-      {:ok, count, _cleaned_count} ->
+      {:ok, count, _cleaned_count, _error_count} ->
         log(state, :debug, fn ->
           "Refreshed heartbeat cache with #{count} nodes in #{cache_duration}ms"
         end)
@@ -601,38 +607,33 @@ defmodule DurableServer.LifecycleManager do
       )
       |> Enum.map(& &1.key)
 
-    {heartbeats, dead_nodes} =
+    results =
       keys
       |> Task.async_stream(
         fn key ->
           case ObjectStore.get_object(state.object_store, key) do
             {:ok, %{body: body}} ->
               case JSON.decode(body) do
-                {:ok,
-                 %{
-                   "node" => node,
-                   "node_ref" => node_ref,
-                   "last_heartbeat_at" => timestamp
-                 } = data} ->
-                  # parse capacity, resources, env_vars, and heartbeat_meta (nil for old heartbeats)
-                  capacity = parse_capacity(data["capacity"])
-                  resources = parse_resources(data["resources"])
-                  env_vars = data["env_vars"] || %{}
-                  heartbeat_meta = parse_heartbeat_meta(data["heartbeat_meta"])
+                {:ok, data} ->
+                  case parse_heartbeat_data(data) do
+                    {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
+                      if current_time - timestamp > dead_node_threshold_ms do
+                        {:dead, key, node, node_ref, timestamp}
+                      else
+                        {:alive, node, node_ref, timestamp, capacity, resources, env_vars,
+                         heartbeat_meta}
+                      end
 
-                  if current_time - timestamp > dead_node_threshold_ms do
-                    {:dead, key, node, node_ref, timestamp}
-                  else
-                    {:alive, node, node_ref, timestamp, capacity, resources, env_vars,
-                     heartbeat_meta}
+                    {:error, :invalid_format} ->
+                      {:fetch_error, key, :invalid_format}
                   end
 
-                _ ->
-                  nil
+                {:error, decode_reason} ->
+                  {:fetch_error, key, {:json_decode, decode_reason}}
               end
 
-            _ ->
-              nil
+            {:error, reason} ->
+              {:fetch_error, key, reason}
           end
         end,
         max_concurrency: 20,
@@ -641,16 +642,36 @@ defmodule DurableServer.LifecycleManager do
       )
       |> Enum.map(fn
         {:ok, result} -> result
-        {:exit, _reason} -> nil
+        {:exit, reason} -> {:task_error, reason}
       end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.split_with(fn
-        {:alive, _node, _node_ref, _timestamp, _capacity, _resources, _env_vars, _heartbeat_meta} ->
-          true
 
-        {:dead, _key, _node, _node_ref, _timestamp} ->
-          false
+    # Separate results into categories
+    {heartbeats, rest} =
+      Enum.split_with(results, fn
+        {:alive, _, _, _, _, _, _, _} -> true
+        _ -> false
       end)
+
+    {dead_nodes, errors} =
+      Enum.split_with(rest, fn
+        {:dead, _, _, _, _} -> true
+        _ -> false
+      end)
+
+    # Log any errors
+    Enum.each(errors, fn
+      {:fetch_error, key, reason} ->
+        log(state, :warning, fn ->
+          "Failed to fetch heartbeat for #{key}: #{inspect(reason)}"
+        end)
+
+      {:task_error, reason} ->
+        log(state, :warning, fn ->
+          "Heartbeat fetch task failed: #{inspect(reason)}"
+        end)
+    end)
+
+    error_count = length(errors)
 
     # extract heartbeat data for alive nodes
     live_heartbeats =
@@ -683,7 +704,7 @@ defmodule DurableServer.LifecycleManager do
 
     :ets.insert(state.heartbeat_table, live_heartbeats)
 
-    {:ok, length(live_heartbeats), cleaned_count}
+    {:ok, length(live_heartbeats), cleaned_count, error_count}
   end
 
   defp heartbeat_table_name(supervisor_name) when is_atom(supervisor_name) do
@@ -774,6 +795,78 @@ defmodule DurableServer.LifecycleManager do
   rescue
     # ETS table doesn't exist yet (node still initializing)
     ArgumentError -> :unknown
+  end
+
+  @doc """
+  Fetch a node's heartbeat directly from object storage.
+
+  This is used as a fallback when the local heartbeat cache returns `:unknown`,
+  to avoid incorrectly treating a healthy node as expired just because we haven't
+  refreshed our cache since that node joined.
+
+  When a healthy heartbeat is fetched, it is also written to the local ETS cache
+  so subsequent lookups will find it without hitting storage.
+
+  Returns:
+  - `{:healthy, %{node_ref: node_ref}}` if heartbeat exists and is fresh
+  - `:stale` if heartbeat exists but is too old
+  - `:not_found` if no heartbeat exists for this node
+  - `{:error, reason}` on fetch failure
+  """
+  def fetch_node_heartbeat_from_storage(supervisor_name, node_str)
+      when is_atom(supervisor_name) and is_binary(node_str) do
+    with %{prefix: prefix, heartbeat_interval_ms: heartbeat_interval_ms, object_store: object_store} <-
+           DurableServer.Supervisor.__get_config__(supervisor_name) do
+      key = "#{prefix}__nodes/#{node_str}"
+
+      case DurableServer.ObjectStore.get_object(object_store, key) do
+        {:ok, %{body: body}} ->
+          case JSON.decode(body) do
+            {:ok, data} ->
+              case parse_heartbeat_data(data) do
+                {:ok, {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
+                  current_time = System.system_time(:millisecond)
+
+                  if current_time - timestamp > heartbeat_interval_ms * 2 do
+                    :stale
+                  else
+                    # Cache the fetched heartbeat so subsequent lookups are fast
+                    cache_fetched_heartbeat(supervisor_name, data)
+                    {:healthy, %{node_ref: node_ref}}
+                  end
+
+                {:error, :invalid_format} ->
+                  {:error, :invalid_heartbeat_format}
+              end
+
+            {:error, _reason} ->
+              {:error, :invalid_heartbeat_format}
+          end
+
+        {:error, :not_found} ->
+          :not_found
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      nil -> {:error, :supervisor_not_ready}
+    end
+  end
+
+  # Cache a heartbeat fetched from storage into the local ETS table
+  defp cache_fetched_heartbeat(supervisor_name, data) do
+    case parse_heartbeat_data(data) do
+      {:ok, heartbeat_tuple} ->
+        table_name = heartbeat_table_name(supervisor_name)
+        :ets.insert(table_name, heartbeat_tuple)
+
+      {:error, :invalid_format} ->
+        :ok
+    end
+  rescue
+    # ETS table might not exist if supervisor is shutting down
+    ArgumentError -> :ok
   end
 
   defp discover_and_restart_servers(%LifecycleManager{} = state) do
@@ -1451,6 +1544,24 @@ defmodule DurableServer.LifecycleManager do
 
   defp parse_heartbeat_meta(nil), do: nil
   defp parse_heartbeat_meta(%{} = heartbeat_meta), do: heartbeat_meta
+
+  # Parses decoded heartbeat JSON into a structured tuple for ETS storage
+  # Returns {:ok, {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}}
+  # or {:error, :invalid_format}
+  defp parse_heartbeat_data(%{
+         "node" => node_str,
+         "node_ref" => node_ref,
+         "last_heartbeat_at" => timestamp
+       } = data) do
+    capacity = parse_capacity(data["capacity"])
+    resources = parse_resources(data["resources"])
+    env_vars = data["env_vars"] || %{}
+    heartbeat_meta = parse_heartbeat_meta(data["heartbeat_meta"])
+
+    {:ok, {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}}
+  end
+
+  defp parse_heartbeat_data(_), do: {:error, :invalid_format}
 
   @doc """
   Finds nodes that can accept the given module, sorted by sticky placement preference and busyness.
