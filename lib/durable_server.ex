@@ -2372,7 +2372,9 @@ defmodule DurableServer do
   end
 
   # Fallback when local heartbeat cache returns :unknown - fetch heartbeat directly from storage
-  defp check_lock_via_storage_heartbeat(%Meta{supervisor: supervisor_name, node_str: node_str, node_ref: stored_node_ref} = meta) do
+  defp check_lock_via_storage_heartbeat(
+         %Meta{supervisor: supervisor_name, node_str: node_str, node_ref: stored_node_ref} = meta
+       ) do
     case LifecycleManager.fetch_node_heartbeat_from_storage(supervisor_name, node_str) do
       {:healthy, %{node_ref: ^stored_node_ref}} ->
         {:locked, meta.pid}

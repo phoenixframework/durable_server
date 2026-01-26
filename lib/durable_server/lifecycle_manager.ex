@@ -616,7 +616,8 @@ defmodule DurableServer.LifecycleManager do
               case JSON.decode(body) do
                 {:ok, data} ->
                   case parse_heartbeat_data(data) do
-                    {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
+                    {:ok,
+                     {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
                       if current_time - timestamp > dead_node_threshold_ms do
                         {:dead, key, node, node_ref, timestamp}
                       else
@@ -815,7 +816,11 @@ defmodule DurableServer.LifecycleManager do
   """
   def fetch_node_heartbeat_from_storage(supervisor_name, node_str)
       when is_atom(supervisor_name) and is_binary(node_str) do
-    with %{prefix: prefix, heartbeat_interval_ms: heartbeat_interval_ms, object_store: object_store} <-
+    with %{
+           prefix: prefix,
+           heartbeat_interval_ms: heartbeat_interval_ms,
+           object_store: object_store
+         } <-
            DurableServer.Supervisor.__get_config__(supervisor_name) do
       key = "#{prefix}__nodes/#{node_str}"
 
@@ -824,7 +829,9 @@ defmodule DurableServer.LifecycleManager do
           case JSON.decode(body) do
             {:ok, data} ->
               case parse_heartbeat_data(data) do
-                {:ok, {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
+                {:ok,
+                 {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars,
+                  _heartbeat_meta}} ->
                   current_time = System.system_time(:millisecond)
 
                   if current_time - timestamp > heartbeat_interval_ms * 2 do
@@ -1548,11 +1555,13 @@ defmodule DurableServer.LifecycleManager do
   # Parses decoded heartbeat JSON into a structured tuple for ETS storage
   # Returns {:ok, {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}}
   # or {:error, :invalid_format}
-  defp parse_heartbeat_data(%{
-         "node" => node_str,
-         "node_ref" => node_ref,
-         "last_heartbeat_at" => timestamp
-       } = data) do
+  defp parse_heartbeat_data(
+         %{
+           "node" => node_str,
+           "node_ref" => node_ref,
+           "last_heartbeat_at" => timestamp
+         } = data
+       ) do
     capacity = parse_capacity(data["capacity"])
     resources = parse_resources(data["resources"])
     env_vars = data["env_vars"] || %{}
