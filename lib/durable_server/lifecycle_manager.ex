@@ -649,13 +649,16 @@ defmodule DurableServer.LifecycleManager do
     # Separate results into categories
     {heartbeats, rest} =
       Enum.split_with(results, fn
-        {:alive, _, _, _, _, _, _, _} -> true
-        _ -> false
+        {:alive, _node, _node_ref, _timestamp, _capacity, _resources, _env_vars, _heartbeat_meta} ->
+          true
+
+        _ ->
+          false
       end)
 
     {dead_nodes, errors} =
       Enum.split_with(rest, fn
-        {:dead, _, _, _, _} -> true
+        {:dead, _key, _node, _node_ref, _timestamp} -> true
         _ -> false
       end)
 
