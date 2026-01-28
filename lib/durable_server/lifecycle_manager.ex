@@ -1604,79 +1604,87 @@ defmodule DurableServer.LifecycleManager do
 
   """
   def find_eligible_nodes(supervisor_name, module, opts \\ []) when is_atom(supervisor_name) do
-    limit = Keyword.get(opts, :limit, 3)
-    key = Keyword.get(opts, :key)
-    my_node = Node.self()
-
     heartbeat_table = heartbeat_table_name(supervisor_name)
+    # Handle case where table doesn't exist yet during startup
+    case :ets.whereis(heartbeat_table) do
+      :undefined ->
+        []
 
-    # Get sticky placement - prefer passed in opts (already augmented), otherwise load and augment
-    sticky_placement =
-      cond do
-        Keyword.has_key?(opts, :sticky_placement) ->
-          Keyword.get(opts, :sticky_placement)
+      _tid ->
+        limit = Keyword.get(opts, :limit, 3)
+        key = Keyword.get(opts, :key)
+        my_node = Node.self()
 
-        key != nil ->
-          # Load and augment persisted sticky placement for existing servers
-          DurableServer.Supervisor.__get_augmented_sticky_placement__(
-            supervisor_name,
-            module,
-            key
-          )
+        # Get sticky placement - prefer passed in opts (already augmented), otherwise load and augment
+        sticky_placement =
+          cond do
+            Keyword.has_key?(opts, :sticky_placement) ->
+              Keyword.get(opts, :sticky_placement)
 
-        true ->
-          # No key means this is for a new server - sticky placement doesn't apply yet
-          # since we don't know what env vars it will have until it starts
-          nil
-      end
+            key != nil ->
+              # Load and augment persisted sticky placement for existing servers
+              DurableServer.Supervisor.__get_augmented_sticky_placement__(
+                supervisor_name,
+                module,
+                key
+              )
 
-    now = System.system_time(:millisecond)
-
-    # scan ETS cache for all live nodes
-    :ets.tab2list(heartbeat_table)
-    |> Enum.map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars, _heartbeat_meta} ->
-      try do
-        node = String.to_existing_atom(node_str)
-
-        # Check if heartbeat is fresh enough to consider the node healthy
-        # Use same threshold as orphan claiming to determine node staleness
-        heartbeat_age_ms = now - timestamp
-
-        health =
-          if heartbeat_age_ms <= @node_health_staleness_threshold_ms do
-            {:healthy, %{node_ref: node_ref, capacity: capacity, resources: resources}}
-          else
-            :stale
+            true ->
+              # No key means this is for a new server - sticky placement doesn't apply yet
+              # since we don't know what env vars it will have until it starts
+              nil
           end
 
-        # Calculate sticky placement matching level for this node
-        matching_level = find_matching_level(sticky_placement, env_vars)
+        now = System.system_time(:millisecond)
 
-        {node, health, matching_level, timestamp}
-      rescue
-        ArgumentError ->
-          # String.to_existing_atom failed - node atom doesn't exist yet
-          nil
-      end
-    end)
-    |> Enum.reject(&is_nil/1)
-    |> Enum.filter(fn {node, health, matching_level, _timestamp} ->
-      # always exclude local node - we only look up eligible nodes after local placement fails
-      # pass matching_level so sticky nodes bypass disk check (child's data is on that node's disk)
-      node != my_node and can_node_accept_module?(health, module, matching_level: matching_level)
-    end)
-    # sort: prefer exact sticky placement matches first, then by least busy, then by most recent heartbeat
-    |> Enum.sort_by(fn {_node, health, matching_level, timestamp} ->
-      # Lower matching_level is better (0 = exact match, 1 = less specific, etc.)
-      # nil means no match, treat as worst
-      level_priority = if matching_level == nil, do: 999, else: matching_level
-      busyness = calculate_node_busyness(health, module)
-      # Negate timestamp so more recent (higher timestamp) comes first
-      staleness = -timestamp
-      {level_priority, busyness, staleness}
-    end)
-    |> Enum.take(limit)
-    |> Enum.map(fn {node, _health, _matching_level, _timestamp} -> node end)
+        # scan ETS cache for all live nodes
+        :ets.tab2list(heartbeat_table)
+        |> Enum.map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars,
+                        _heartbeat_meta} ->
+          try do
+            node = String.to_existing_atom(node_str)
+
+            # Check if heartbeat is fresh enough to consider the node healthy
+            # Use same threshold as orphan claiming to determine node staleness
+            heartbeat_age_ms = now - timestamp
+
+            health =
+              if heartbeat_age_ms <= @node_health_staleness_threshold_ms do
+                {:healthy, %{node_ref: node_ref, capacity: capacity, resources: resources}}
+              else
+                :stale
+              end
+
+            # Calculate sticky placement matching level for this node
+            matching_level = find_matching_level(sticky_placement, env_vars)
+
+            {node, health, matching_level, timestamp}
+          rescue
+            ArgumentError ->
+              # String.to_existing_atom failed - node atom doesn't exist yet
+              nil
+          end
+        end)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.filter(fn {node, health, matching_level, _timestamp} ->
+          # always exclude local node - we only look up eligible nodes after local placement fails
+          # pass matching_level so sticky nodes bypass disk check (child's data is on that node's disk)
+          node != my_node and
+            can_node_accept_module?(health, module, matching_level: matching_level)
+        end)
+        # sort: prefer exact sticky placement matches first, then by least busy, then by most recent heartbeat
+        |> Enum.sort_by(fn {_node, health, matching_level, timestamp} ->
+          # Lower matching_level is better (0 = exact match, 1 = less specific, etc.)
+          # nil means no match, treat as worst
+          level_priority = if matching_level == nil, do: 999, else: matching_level
+          busyness = calculate_node_busyness(health, module)
+          # Negate timestamp so more recent (higher timestamp) comes first
+          staleness = -timestamp
+          {level_priority, busyness, staleness}
+        end)
+        |> Enum.take(limit)
+        |> Enum.map(fn {node, _health, _matching_level, _timestamp} -> node end)
+    end
   end
 
   # Find which sticky placement level matches the given env_vars from a node's heartbeat
