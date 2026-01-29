@@ -529,6 +529,10 @@ defmodule DurableServer.PubSub do
     |> Enum.filter(fn {pattern, _pid} -> matches_pattern?(pattern, key) end)
     |> Enum.map(fn {_pattern, pid} -> pid end)
     |> Enum.uniq()
+  rescue
+    # Registry doesn't exist yet during startup
+    # (syn callbacks can fire before DurableServer.Application starts the registry)
+    ArgumentError -> []
   end
 
   # Extract user_meta from DurableServer meta, or return the meta as-is for joined pids

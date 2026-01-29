@@ -8,11 +8,10 @@ defmodule DurableServer.ObjectStore do
   ## Consistency
 
   All operations are consistent by default. Consistent operations send then
-  `x-tigris-consistent true` header, and the `x-tigris-region` header to the configured
-  `:default_region`. This guarantees consistency with reads and writes, regardless of the
-  client region. Clients can opt into local region requests with `consistent: false` on a
-  case by case basis, to favor speed and reduced latency at the cost of consistency
-  on a base-by-base basis.
+  `x-tigris-consistent true` header. This guarantees consistency with reads and writes,
+  regardless of the client region. Clients can opt into local region request
+  with `consistent: false` on a case by case basis, to favor speed and reduced latency
+  at the cost of consistency on a base-by-base basis.
   """
 
   @default_timeout 30_000
@@ -652,15 +651,12 @@ defmodule DurableServer.ObjectStore do
       if consistent do
         computed =
           [
-            {"x-tigris-consistent", "true"},
-            # we MUST put the default region for consistent requests to avoid a race where
-            # an write for an unknown object from two different regions occurs
-            {"x-tigris-region", client.default_region}
+            {"x-tigris-consistent", "true"}
           ]
 
         new_caller_headers =
           Enum.filter(initial_caller_headers, fn {key, _val} ->
-            String.downcase(key) not in ["x-tigris-consistent", "x-tigris-region"]
+            String.downcase(key) not in ["x-tigris-consistent"]
           end)
 
         {computed, new_caller_headers, client.default_region}
