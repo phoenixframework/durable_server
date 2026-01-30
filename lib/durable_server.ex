@@ -1173,7 +1173,6 @@ defmodule DurableServer do
     case DurableServer.Supervisor.__register_child__(
            state.supervisor,
            state.key,
-           self(),
            %{
              key: state.key,
              module: state.module,
