@@ -10,7 +10,7 @@ defmodule DurableServer.Application do
 
     children = [
       {Finch, name: DurableServer.Finch},
-      {Registry, keys: :duplicate, name: DurableServer.PubSub.Registry},
+      {Registry, keys: :duplicate, name: DurableServer.Cluster.Registry},
       {Task.Supervisor, name: DurableServer.TaskSupervisor}
     ]
 

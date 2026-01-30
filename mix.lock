@@ -15,6 +15,6 @@
   "req": {:hex, :req, "0.5.16", "99ba6a36b014458e52a8b9a0543bfa752cb0344b2a9d756651db1281d4ba4450", [:mix], [{:brotli, "~> 0.3.1", [hex: :brotli, repo: "hexpm", optional: true]}, {:ezstd, "~> 1.0", [hex: :ezstd, repo: "hexpm", optional: true]}, {:finch, "~> 0.17", [hex: :finch, repo: "hexpm", optional: false]}, {:jason, "~> 1.0", [hex: :jason, repo: "hexpm", optional: false]}, {:mime, "~> 2.0.6 or ~> 2.1", [hex: :mime, repo: "hexpm", optional: false]}, {:nimble_csv, "~> 1.0", [hex: :nimble_csv, repo: "hexpm", optional: true]}, {:plug, "~> 1.0", [hex: :plug, repo: "hexpm", optional: true]}], "hexpm", "974a7a27982b9b791df84e8f6687d21483795882a7840e8309abdbe08bb06f09"},
   "req_s3": {:hex, :req_s3, "0.2.3", "ede5f4c792cf39995379307733ff4593032a876f38da29d9d7ea03881b498b51", [:mix], [{:req, "~> 0.5.6", [hex: :req, repo: "hexpm", optional: false]}], "hexpm", "31b5d52490495c8aeea7e3c5cbcec82f49035e11bdaf41f0e58ab716fefe44ca"},
   "sweet_xml": {:hex, :sweet_xml, "0.7.5", "803a563113981aaac202a1dbd39771562d0ad31004ddbfc9b5090bdcd5605277", [:mix], [], "hexpm", "193b28a9b12891cae351d81a0cead165ffe67df1b73fe5866d10629f4faefb12"},
-  "syn": {:git, "https://github.com/chrismccord/syn.git", "cf2b31844b00e229fde0e94dba418011ab2f3a38", []},
+  "syn": {:git, "https://github.com/chrismccord/syn.git", "c89895f0553a08114d60f854d9fff88f60a6a23b", []},
   "telemetry": {:hex, :telemetry, "1.3.0", "fedebbae410d715cf8e7062c96a1ef32ec22e764197f70cda73d82778d61e7a2", [:rebar3], [], "hexpm", "7015fc8919dbe63764f4b4b87a95b7c0996bd539e0d499be6ec9d7f3875b79e6"},
 }

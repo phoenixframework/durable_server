@@ -216,9 +216,14 @@ defmodule DurableServer.SynEventHandler do
 
   @impl true
   def on_process_registered(scope, key, pid, meta, _reason) do
-    if durable_scope?(scope) and is_binary(key) do
-      supervisor_name = scope_to_supervisor(scope)
-      DurableServer.PubSub.__broadcast__(supervisor_name, :registered, key, pid, meta)
+    case parse_scope(scope) do
+      {supervisor_name, cluster} when is_binary(key) ->
+        DurableServer.Cluster.__broadcast__(supervisor_name, :registered, key, pid, meta, %{
+          cluster: cluster
+        })
+
+      _ ->
+        :ok
     end
 
     :ok
@@ -226,12 +231,15 @@ defmodule DurableServer.SynEventHandler do
 
   @impl true
   def on_process_unregistered(scope, key, pid, meta, reason) do
-    if durable_scope?(scope) and is_binary(key) do
-      supervisor_name = scope_to_supervisor(scope)
+    case parse_scope(scope) do
+      {supervisor_name, cluster} when is_binary(key) ->
+        DurableServer.Cluster.__broadcast__(supervisor_name, :unregistered, key, pid, meta, %{
+          reason: reason,
+          cluster: cluster
+        })
 
-      DurableServer.PubSub.__broadcast__(supervisor_name, :unregistered, key, pid, meta, %{
-        reason: reason
-      })
+      _ ->
+        :ok
     end
 
     :ok
@@ -240,9 +248,14 @@ defmodule DurableServer.SynEventHandler do
   @impl true
   def on_registry_process_updated(scope, key, pid, meta, _reason) do
     # 5-arity version without previous_meta
-    if durable_scope?(scope) and is_binary(key) do
-      supervisor_name = scope_to_supervisor(scope)
-      DurableServer.PubSub.__broadcast__(supervisor_name, :updated, key, pid, meta)
+    case parse_scope(scope) do
+      {supervisor_name, cluster} when is_binary(key) ->
+        DurableServer.Cluster.__broadcast__(supervisor_name, :updated, key, pid, meta, %{
+          cluster: cluster
+        })
+
+      _ ->
+        :ok
     end
 
     :ok
@@ -251,12 +264,15 @@ defmodule DurableServer.SynEventHandler do
   @impl true
   def on_registry_process_updated(scope, key, pid, previous_meta, meta, _reason) do
     # 6-arity version with previous_meta
-    if durable_scope?(scope) and is_binary(key) do
-      supervisor_name = scope_to_supervisor(scope)
+    case parse_scope(scope) do
+      {supervisor_name, cluster} when is_binary(key) ->
+        DurableServer.Cluster.__broadcast__(supervisor_name, :updated, key, pid, meta, %{
+          previous_meta: extract_user_meta(previous_meta),
+          cluster: cluster
+        })
 
-      DurableServer.PubSub.__broadcast__(supervisor_name, :updated, key, pid, meta, %{
-        previous_meta: extract_user_meta(previous_meta)
-      })
+      _ ->
+        :ok
     end
 
     :ok
@@ -268,9 +284,14 @@ defmodule DurableServer.SynEventHandler do
   @impl true
   def on_process_joined(scope, group, pid, meta, _reason) do
     # Only dispatch for string keys (actual keys), not atom groups (sup_name, module)
-    if durable_scope?(scope) and is_binary(group) do
-      supervisor_name = scope_to_supervisor(scope)
-      DurableServer.PubSub.__broadcast__(supervisor_name, :joined, group, pid, meta)
+    case parse_scope(scope) do
+      {supervisor_name, cluster} when is_binary(group) ->
+        DurableServer.Cluster.__broadcast__(supervisor_name, :joined, group, pid, meta, %{
+          cluster: cluster
+        })
+
+      _ ->
+        :ok
     end
 
     :ok
@@ -279,26 +300,42 @@ defmodule DurableServer.SynEventHandler do
   @impl true
   def on_process_left(scope, group, pid, meta, reason) do
     # Only dispatch for string keys (actual keys), not atom groups (sup_name, module)
-    if durable_scope?(scope) and is_binary(group) do
-      supervisor_name = scope_to_supervisor(scope)
+    case parse_scope(scope) do
+      {supervisor_name, cluster} when is_binary(group) ->
+        DurableServer.Cluster.__broadcast__(supervisor_name, :left, group, pid, meta, %{
+          reason: reason,
+          cluster: cluster
+        })
 
-      DurableServer.PubSub.__broadcast__(supervisor_name, :left, group, pid, meta, %{
-        reason: reason
-      })
+      _ ->
+        :ok
     end
 
     :ok
   end
 
-  defp durable_scope?(scope), do: String.starts_with?(to_string(scope), "durable_")
+  # Parse a syn scope into {supervisor_name, cluster_name}
+  # Returns nil for non-durable scopes
+  # Uses __cluster__ (double underscore) as delimiter to avoid ambiguity with
+  # supervisor names that contain "_cluster_"
+  defp parse_scope(scope) do
+    scope_str = to_string(scope)
 
-  defp scope_to_supervisor(scope) do
-    scope
-    |> to_string()
-    |> String.trim_leading("durable_")
-    # We already verified it's a durable scope, so we are fine without to_existing_atom.
-    # It's possible to race dynamic supervisor name creation, so we need to convert
-    |> String.to_atom()
+    cond do
+      String.contains?(scope_str, "__cluster__") ->
+        # Named cluster: "durable_MySup__cluster__game_servers"
+        [prefix_and_sup, cluster] = String.split(scope_str, "__cluster__", parts: 2)
+        sup = String.trim_leading(prefix_and_sup, "durable_")
+        {String.to_atom(sup), String.to_atom(cluster)}
+
+      String.starts_with?(scope_str, "durable_") ->
+        # Default cluster: "durable_MySup"
+        sup = String.trim_leading(scope_str, "durable_")
+        {String.to_atom(sup), nil}
+
+      true ->
+        nil
+    end
   end
 
   defp extract_user_meta(%{user_meta: user_meta}), do: user_meta

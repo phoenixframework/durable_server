@@ -201,21 +201,17 @@ defmodule DurableServer.Supervisor do
       iex> {pid, _meta} = DurableServer.Supervisor.lookup(MyDurableUp, "counter123")
   """
   def lookup(sup_name, key) when is_atom(sup_name) and is_binary(key) do
-    try do
-      case :syn.lookup(syn_scope(sup_name), key) do
-        {pid, meta} when is_pid(pid) ->
-          # handle case where node-local DOWN from a caller races syn cleanup
-          if node(pid) == Node.self() && !Process.alive?(pid) do
-            nil
-          else
-            {pid, meta.user_meta}
-          end
-
-        :undefined ->
+    case DurableServer.Cluster.lookup(sup_name, key) do
+      {pid, meta} when is_pid(pid) ->
+        # handle case where node-local DOWN from a caller races syn cleanup
+        if node(pid) == Node.self() && !Process.alive?(pid) do
           nil
-      end
-    catch
-      :error, {:invalid_scope, _} -> nil
+        else
+          {pid, meta.user_meta}
+        end
+
+      nil ->
+        nil
     end
   end
 
@@ -441,7 +437,7 @@ defmodule DurableServer.Supervisor do
       nil
   """
   def current_capacity(supervisor_name) when is_atom(supervisor_name) do
-    %{syn_scope: scope, ets_table: table_name} = __get_config__(supervisor_name)
+    %{ets_table: table_name} = __get_config__(supervisor_name)
 
     limits =
       case :ets.lookup(table_name, :capacity_limits) do
@@ -460,7 +456,7 @@ defmodule DurableServer.Supervisor do
         # add total capacity if configured
         capacity_map =
           if total_limit = max_children[:total] do
-            current = :syn.local_registry_count(scope)
+            current = DurableServer.Cluster.local_registry_count(supervisor_name)
             Map.put(capacity_map, :total, %{current: current, limit: total_limit})
           else
             capacity_map
@@ -471,13 +467,7 @@ defmodule DurableServer.Supervisor do
           max_children
           |> Enum.reject(fn {k, _v} -> k == :total end)
           |> Enum.reduce(capacity_map, fn {module, limit}, acc ->
-            current =
-              try do
-                :syn.local_member_count(scope, module)
-              rescue
-                _ -> 0
-              end
-
+            current = DurableServer.Cluster.local_member_count(supervisor_name, module)
             Map.put(acc, module, %{current: current, limit: limit})
           end)
 
@@ -1394,10 +1384,8 @@ defmodule DurableServer.Supervisor do
       #=> %{"user_1" => {#PID<0.123.0>, %{...}}}
   """
   def global_members(sup_name) when is_atom(sup_name) do
-    %{syn_scope: scope} = __get_config__(sup_name)
-
-    scope
-    |> :syn.members(sup_name)
+    sup_name
+    |> DurableServer.Cluster.members(sup_name)
     |> Enum.reduce(%{}, fn {pid, meta}, acc ->
       if node(pid) == Node.self() && !Process.alive?(pid) do
         acc
@@ -1408,10 +1396,8 @@ defmodule DurableServer.Supervisor do
   end
 
   def global_members(sup_name, module) when is_atom(sup_name) and is_atom(module) do
-    %{syn_scope: scope} = __get_config__(sup_name)
-
-    scope
-    |> :syn.members(module)
+    sup_name
+    |> DurableServer.Cluster.members(module)
     |> Enum.reduce(%{}, fn {pid, meta}, acc ->
       if node(pid) == Node.self() && !Process.alive?(pid) do
         acc
@@ -1419,26 +1405,24 @@ defmodule DurableServer.Supervisor do
         Map.put(acc, meta.key, {pid, meta})
       end
     end)
-  rescue
-    ArgumentError -> %{}
   end
 
   @doc false
-  def __register_child__(sup_name, key, pid, meta)
-      when is_atom(sup_name) and is_binary(key) and is_pid(pid) do
-    %{syn_scope: scope, ets_table: table_name} = __get_config__(sup_name)
+  def __register_child__(sup_name, key, meta)
+      when is_atom(sup_name) and is_binary(key) and is_map(meta) do
+    %{ets_table: table_name} = __get_config__(sup_name)
 
-    case :syn.register(scope, key, pid, meta) do
+    case DurableServer.Cluster.register(sup_name, key, meta) do
       :ok ->
-        :ok = :syn.join(scope, sup_name, pid, meta)
+        # Join internal tracking groups (by supervisor name and module)
+        :ok = DurableServer.Cluster.join_group(sup_name, sup_name, meta)
 
-        # Also register in module-specific scope for per-module counting
-        # Scopes are created at startup, but we check at runtime to handle hot code reloads
+        # Also join module-specific group for per-module counting
         if module = meta[:module] do
           [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
 
           if is_map(limits[:max_children]) and Map.has_key?(limits[:max_children], module) do
-            :ok = :syn.join(scope, module, pid, meta)
+            :ok = DurableServer.Cluster.join_group(sup_name, module, meta)
           end
         end
 

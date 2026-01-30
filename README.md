@@ -108,9 +108,9 @@ State is synchronized to storage in these scenarios:
 2. **Automatic sync**: When `:auto_sync` is enabled, changes sync on the `:sync_every_ms` interval
 3. **Graceful shutdown**: State is always synced before termination
 
-## PubSub
+## Cluster
 
-`DurableServer.PubSub` provides a pubsub system for DurableServer lifecycle events and enables coordination between DurableServers and other processes.
+`DurableServer.Cluster` provides cluster management, pubsub for lifecycle events, and process group coordination.
 
 ### Subscribing to Events
 
@@ -118,13 +118,13 @@ Subscribe to lifecycle events for DurableServers:
 
 ```elixir
 # Subscribe to a specific key
-:ok = DurableServer.PubSub.subscribe(MyDurableSup, "user/123")
+:ok = DurableServer.Cluster.subscribe(MyDurableSup, "user/123")
 
 # Subscribe to all keys with a prefix
-:ok = DurableServer.PubSub.subscribe(MyDurableSup, "user/")
+:ok = DurableServer.Cluster.subscribe(MyDurableSup, "user/")
 
 # Subscribe to all events
-:ok = DurableServer.PubSub.subscribe(MyDurableSup, :all)
+:ok = DurableServer.Cluster.subscribe(MyDurableSup, :all)
 ```
 
 Subscribers receive messages in their mailbox:
@@ -147,14 +147,14 @@ Non-DurableServer processes can join keys to be discoverable and receive broadca
 
 ```elixir
 # Join a key (e.g., from a Phoenix Channel)
-:ok = DurableServer.PubSub.join(MyDurableSup, "room/123", %{type: :channel})
+:ok = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{type: :channel})
 
 # Query all members of a key (DurableServers + joined processes)
-members = DurableServer.PubSub.members(MyDurableSup, "room/123")
+members = DurableServer.Cluster.members(MyDurableSup, "room/123")
 # => [{#PID<0.150.0>, %{...}}, {#PID<0.200.0>, %{type: :channel}}]
 
 # Leave when done (also happens automatically on process death)
-:ok = DurableServer.PubSub.leave(MyDurableSup, "room/123")
+:ok = DurableServer.Cluster.leave_group(MyDurableSup, "room/123")
 ```
 
 ### Broadcasting to Members
@@ -163,13 +163,28 @@ Send messages to all members of a key:
 
 ```elixir
 # From a DurableServer, broadcast to all connected channels
-DurableServer.PubSub.broadcast(MyDurableSup, state.key, {:new_message, message})
+DurableServer.Cluster.broadcast(MyDurableSup, state.key, {:new_message, message})
 ```
+
+### Named Clusters
+
+For advanced use cases, you can create isolated subclusters where only connected nodes receive events:
+
+```elixir
+# Connect this node to a named cluster
+:ok = DurableServer.Cluster.connect(MyDurableSup, :game_servers)
+
+# Join/subscribe/broadcast with the cluster: option
+:ok = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{}, cluster: :game_servers)
+:ok = DurableServer.Cluster.subscribe(MyDurableSup, :all, cluster: :game_servers)
+```
+
+Note: DurableServers always register in the default cluster to ensure global uniqueness. Named clusters are purely for the pub/sub layer.
 
 ### Subscribe vs Join
 
 - **`subscribe/2`**: Receive lifecycle events (`:registered`, `:unregistered`, etc.) - system-generated
-- **`join/3`**: Be discoverable via `members/2` and receive `broadcast/3` messages - application-level
+- **`join_group/3`**: Be discoverable via `members/2` and receive `broadcast/3` messages - application-level
 
 These are independent - joining does not subscribe you to events, and subscribing does not make you discoverable.
 
