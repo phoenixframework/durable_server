@@ -1,0 +1,890 @@
+defmodule DurableServer.Cluster do
+  @moduledoc """
+  Cluster management, distributed registry, and pubsub system for DurableServer.
+
+  This module provides:
+  - **Distributed registry**: Unique key => process mapping across all nodes
+  - **Process groups**: Allow processes to join/leave keys (many processes per key)
+  - **Cluster management**: Connect/disconnect nodes to isolated subclusters
+  - **Pubsub interface**: Subscribe to lifecycle events for registry and group changes
+
+  ## Consistency Model
+
+  All operations are **eventually consistent**. The underlying syn library uses
+  Erlang distribution to propagate state across nodes, which means:
+
+  - Writes (register, join_group, etc.) return immediately after local update
+  - Other nodes receive updates asynchronously via Erlang distribution
+  - During network partitions, nodes may have divergent views
+  - When partitions heal, conflicts are resolved (see `DurableServer.SynEventHandler`)
+
+  ## Clusters
+
+  By default, all operations use the supervisor's default cluster (syn scope). You can
+  optionally create isolated subclusters where only connected nodes receive events.
+
+  ### Default vs Named Clusters
+
+  - **Default cluster**: Uses scope `:"durable_<supervisor_name>"` - all nodes share this
+  - **Named clusters**: Use scope `:"durable_<supervisor_name>__cluster__<cluster_name>"`
+
+  Named clusters are useful when you want to partition your registry/pubsub layer while still
+  maintaining global uniqueness for DurableServers (which always register in the default
+  cluster).
+
+  ### Important: DurableServer Registration
+
+  DurableServers always register in the **default cluster** to ensure global uniqueness
+  via the distributed locking mechanism. Named clusters are purely for isolating your own
+  registries, process groups, and subscriptions to isolated subclusters. If a DurableServer
+  wants to participate in an isolated cluster, it can call `connect/2` and `join_group/4`
+  inside its `init` callback.
+
+  ## Core Concepts
+
+  ### Subscriptions vs Memberships
+
+  - **Subscriptions** (`subscribe/2`, `unsubscribe/2`): Receive events in your mailbox
+    when DurableServers or other processes register/join matching keys anywhere in the
+    cluster. Supports pattern matching on keys.
+
+  - **Memberships** (`join_group/3`, `leave_group/2`): Make your process discoverable cluster-wide
+    via `members/2`. Triggers `:joined`/`:left` events to subscribers.
+
+  These are independent - joining a key does NOT automatically subscribe you to events,
+  and subscribing does NOT make you discoverable via `members/2`.
+
+  ### String Groups vs Atom Groups
+
+  Process groups can use either **string** or **atom** names:
+
+  - **String groups** (e.g., `"room/123"`): Trigger `:joined`/`:left` pub/sub events.
+    Subscribers can pattern-match on these using prefix patterns like `"room/"`.
+
+  - **Atom groups** (e.g., `:my_module`): Do NOT trigger pub/sub events. Useful for
+    internal bookkeeping where you do not need or want pubsub network overhead.
+
+  ## Event Types
+
+  Events are delivered as messages to subscribed processes:
+
+      {:durable_server, event_type, payload}
+
+  | Event Type      | Trigger                                        | Extra Fields        |
+  |-----------------|------------------------------------------------|---------------------|
+  | `:registered`   | Process registered via `register/3`            | -                   |
+  | `:unregistered` | Process unregistered or died                   | `:reason`           |
+  | `:updated`      | Registry or group metadata changed             | `:previous_meta`    |
+  | `:joined`       | Process joined group via `join_group/3`        | -                   |
+  | `:left`         | Process left group or died                     | `:reason`           |
+
+  DurableServers automatically register/unregister during their lifecycle, so these
+  events can be used to track DurableServer start/stop.
+
+  All payloads include: `:supervisor`, `:cluster`, `:key`, `:pid`, `:meta`
+
+  ## Pattern Types
+
+  Subscriptions support three pattern types:
+
+  - `"user/123"` - Exact match, only events for this specific key
+  - `"user/"` - Prefix match, all keys starting with "user/"
+  - `:all` - All events for this supervisor
+
+  ## Self-Events
+
+  A process that subscribes to a pattern and then joins a matching key will receive
+  its own `:joined` event. Similarly for `:left` when leaving. Filter these in your
+  handler if needed:
+
+      def handle_info({:durable_server, :joined, %{pid: pid}}, state) when pid == self() do
+        # Ignore our own join event
+        {:noreply, state}
+      end
+
+  ## Examples
+
+  ### Basic Subscription
+
+      # Subscribe to all events for a specific key
+      :ok = DurableServer.Cluster.subscribe(MySup, "user/123")
+
+      # Subscribe to all keys under a prefix
+      :ok = DurableServer.Cluster.subscribe(MySup, "chat/")
+
+      # Subscribe to all events
+      :ok = DurableServer.Cluster.subscribe(MySup, :all)
+
+      # Handle events in a GenServer
+      def handle_info({:durable_server, :registered, %{key: key, pid: pid}}, state) do
+        IO.puts("DurableServer started: \#{key}")
+        {:noreply, state}
+      end
+
+      def handle_info({:durable_server, :unregistered, %{key: key, reason: reason}}, state) do
+        IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
+        {:noreply, state}
+      end
+
+  ### Joining as a Member
+
+      # Join a key to be discoverable by other processes
+      :ok = DurableServer.Cluster.join_group(MySup, "game/room/42", %{role: :spectator})
+
+      # Query all members of a key (DurableServers + joined processes)
+      members = DurableServer.Cluster.members(MySup, "game/room/42")
+      # => [{#PID<0.150.0>, %{module: GameRoom, ...}}, {#PID<0.200.0>, %{role: :spectator}}]
+
+      # Leave when done
+      :ok = DurableServer.Cluster.leave_group(MySup, "game/room/42")
+
+  ### Using Named Clusters
+
+      # Connect this node to a named cluster
+      :ok = DurableServer.Cluster.connect(MySup, :game_servers)
+
+      # Join a group in the named cluster
+      :ok = DurableServer.Cluster.join_group(MySup, "room/123", %{role: :member}, cluster: :game_servers)
+
+      # Subscribe to events in the named cluster
+      :ok = DurableServer.Cluster.subscribe(MySup, :all, cluster: :game_servers)
+
+      # Members and broadcast also support cluster option
+      DurableServer.Cluster.members(MySup, "room/123", cluster: :game_servers)
+      DurableServer.Cluster.broadcast(MySup, "room/123", {:msg, "hi"}, cluster: :game_servers)
+
+  ## Architecture Notes
+
+  - **Events are cluster-wide**: syn callbacks (`on_process_registered`, `on_process_joined`,
+    etc.) fire on ALL nodes in the cluster. This means a subscriber on Node A receives
+    events when a DurableServer registers on Node B.
+
+  - **Subscriptions** are stored per-node in an Elixir `Registry`, enabling pattern matching
+    and automatic cleanup when subscriber processes die.
+
+  - **Memberships** use syn process groups for cluster-wide distribution and automatic
+    cleanup when member processes die.
+  """
+
+  @registry DurableServer.Cluster.Registry
+
+  # ===========================================================================
+  # Cluster Management (Node ↔ Cluster)
+  # ===========================================================================
+
+  @doc """
+  Connect the local node to a named cluster.
+
+  This adds the current node to the syn scope for the named cluster, allowing it
+  to send and receive process group events within that cluster.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `cluster_name` - The name of the cluster to connect to (atom)
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, reason}` on failure
+  """
+  def connect(supervisor_name, cluster_name)
+      when is_atom(supervisor_name) and is_atom(cluster_name) do
+    scope = cluster_scope(supervisor_name, cluster_name)
+
+    case :syn.add_node_to_scopes([scope]) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Disconnect the local node from a named cluster.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `cluster_name` - The name of the cluster to disconnect from (atom)
+
+  ## Returns
+
+  - `:ok` always
+  """
+  def disconnect(supervisor_name, cluster_name)
+      when is_atom(supervisor_name) and is_atom(cluster_name) do
+    scope = cluster_scope(supervisor_name, cluster_name)
+    :syn.remove_node_from_scopes([scope])
+  end
+
+  @doc """
+  Check if the local node is connected to a named cluster.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `cluster_name` - The name of the cluster to check
+
+  ## Returns
+
+  - `true` if connected
+  - `false` if not connected
+  """
+  def connected?(supervisor_name, cluster_name)
+      when is_atom(supervisor_name) and is_atom(cluster_name) do
+    scope = cluster_scope(supervisor_name, cluster_name)
+    scope in :syn.node_scopes()
+  end
+
+  @doc """
+  List all nodes in a cluster.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `cluster_name` - The cluster name (optional, defaults to nil for default cluster)
+
+  ## Returns
+
+  - List of node atoms
+  """
+  def nodes(supervisor_name, cluster_name \\ nil)
+
+  def nodes(supervisor_name, nil) when is_atom(supervisor_name) do
+    scope = DurableServer.Supervisor.syn_scope(supervisor_name)
+
+    try do
+      :syn.subcluster_nodes(:pg, scope)
+    rescue
+      # If scope doesn't exist yet
+      ArgumentError -> []
+    catch
+      :exit, _ -> []
+    end
+  end
+
+  def nodes(supervisor_name, cluster_name)
+      when is_atom(supervisor_name) and is_atom(cluster_name) do
+    scope = cluster_scope(supervisor_name, cluster_name)
+
+    try do
+      :syn.subcluster_nodes(:pg, scope)
+    rescue
+      ArgumentError -> []
+    catch
+      :exit, _ -> []
+    end
+  end
+
+  # ===========================================================================
+  # Registry (Process Registration)
+  # ===========================================================================
+
+  @doc """
+  Register the calling process in the cluster registry.
+
+  This registers a process with a unique key in the cluster. Only one process
+  can be registered with a given key at a time (cluster-wide uniqueness).
+
+  Use `register/4` when you need exactly one process per key. Use `join_group/4`
+  when multiple processes should be able to share the same key.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `key` - The unique key to register under
+  - `meta` - Metadata map to associate with the registration
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Register in a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, :taken}` if another process is already registered with this key
+  """
+  def register(supervisor_name, key, meta, opts \\ [])
+
+  def register(supervisor_name, key, meta, opts)
+      when is_atom(supervisor_name) and is_binary(key) and is_map(meta) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    case :syn.register(scope, key, self(), meta) do
+      :ok -> :ok
+      {:error, :taken} -> {:error, :taken}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Unregister a process from the cluster registry.
+
+  This removes a process registration. Typically not needed as registrations
+  are automatically cleaned up when the process dies.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `key` - The key to unregister
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Unregister from a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, reason}` on failure
+  """
+  def unregister(supervisor_name, key, opts \\ [])
+
+  def unregister(supervisor_name, key, opts)
+      when is_atom(supervisor_name) and is_binary(key) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    case :syn.unregister(scope, key) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Look up a registered process by key.
+
+  Returns the pid and metadata for the process registered at the given key,
+  or `nil` if no process is registered.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `key` - The key to look up
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Look up in a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `{pid, meta}` if a process is registered at the key
+  - `nil` if no process is registered
+  """
+  def lookup(supervisor_name, key, opts \\ [])
+
+  def lookup(supervisor_name, key, opts)
+      when is_atom(supervisor_name) and is_binary(key) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    try do
+      case :syn.lookup(scope, key) do
+        {pid, meta} when is_pid(pid) -> {pid, meta}
+        :undefined -> nil
+      end
+    catch
+      :error, {:invalid_scope, _} -> nil
+    end
+  end
+
+  # ===========================================================================
+  # Subscriptions
+  # ===========================================================================
+
+  @doc """
+  Subscribe to DurableServer registry events matching the given pattern.
+
+  The calling process will receive messages for matching keys:
+
+      {:durable_server, event_type, %{
+        supervisor: supervisor_name,
+        cluster: cluster_name,  # nil for default cluster
+        key: key,
+        pid: pid,
+        meta: meta,
+        ...
+      }}
+
+  ## Patterns
+
+  - `"exact/key"` - exact key match
+  - `"prefix/"` - all keys starting with "prefix/"
+  - `:all` - all keys
+
+  ## Options
+
+  - `:cluster` - Subscribe to events from a named cluster (default: nil for default cluster)
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, reason}` on failure
+  """
+  def subscribe(supervisor_name, pattern_string, opts \\ [])
+      when is_atom(supervisor_name) and (is_binary(pattern_string) or pattern_string == :all) do
+    cluster = Keyword.get(opts, :cluster)
+    pattern = parse_pattern(pattern_string)
+    key = {supervisor_name, cluster, pattern}
+
+    case Registry.register(@registry, key, nil) do
+      {:ok, _} -> :ok
+      {:error, {:already_registered, _}} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Unsubscribe from DurableServer registry events for the given pattern.
+
+  ## Options
+
+  - `:cluster` - The cluster to unsubscribe from (default: nil for default cluster)
+
+  ## Returns
+
+  - `:ok` always (unsubscribing from a non-existent subscription is a no-op)
+  """
+  def unsubscribe(supervisor_name, pattern_string, opts \\ []) when is_atom(supervisor_name) do
+    cluster = Keyword.get(opts, :cluster)
+    pattern = parse_pattern(pattern_string)
+    key = {supervisor_name, cluster, pattern}
+    Registry.unregister(@registry, key)
+    :ok
+  end
+
+  # ===========================================================================
+  # Process Groups (Process ↔ Group)
+  # ===========================================================================
+
+  @doc """
+  Join a group as a member.
+
+  The process will:
+  - Be discoverable via `members/2`
+  - Be automatically removed when it dies
+
+  **String groups** (e.g., `"room/123"`) trigger `:joined`/`:left` events to subscribers.
+  **Atom groups** (e.g., `:my_module`) do not trigger events - use for internal tracking.
+
+  Note: Joining does NOT automatically subscribe the process to events.
+  Call `subscribe/2` separately if you want to receive events.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `group` - The group to join (string or atom)
+  - `pid` - The process to add (default: `self()`)
+  - `meta` - Metadata map (default: `%{}`)
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Join a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, :already_member}` if already a member (use `update_group/4` to change metadata)
+  - `{:error, reason}` on other failures
+  """
+  def join_group(supervisor_name, group, meta \\ %{}, opts \\ [])
+
+  def join_group(supervisor_name, group, meta, opts)
+      when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_map(meta) and
+             is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    case :syn.join(scope, group, self(), meta) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Leave a group that was previously joined.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `group` - The group to leave (string or atom)
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Leave from a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, :not_in_group}` if not a member
+  """
+  def leave_group(supervisor_name, group, opts \\ [])
+
+  def leave_group(supervisor_name, group, opts)
+      when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+    pid = self()
+
+    case :syn.leave(scope, group, pid) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Update metadata for a process's membership in a key.
+
+  This updates the metadata associated with the process in the given key's
+  member list and broadcasts an `:updated` event to subscribers.
+
+  Syn's process groups don't natively fire callbacks on metadata updates,
+  so this function manually broadcasts the event after updating the metadata
+  in syn. The order of operations is:
+
+  1. Fetch the current metadata for the process
+  2. Update the metadata in syn (via re-join)
+  3. Broadcast `:updated` event to subscribers
+
+  This ensures that `members/2` will return the new metadata before subscribers
+  receive the event.
+
+  Note: The `:updated` event is the same type used for DurableServer metadata
+  changes. If you need to distinguish between DurableServer and member updates,
+  you can check if the pid is registered in the syn registry (DurableServer) or
+  only in the process group (member).
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `key` - The exact key the process has joined
+  - `new_meta` - The new metadata map
+  - `pid` - The pid to update (defaults to `self()`)
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Update in a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `:ok` on success
+  - `{:error, :not_a_member}` if the process is not a member of the key
+  - `{:error, reason}` on other failures
+  """
+  def update_group(supervisor_name, key, new_meta, pid \\ self(), opts \\ [])
+
+  def update_group(supervisor_name, key, new_meta, pid, opts)
+      when is_atom(supervisor_name) and is_binary(key) and is_map(new_meta) and is_pid(pid) and
+             is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    # Get current metadata before updating
+    case get_group_member_meta(scope, key, pid) do
+      {:ok, old_meta} ->
+        # Update metadata in syn (re-join updates in place, no callback fired)
+        case :syn.join(scope, key, pid, new_meta) do
+          :ok ->
+            # Broadcast the update event
+            __broadcast__(supervisor_name, :updated, key, pid, new_meta, %{
+              previous_meta: old_meta,
+              cluster: cluster
+            })
+
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      :error ->
+        {:error, :not_a_member}
+    end
+  end
+
+  # Get metadata for a specific pid in a process group
+  defp get_group_member_meta(scope, key, pid) do
+    try do
+      case Enum.find(:syn.members(scope, key), fn {p, _meta} -> p == pid end) do
+        {^pid, meta} -> {:ok, meta}
+        nil -> :error
+      end
+    rescue
+      # syn raises ArgumentError if the group doesn't exist
+      ArgumentError -> :error
+    end
+  end
+
+  # ===========================================================================
+  # Queries
+  # ===========================================================================
+
+  @doc """
+  List all members of a group.
+
+  For **string groups**: Returns both registered processes (via `register/5`) and
+  joined processes (via `join_group/5`) - this is typical for application keys
+  like `"room/123"`.
+
+  For **atom groups**: Returns only joined processes - atom groups are used for
+  internal tracking (e.g., all processes of a module).
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `group` - The group to query (string or atom)
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Query a named cluster instead of the default cluster
+
+  ## Returns
+
+  - List of `{pid, meta}` tuples
+  """
+  def members(supervisor_name, group, opts \\ [])
+
+  def members(supervisor_name, group, opts)
+      when is_atom(supervisor_name) and is_binary(group) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    # DurableServer from registry (one or none)
+    registry_result =
+      case :syn.lookup(scope, group) do
+        {pid, meta} -> [{pid, extract_user_meta(meta)}]
+        :undefined -> []
+      end
+
+    # Joined pids from process group (zero or more)
+    group_members =
+      try do
+        :syn.members(scope, group)
+      rescue
+        # syn raises ArgumentError if the group doesn't exist
+        ArgumentError -> []
+      end
+
+    registry_result ++ group_members
+  end
+
+  def members(supervisor_name, group, opts)
+      when is_atom(supervisor_name) and is_atom(group) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    # Atom groups are only process groups, no registry lookup
+    try do
+      :syn.members(scope, group)
+    rescue
+      ArgumentError -> []
+    end
+  end
+
+  @doc """
+  Count processes registered in the local node's registry.
+
+  This counts only processes registered via `register/5` on the local node.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Count in a named cluster instead of the default cluster
+
+  ## Returns
+
+  - Integer count
+  """
+  def local_registry_count(supervisor_name, opts \\ [])
+
+  def local_registry_count(supervisor_name, opts)
+      when is_atom(supervisor_name) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+    :syn.local_registry_count(scope)
+  end
+
+  @doc """
+  Count processes in a group on the local node.
+
+  ## Parameters
+
+  - `supervisor_name` - The DurableServer.Supervisor name
+  - `group` - The group to count (string or atom)
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Count in a named cluster instead of the default cluster
+
+  ## Returns
+
+  - Integer count
+  """
+  def local_member_count(supervisor_name, group, opts \\ [])
+
+  def local_member_count(supervisor_name, group, opts)
+      when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    scope = resolve_scope(supervisor_name, cluster)
+
+    try do
+      :syn.local_member_count(scope, group)
+    rescue
+      ArgumentError -> 0
+    end
+  end
+
+  # ===========================================================================
+  # Broadcast
+  # ===========================================================================
+
+  @doc """
+  Broadcast a message to all members of a key.
+
+  Sends `message` to all processes that have joined the key via `join_group/3`, as well as
+  any DurableServer registered at that key. This is useful for application-level
+  messaging between a DurableServer and connected clients (e.g., Phoenix Channels).
+
+  ## Broadcast vs Subscribe
+
+  There are two ways to receive messages in this module:
+
+  - **`subscribe/2`** - Receive *lifecycle events* (`:registered`, `:unregistered`, etc.)
+    when DurableServers or processes join/leave keys matching a pattern. These are
+    system-generated events.
+
+  - **`broadcast/3`** - Receive *application messages* sent explicitly by your code.
+    Only members of the exact key receive the message.
+
+  Use `subscribe` to react to lifecycle changes. Use `broadcast` to send your own
+  messages to members.
+
+  ## Filtering by Metadata
+
+  `broadcast/3` sends to all members. If you need to filter by metadata (e.g., only
+  send to members with `%{type: :channel}`), use `members/2` directly:
+
+      for {pid, %{type: :channel}} <- DurableServer.Cluster.members(sup, key) do
+        send(pid, message)
+      end
+
+  ## Options
+
+  - `:cluster` - Broadcast to a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `:ok` always
+  """
+  def broadcast(supervisor_name, key, message, opts \\ [])
+
+  def broadcast(supervisor_name, key, message, opts)
+      when is_atom(supervisor_name) and is_binary(key) and is_list(opts) do
+    for {pid, _meta} <- members(supervisor_name, key, opts) do
+      send(pid, message)
+    end
+
+    :ok
+  end
+
+  # ===========================================================================
+  # Internal
+  # ===========================================================================
+
+  @doc false
+  def __broadcast__(supervisor_name, event_type, key, pid, meta, extra \\ %{}) do
+    cluster = Map.get(extra, :cluster)
+    subscribers = get_subscribers_for_key(supervisor_name, cluster, key)
+
+    payload =
+      Map.merge(
+        %{
+          supervisor: supervisor_name,
+          cluster: cluster,
+          key: key,
+          pid: pid,
+          meta: extract_user_meta(meta)
+        },
+        Map.delete(extra, :cluster)
+      )
+
+    event = {:durable_server, event_type, payload}
+
+    for subscriber_pid <- subscribers do
+      send(subscriber_pid, event)
+    end
+
+    :ok
+  end
+
+  # Compute the syn scope for a named cluster.
+  # Uses __cluster__ (double underscore) as delimiter to avoid ambiguity with
+  # supervisor names that might contain underscores.
+  defp cluster_scope(supervisor_name, cluster_name) do
+    :"durable_#{supervisor_name}__cluster__#{cluster_name}"
+  end
+
+  # Resolve the syn scope: default cluster uses Supervisor.syn_scope, named clusters use cluster_scope
+  defp resolve_scope(supervisor_name, nil) do
+    DurableServer.Supervisor.syn_scope(supervisor_name)
+  end
+
+  defp resolve_scope(supervisor_name, cluster_name) do
+    cluster_scope(supervisor_name, cluster_name)
+  end
+
+  # Parse a pattern into an internal pattern representation
+  # - :all matches all keys
+  # - "prefix/" matches all keys starting with "prefix/"
+  # - "exact/key" matches only that exact key
+  defp parse_pattern(:all), do: :all
+
+  defp parse_pattern(pattern) when is_binary(pattern) do
+    if String.ends_with?(pattern, "/") do
+      {:prefix, pattern}
+    else
+      {:exact, pattern}
+    end
+  end
+
+  # Check if a pattern matches a key
+  defp matches_pattern?(:all, _key), do: true
+  defp matches_pattern?({:exact, pattern}, key), do: pattern == key
+  defp matches_pattern?({:prefix, prefix}, key), do: String.starts_with?(key, prefix)
+
+  # Get all local subscriber pids whose patterns match the given key and cluster
+  defp get_subscribers_for_key(supervisor_name, cluster, key) do
+    # Get all registrations and filter by pattern match
+    # Registry keys are {supervisor_name, cluster, pattern}
+    @registry
+    |> Registry.select([
+      {
+        {{:"$1", :"$2", :"$3"}, :"$4", :_},
+        [{:andalso, {:==, :"$1", supervisor_name}, {:==, :"$2", cluster}}],
+        [{{:"$3", :"$4"}}]
+      }
+    ])
+    |> Enum.filter(fn {pattern, _pid} -> matches_pattern?(pattern, key) end)
+    |> Enum.map(fn {_pattern, pid} -> pid end)
+    |> Enum.uniq()
+  rescue
+    # Registry doesn't exist yet during startup
+    # (syn callbacks can fire before DurableServer.Application starts the registry)
+    ArgumentError -> []
+  end
+
+  # Extract user_meta from DurableServer meta, or return the meta as-is for joined pids
+  defp extract_user_meta(%{user_meta: user_meta}), do: user_meta
+  defp extract_user_meta(meta) when is_map(meta), do: meta
+end
