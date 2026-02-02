@@ -135,7 +135,8 @@ defmodule DurableServer.ObjectStore do
            url: "s3://#{bucket_name}",
            params: %{
              "location-constraint" => "us-east-1"
-           }
+           },
+           retry: :transient
          ) do
       {:ok, %{status: status}} when status >= 200 and status < 300 ->
         {:ok, new(client, bucket: bucket_name)}
