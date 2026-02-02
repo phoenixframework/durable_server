@@ -120,7 +120,7 @@ defmodule DurableServer.SynEventHandler do
       nil ->
         # Try to get it from process state via GenServer call
         try do
-          case GenServer.call(pid, :get_etag, 1000) do
+          case GenServer.call(pid, {:durable, :get_etag}, 1000) do
             {:ok, etag} -> etag
             _ -> nil
           end

@@ -1404,6 +1404,10 @@ defmodule DurableServer do
     {:stop, reason, :ok, updated_state}
   end
 
+  def handle_call({@durable, :get_etag}, _from, %DurableServer{etag: etag} = state) do
+    {:reply, {:ok, etag}, state}
+  end
+
   def handle_call(request, from, %DurableServer{} = state) do
     state = maybe_migrate_on_callback(state)
     result = state.module.handle_call(request, from, state.user_state)
