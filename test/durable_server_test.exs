@@ -223,9 +223,9 @@ defmodule DurableServerTest do
       DurableServerTest.atomify_keys(persisted_state)
     end
 
-    def init(%{key: key}) do
-      # assert that we have a task sup in pdict by the time we get to init
-      _ = DurableServer.get_task_supervisor!()
+    def init(%{key: key}, info) do
+      # assert that we have a task sup in the info map
+      _ = info.task_supervisor
       {:ok, %{key: key, count: 0}, auto_sync: true}
     end
 
@@ -253,6 +253,25 @@ defmodule DurableServerTest do
     def handle_call(:increment, _from, %{count: count} = state) do
       new_state = %{state | count: count + 1}
       {:reply, count + 1, new_state}
+    end
+  end
+
+  defmodule InitInfoServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: Map.take(state, [:key])
+
+    def load_state(_old_vsn, persisted_state) do
+      DurableServerTest.atomify_keys(persisted_state)
+    end
+
+    def init(%{key: key}, info) do
+      # Store the info map in state so tests can verify it
+      {:ok, %{key: key, info: info}}
+    end
+
+    def handle_call(:get_info, _from, state) do
+      {:reply, state.info, state}
     end
   end
 
@@ -392,6 +411,62 @@ defmodule DurableServerTest do
 
       # Verify it's the same process in the registry
       {^pid1, ^initial_meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+    end
+  end
+
+  describe "init/2 with info map" do
+    test "receives built-in supervisor info", %{supervisor_name: supervisor_name} do
+      key = "init-info-test-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {InitInfoServer, %{key: key}}
+        )
+
+      info = GenServer.call(pid, :get_info)
+
+      # Verify built-in keys are present
+      assert info.supervisor == supervisor_name
+      assert info.task_supervisor == DurableServer.Supervisor.get_task_supervisor(supervisor_name)
+
+      assert info.dynamic_supervisor ==
+               DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
+    end
+
+    test "receives user-defined init_info from supervisor config" do
+      # Start a supervisor with custom init_info
+      prefix = "init-info-custom-#{DurableServer.UUID.uuid4()}/"
+      supervisor_name = :"init_info_test_sup_#{System.unique_integer([:positive])}"
+
+      {:ok, _sup_pid} =
+        DurableServer.Supervisor.start_link(
+          name: supervisor_name,
+          prefix: prefix,
+          object_store: test_object_store_opts(),
+          init_info: %{api_client: MyApp.APIClient, custom_key: "custom_value"}
+        )
+
+      key = "init-info-custom-test-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {InitInfoServer, %{key: key}}
+        )
+
+      info = GenServer.call(pid, :get_info)
+
+      # Verify user-defined keys are present and merged
+      assert info.api_client == MyApp.APIClient
+      assert info.custom_key == "custom_value"
+
+      # Built-in keys should still be there
+      assert info.supervisor == supervisor_name
+      assert is_atom(info.task_supervisor)
+      assert is_atom(info.dynamic_supervisor)
+
+      Supervisor.stop(supervisor_name)
     end
   end
 

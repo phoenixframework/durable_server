@@ -137,12 +137,53 @@ defmodule DurableServer do
 
   ## Configuration Options
 
-  DurableServer supports these options in the `init/1` return tuple:
+  DurableServer supports these options in the `init/1` or `init/2` return tuple:
 
   - `:auto_sync` - Enable automatic periodic syncing (default: false)
   - `:sync_every_ms` - Sync interval in milliseconds (default: 30_000)
   - `:meta` - Optional metadata to include for the globally registered server which is
     returned alongside the pid with `DurableServer.Supervisor.lookup/2`.
+  - `:permanent` - Mark server for automatic restart by LifecycleManager (default: false)
+
+  ## Accessing Runtime Info
+
+  DurableServer provides runtime information through the optional `init/2` callback.
+  The `info` map contains supervisor references and any user-defined data configured
+  via the supervisor's `:init_info` option.
+
+  ### Built-in Keys
+
+  The following keys are always present in the info map:
+
+  - `:supervisor` - The `DurableServer.Supervisor` name
+  - `:task_supervisor` - Task supervisor for spawning async tasks
+  - `:dynamic_supervisor` - The DynamicSupervisor managing DurableServer processes
+
+  ### User-defined Keys
+
+  Pass custom data to all servers via the supervisor's `:init_info` option:
+
+      # In your supervision tree
+      {DurableServer.Supervisor,
+        name: MyApp.DurableSup,
+        prefix: "myapp/",
+        init_info: %{api_client: MyApp.APIClient, config: %{timeout: 5000}}}
+
+  Then access it in your server's `init/2`:
+
+      def init(state, info) do
+        api_client = info.api_client
+        timeout = info.config.timeout
+        {:ok, %{state | api_client: api_client, timeout: timeout}}
+      end
+
+  ### Choosing Between init/1 and init/2
+
+  - Use `init/1` if you don't need access to supervisor references or custom init_info
+  - Use `init/2` if you need the task supervisor, dynamic supervisor, or custom data
+
+  Both callbacks are optional. If you implement `init/2`, it takes precedence.
+  If neither is implemented, the default `init/1` returns `{:ok, state}`.
 
   ## State Synchronization
 
@@ -491,7 +532,64 @@ defmodule DurableServer do
   @type timeout_action ::
           timeout() | :hibernate | {:continue, term()} | sync_action()
 
+  @doc """
+  Initializes the DurableServer with loaded state.
+
+  This callback is invoked after the server acquires its global lock and loads
+  any persisted state. You can implement either `init/1` or `init/2`:
+
+  - `init/1` - Receives only the loaded state
+  - `init/2` - Receives the loaded state and an info map with runtime information
+
+  If you implement `init/2`, it takes precedence over `init/1`.
+
+  ## The Info Map (init/2)
+
+  The `info` map in `init/2` contains:
+
+  - `:supervisor` - The supervisor name (e.g., `MyApp.DurableSup`)
+  - `:task_supervisor` - The task supervisor for async operations
+  - `:dynamic_supervisor` - The dynamic supervisor managing DurableServer processes
+  - Any user-defined keys from the supervisor's `:init_info` option
+
+  ## Return Values
+
+  - `{:ok, state}` - Initialize with the given state
+  - `{:ok, state, opts}` - Initialize with state and options
+  - `:ignore` - Don't start the server, sync as stopped_graceful
+
+  ## Options
+
+  - `:auto_sync` - Enable automatic syncing on every callback return (default: `false`)
+  - `:sync_every_ms` - Periodic sync interval in milliseconds (default: `30_000`)
+  - `:meta` - User metadata returned by `DurableServer.Supervisor.lookup/2`
+  - `:permanent` - Mark server for automatic restart by LifecycleManager (default: `false`)
+
+  ## Examples
+
+      # Simple init/1
+      def init(%{key: key} = state) do
+        {:ok, state, permanent: true}
+      end
+
+      # init/2 with runtime info
+      def init(%{key: key} = state, info) do
+        # Access built-in values
+        task_sup = info.task_supervisor
+
+        # Access user-defined values from supervisor's init_info
+        api_client = info.api_client
+
+        {:ok, Map.merge(state, %{task_sup: task_sup, api_client: api_client})}
+      end
+
+  """
   @callback init(loaded_state :: map()) ::
+              :ignore
+              | {:ok, state :: term()}
+              | {:ok, state :: term(), [init_option()]}
+
+  @callback init(loaded_state :: map(), info :: map()) ::
               :ignore
               | {:ok, state :: term()}
               | {:ok, state :: term(), [init_option()]}
@@ -606,7 +704,9 @@ defmodule DurableServer do
   """
   @callback load_state(old_vsn :: pos_integer() | nil, persisted_state :: map()) :: map()
 
-  @optional_callbacks handle_call: 3,
+  @optional_callbacks init: 1,
+                      init: 2,
+                      handle_call: 3,
                       handle_cast: 2,
                       handle_info: 2,
                       handle_continue: 2,
@@ -687,6 +787,10 @@ defmodule DurableServer do
       end
 
       # Default implementations
+      def init(state) do
+        {:ok, state}
+      end
+
       def handle_call(_request, _from, state) do
         {:reply, :ok, state}
       end
@@ -723,7 +827,8 @@ defmodule DurableServer do
         {:ok, state}
       end
 
-      defoverridable handle_call: 3,
+      defoverridable init: 1,
+                     handle_call: 3,
                      handle_cast: 2,
                      handle_info: 2,
                      handle_continue: 2,
@@ -740,34 +845,6 @@ defmodule DurableServer do
       restart: :temporary,
       shutdown: 30_000
     }
-  end
-
-  @doc """
-  Gets the supervisor of the current DurableServer process.
-
-  Can only be called from a durable server process as the data is stored in the pdict.
-
-  Raises RuntimeError if not set.
-  """
-  def get_supervisor! do
-    case Process.get(:durable_meta) do
-      %{supervisor: name} when is_atom(name) -> name
-      _ -> raise "no supervisor found in metadata"
-    end
-  end
-
-  @doc """
-  Gets the task supervisor of the current DurableServer process.
-
-  Can only be called from a durable server process as the data is stored in the pdict.
-
-  Raises RuntimeError if not set.
-  """
-  def get_task_supervisor! do
-    case Process.get(:durable_meta) do
-      %{task_supervisor: name} when is_atom(name) -> name
-      _ -> raise "no task supervisor found in metadata"
-    end
   end
 
   def start_link(
@@ -897,7 +974,27 @@ defmodule DurableServer do
                    sticky_placement_history_limit: sticky_placement_history_limit
                  }) do
               {:ok, %DurableServer{} = state} ->
-                case module.init(loaded_init_state) do
+                # Build info map with built-in values
+                info = %{
+                  supervisor: supervisor_name,
+                  task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
+                  dynamic_supervisor:
+                    DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
+                }
+
+                # Merge user's init_info from supervisor config
+                init_info = Map.get(config, :init_info, %{})
+                info = Map.merge(info, init_info)
+
+                # Try init/2 first, fall back to init/1
+                init_result =
+                  if function_exported?(module, :init, 2) do
+                    module.init(loaded_init_state, info)
+                  else
+                    module.init(loaded_init_state)
+                  end
+
+                case init_result do
                   :ignore ->
                     handle_ignore(state, init_from)
 
@@ -1035,33 +1132,32 @@ defmodule DurableServer do
         %Meta{} -> []
       end
 
-    state =
-      put_meta(%DurableServer{
-        object_store: object_store,
-        # full key with prefix for use in all storage ops
-        key: key,
-        # original unprefixed key passed by user, used for syn registry
-        prefix: prefix,
-        vsn: config.vsn,
-        etag: etag,
-        old_vsn: old_vsn,
-        user_state: user_state,
-        module: module,
-        supervisor: supervisor_name,
-        dynamic_supervisor: DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name),
-        task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
-        circuit_breaker: circuit_breaker,
-        last_synced_user_state_hash: nil,
-        node_str: to_string(Node.self()),
-        pid: self(),
-        status: :running,
-        last_heartbeat_at: System.system_time(:millisecond),
-        node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
-        init_from_ref: init_from_ref,
-        init_from_pid: init_from_pid,
-        sticky_placement_history: sticky_placement_history,
-        sticky_placement_history_limit: history_limit
-      })
+    state = %DurableServer{
+      object_store: object_store,
+      # full key with prefix for use in all storage ops
+      key: key,
+      # original unprefixed key passed by user, used for syn registry
+      prefix: prefix,
+      vsn: config.vsn,
+      etag: etag,
+      old_vsn: old_vsn,
+      user_state: user_state,
+      module: module,
+      supervisor: supervisor_name,
+      dynamic_supervisor: DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name),
+      task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
+      circuit_breaker: circuit_breaker,
+      last_synced_user_state_hash: nil,
+      node_str: to_string(Node.self()),
+      pid: self(),
+      status: :running,
+      last_heartbeat_at: System.system_time(:millisecond),
+      node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
+      init_from_ref: init_from_ref,
+      init_from_pid: init_from_pid,
+      sticky_placement_history: sticky_placement_history,
+      sticky_placement_history_limit: history_limit
+    }
 
     case acquire_lock(state, meta) do
       {:ok, %DurableServer{} = new_state} ->
@@ -2129,12 +2225,6 @@ defmodule DurableServer do
     end
   end
 
-  defp put_meta(%__MODULE__{} = state) do
-    %Meta{} = meta = dump_meta(state)
-    Process.put(:durable_meta, meta)
-    state
-  end
-
   defp validate_user_state!(%{} = user_state), do: user_state
 
   defp validate_user_state!(user_state) do
@@ -2144,8 +2234,7 @@ defmodule DurableServer do
 
   defp update_state(%__MODULE__{} = state, new_user_state) do
     new_user_state = validate_user_state!(new_user_state)
-    # ensure user state always has meta
-    put_meta(%{state | user_state: new_user_state})
+    %{state | user_state: new_user_state}
   end
 
   defp auto_sync_to_storage(%DurableServer{module: module, key: key} = state) do

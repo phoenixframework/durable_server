@@ -93,6 +93,10 @@ defmodule DurableServer.Supervisor do
   - `:sticky_placement_history_limit` - Maximum number of placement history entries to keep
     per server (default: 5). History tracks unique placement changes over time, useful for
     identifying displaced servers and re-homing decisions. Oldest entries are pruned first.
+  - `:init_info` - A map of user-defined data passed to each DurableServer's `init/2` callback.
+    Use this to provide shared configuration, API clients, or other dependencies to all servers
+    managed by this supervisor. The map is merged with built-in keys (`:supervisor`,
+    `:task_supervisor`, `:dynamic_supervisor`). Example: `init_info: %{api_client: MyApp.API}`
 
   ## Examples
 
@@ -113,6 +117,12 @@ defmodule DurableServer.Supervisor do
        max_cpu: 80,
        max_memory: 85,
        max_disk: {90, "/data"}}
+
+      # With init_info for passing dependencies to servers
+      {DurableServer.Supervisor,
+       name: MyApp.DurableSup,
+       prefix: "myapp/",
+       init_info: %{api_client: MyApp.APIClient, pubsub: MyApp.PubSub}}
 
       # Start a server
       {:ok, {pid, _meta}} = DurableServer.Supervisor.start_child(
@@ -494,6 +504,7 @@ defmodule DurableServer.Supervisor do
   - `:module_circuit_breaker_window_ms` - Module circuit breaker window (default: 300_000)
   - `:module_circuit_breaker_cooldown_ms` - Module circuit breaker cooldown (default: 600_000)
   - `:object_store` - The configured `DurableServer.ObjectStore`. Defaults to preconfigured store.
+  - `:init_info` - Map of user-defined data passed to each server's `init/2` callback (default: `%{}`)
   """
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -1443,6 +1454,38 @@ defmodule DurableServer.Supervisor do
 
   @impl Supervisor
   def init(opts) do
+    opts =
+      Keyword.validate!(opts, [
+        :name,
+        :prefix,
+        :object_store,
+        :finch,
+        :task_supervisor,
+        :max_children,
+        :max_cpu,
+        :max_memory,
+        :max_disk,
+        :discovery_interval_ms,
+        :heartbeat_interval_ms,
+        :graceful_shutdown_timeout_ms,
+        :graceful_shutdown_concurrency,
+        :supervisor_shutdown_timeout_ms,
+        :dead_node_threshold_ms,
+        :sticky_placement_history_limit,
+        :init_info,
+        :crash_threshold_count,
+        :crash_threshold_window_ms,
+        :module_circuit_breaker_count,
+        :module_circuit_breaker_window_ms,
+        :module_circuit_breaker_cooldown_ms,
+        :global_lock_failure_count,
+        :global_lock_failure_window_ms,
+        :global_lock_failure_cooldown_ms,
+        :sticky_placement,
+        :default_sticky_placement,
+        :heartbeat_meta
+      ])
+
     name = Keyword.fetch!(opts, :name)
     prefix = Keyword.fetch!(opts, :prefix)
 
@@ -1536,6 +1579,7 @@ defmodule DurableServer.Supervisor do
       supervisor_shutdown_timeout_ms: Keyword.get(opts, :supervisor_shutdown_timeout_ms, 60_000),
       dead_node_threshold_ms: Keyword.get(opts, :dead_node_threshold_ms, 5 * 60 * 1000),
       sticky_placement_history_limit: Keyword.get(opts, :sticky_placement_history_limit, 5),
+      init_info: Keyword.get(opts, :init_info, %{}),
       circuit_breaker: circuit_breaker,
       ets_table: table_name
     }
