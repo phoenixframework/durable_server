@@ -782,13 +782,12 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp extract_sticky_placement_from_body(key, supervisor_name, body) do
+  defp extract_meta_from_body(key, supervisor_name, body) do
     config = __get_config__(supervisor_name)
 
     case JSON.decode(body) do
       {:ok, %{"meta" => meta_str}} when is_binary(meta_str) ->
-        meta = Meta.decode_from_binary(meta_str, %{key: key, prefix: config.prefix})
-        meta.sticky_placement
+        Meta.decode_from_binary(meta_str, %{key: key, prefix: config.prefix})
 
       _ ->
         nil
@@ -805,14 +804,16 @@ defmodule DurableServer.Supervisor do
     # Extract or load the persisted sticky placement
     persisted =
       if body do
-        extract_sticky_placement_from_body(key, supervisor, body)
+        meta = extract_meta_from_body(key, supervisor, body)
+        meta && meta.sticky_placement
       else
         config = __get_config__(supervisor)
         storage_key = config.prefix <> key
 
         case ObjectStore.get_object(config.object_store, storage_key) do
           {:ok, %{body: body}} ->
-            extract_sticky_placement_from_body(key, supervisor, body)
+            meta = extract_meta_from_body(key, supervisor, body)
+            meta && meta.sticky_placement
 
           {:error, _} ->
             nil
@@ -1001,19 +1002,18 @@ defmodule DurableServer.Supervisor do
           end
 
         # Check if we should respect sticky placement and skip local start
-        # For ensure_started (non-crash scenarios), we respect sticky placement WITHOUT time delays
-        # Time delays are only for orphan/crash recovery handled by LifecycleManager
+        # Also track matching_level for time-gated fallback when remote placement fails
         # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
-        {should_skip_local, is_sticky_local} =
+        {should_skip_local, is_sticky_local, matching_level} =
           case sticky_placement do
             nil ->
               # No sticky placement, proceed with normal local-first logic
-              {_should_skip_local = false, _is_sticky_local = false}
+              {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
 
             [%{env_var: :any, value: :any} | _] ->
               # First level is :any, so local node is acceptable but we don't know
               # if data is specifically here (could have been on any node)
-              {_should_skip_local = false, _is_sticky_local = false}
+              {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
 
             placement ->
               # Have specific sticky placement (first element is not :any)
@@ -1027,7 +1027,7 @@ defmodule DurableServer.Supervisor do
                 |> Enum.into(%{})
 
               # Check if we match any level (0 = exact, 1 = less specific, etc.)
-              matching_level =
+              my_matching_level =
                 Enum.find_index(placement, fn preference ->
                   case preference do
                     %{env_var: :any, value: :any} ->
@@ -1043,14 +1043,13 @@ defmodule DurableServer.Supervisor do
 
               # Skip local start only if we don't match level 0 (exact match)
               # This ensures servers stay on their sticky placement node for specific matches
-              if matching_level == 0 do
+              if my_matching_level == 0 do
                 # Level 0 match with specific env var - use local, bypass disk check
                 # (we know it's specific because :any at level 0 is handled above)
-                {_should_skip_local = false, _is_sticky_local = true}
+                {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
               else
-                # Level > 0 match - skip local to try finding better remote match
-                # Even if we matched :any at level 1+, there might be a level 0 match remotely
-                {_should_skip_local = true, _is_sticky_local = false}
+                # Level > 0 match or nil (no match) - skip local to try remote first
+                {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
               end
           end
 
@@ -1070,31 +1069,29 @@ defmodule DurableServer.Supervisor do
         cond do
           should_skip_local ->
             Logger.info(
-              "Skipping local start for #{key} due to sticky placement mismatch, trying remote placement"
+              "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
             )
 
             case try_remote_placement(supervisor, child_spec_with_restart, 3) do
               {:ok, result} ->
                 {:ok, result}
 
-              {:error, {:capacity_limit, :no_available_nodes}} ->
-                # No healthy remote nodes found - fall back to local as last resort
-                # Use max_placement_retries: 0 to only try local (no point retrying remotes)
-                Logger.info(
-                  "No healthy remote nodes found for #{key}, falling back to local start"
+              {:error, {:capacity_limit, reason}}
+              when reason in [:no_available_nodes, :all_placement_attempts_failed] ->
+                # Remote placement failed, but we skipped local due to sticky mismatch.
+                # Only fall back to local if our sticky level's time gate has elapsed —
+                # this prevents stealing a server from a node that's just restarting
+                # (e.g., during rolling deploy) while still allowing fallback once
+                # enough time has passed that the preferred node isn't coming back.
+                maybe_fallback_to_local_with_sticky_gate(
+                  supervisor,
+                  module,
+                  key,
+                  stored_object,
+                  child_spec_with_restart,
+                  matching_level,
+                  reason
                 )
-
-                fallback_to_local_start(supervisor, child_spec_with_restart)
-
-              {:error, {:capacity_limit, :all_placement_attempts_failed}} ->
-                # All remote nodes failed (ERPC errors, capacity, etc.) - fall back to local
-                # This can happen when sticky placement skipped local but all remotes are unreachable
-                # Use max_placement_retries: 0 to only try local (we already tried remotes)
-                Logger.info(
-                  "All remote placement attempts failed for #{key}, falling back to local start"
-                )
-
-                fallback_to_local_start(supervisor, child_spec_with_restart)
 
               {:error, reason} ->
                 {:error, reason}
@@ -1114,6 +1111,63 @@ defmodule DurableServer.Supervisor do
                 {:error, reason}
             end
         end
+    end
+  end
+
+  # When remote placement fails after a sticky mismatch, check the time gate for
+  # our matching level before falling back to local. Uses the same cumulative delay
+  # logic as LifecycleManager.can_claim_at_level?/3:
+  # unlock_after_ms = sum of delays for all levels before ours.
+  #
+  # e.g. config [MACHINE: 2min, REGION: 4min, any: 0]:
+  #   level 0 (MACHINE) → unlock after 0ms (immediate)
+  #   level 1 (REGION)  → unlock after 2min
+  #   level 2 (any)     → unlock after 2+4=6min
+  defp maybe_fallback_to_local_with_sticky_gate(
+         supervisor,
+         module,
+         key,
+         stored_object,
+         child_spec,
+         matching_level,
+         placement_error_reason
+       ) do
+    delays =
+      case __get_sticky_placement_for_module__(supervisor, module) do
+        nil -> []
+        list -> Enum.map(list, fn {_env_var, delay} -> delay end)
+      end
+
+    gate_passed =
+      case {matching_level, stored_object} do
+        {nil, _} ->
+          # No match at any level — this node is never eligible
+          false
+
+        {level, {:ok, %{body: body}}} ->
+          unlock_after_ms = delays |> Enum.take(level) |> Enum.sum()
+          meta = extract_meta_from_body(key, supervisor, body)
+          meta && !Meta.last_heartbeat_within_ms(meta, unlock_after_ms)
+
+        {_level, nil} ->
+          # No stored object — shouldn't normally reach here since sticky_placement
+          # comes from the stored object, but allow fallback to be safe
+          true
+      end
+
+    if gate_passed do
+      Logger.info(
+        "Sticky placement time gate passed for #{key} (level=#{matching_level}), falling back to local start"
+      )
+
+      fallback_to_local_start(supervisor, child_spec)
+    else
+      Logger.info(
+        "Sticky placement time gate not yet passed for #{key} (level=#{inspect(matching_level)}), " <>
+          "not falling back to local (#{placement_error_reason})"
+      )
+
+      {:error, {:sticky_placement, placement_error_reason}}
     end
   end
 
