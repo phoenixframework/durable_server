@@ -1189,7 +1189,13 @@ defmodule DurableServer.LifecycleManager do
             CircuitBreaker.increment_module_circuit_breaker(state.circuit_breaker, module)
 
           {:error, reason} ->
-            log(state, :error, fn ->
+            log_level =
+              case reason do
+                {:already_started, _} -> :info
+                _ -> :error
+              end
+
+            log(state, log_level, fn ->
               "Failed to restart DurableServer #{meta.key}: #{inspect(reason)}"
             end)
 
