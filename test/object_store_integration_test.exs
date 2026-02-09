@@ -24,7 +24,7 @@ defmodule DurableServer.ObjectStoreIntegrationTest do
         # All environment variables are set
         # Use separate IAM endpoint if provided, otherwise use Tigris IAM endpoint
         iam_endpoint =
-          System.get_env("DURABLE_AWS_ENDPOINT_URL_IAM") || "https://fly.iam.storage.tigris.dev"
+          System.get_env("DURABLE_AWS_ENDPOINT_URL_IAM") || "https://iam.storage.dev"
 
         store_config = [
           access_key_id: System.get_env("DURABLE_AWS_ACCESS_KEY_ID"),
