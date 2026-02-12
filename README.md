@@ -12,7 +12,7 @@ It implements fault-tolerant, stateful processes that can survive node failures,
 - **Sticky placement**: Environment variable-based placement preferences (e.g., same machine, same region, etc.) with time-gated fallback to ensure servers restart on preferred nodes when possible
 - **Automatic recovery**: Failed processes are detected and restarted across the cluster
 - **Graceful shutdown**: Ensures state is synchronized before termination
-- **PubSub**: Subscribe to lifecycle events and broadcast messages between DurableServers and other processes
+- **Lifecycle monitoring & dispatch**: Monitor lifecycle events and dispatch messages between DurableServers and other processes
 
 ## Installation
 
@@ -110,24 +110,24 @@ State is synchronized to storage in these scenarios:
 
 ## Cluster
 
-`DurableServer.Cluster` provides cluster management, pubsub for lifecycle events, and process group coordination.
+`DurableServer.Cluster` provides cluster management, lifecycle monitoring, and process group coordination.
 
-### Subscribing to Events
+### Monitoring Events
 
-Subscribe to lifecycle events for DurableServers:
+Monitor lifecycle events for DurableServers:
 
 ```elixir
-# Subscribe to a specific key
-:ok = DurableServer.Cluster.subscribe(MyDurableSup, "user/123")
+# Monitor a specific key
+:ok = DurableServer.Cluster.monitor(MyDurableSup, "user/123")
 
-# Subscribe to all keys with a prefix
-:ok = DurableServer.Cluster.subscribe(MyDurableSup, "user/")
+# Monitor all keys with a prefix
+:ok = DurableServer.Cluster.monitor(MyDurableSup, "user/")
 
-# Subscribe to all events
-:ok = DurableServer.Cluster.subscribe(MyDurableSup, :all)
+# Monitor all events
+:ok = DurableServer.Cluster.monitor(MyDurableSup, :all)
 ```
 
-Subscribers receive messages in their mailbox:
+Monitors receive messages in their mailbox:
 
 ```elixir
 def handle_info({:durable_server, :registered, %{key: key, pid: pid}}, state) do
@@ -143,27 +143,31 @@ Event types: `:registered`, `:unregistered`, `:updated`, `:joined`, `:left`
 
 ### Joining as a Member
 
-Non-DurableServer processes can join keys to be discoverable and receive broadcasts:
+Non-DurableServer processes can join keys to be discoverable and receive dispatched messages:
 
 ```elixir
 # Join a key (e.g., from a Phoenix Channel)
 :ok = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{type: :channel})
 
+# Re-joining returns an error — use update_group to change metadata
+{:error, :already_member} = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{type: :channel})
+:ok = DurableServer.Cluster.update_group(MyDurableSup, "room/123", %{type: :channel, status: :active})
+
 # Query all members of a key (DurableServers + joined processes)
 members = DurableServer.Cluster.members(MyDurableSup, "room/123")
-# => [{#PID<0.150.0>, %{...}}, {#PID<0.200.0>, %{type: :channel}}]
+# => [{#PID<0.150.0>, %{...}}, {#PID<0.200.0>, %{type: :channel, status: :active}}]
 
 # Leave when done (also happens automatically on process death)
 :ok = DurableServer.Cluster.leave_group(MyDurableSup, "room/123")
 ```
 
-### Broadcasting to Members
+### Dispatching to Members
 
 Send messages to all members of a key:
 
 ```elixir
 # From a DurableServer, broadcast to all connected channels
-DurableServer.Cluster.broadcast(MyDurableSup, state.key, {:new_message, message})
+DurableServer.Cluster.dispatch(MyDurableSup, state.key, {:new_message, message})
 ```
 
 ### Named Clusters
@@ -174,19 +178,20 @@ For advanced use cases, you can create isolated subclusters where only connected
 # Connect this node to a named cluster
 :ok = DurableServer.Cluster.connect(MyDurableSup, :game_servers)
 
-# Join/subscribe/broadcast with the cluster: option
+# Join/monitor/dispatch with the cluster: option
 :ok = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{}, cluster: :game_servers)
-:ok = DurableServer.Cluster.subscribe(MyDurableSup, :all, cluster: :game_servers)
+:ok = DurableServer.Cluster.monitor(MyDurableSup, :all, cluster: :game_servers)
 ```
 
 Note: DurableServers always register in the default cluster to ensure global uniqueness. Named clusters are purely for the pub/sub layer.
 
-### Subscribe vs Join
+### Monitor vs Join vs Update
 
-- **`subscribe/2`**: Receive lifecycle events (`:registered`, `:unregistered`, etc.) - system-generated
-- **`join_group/3`**: Be discoverable via `members/2` and receive `broadcast/3` messages - application-level
+- **`monitor/2`**: Receive lifecycle events (`:registered`, `:unregistered`, `:updated`, `:joined`, `:left`) - system-generated
+- **`join_group/3`**: Be discoverable via `members/2` and receive `dispatch/3` messages - application-level
+- **`update_group/4`**: Update metadata for an existing group membership, triggers `:updated` events cluster-wide
 
-These are independent - joining does not subscribe you to events, and subscribing does not make you discoverable.
+These are independent - joining does not monitor events, and monitoring does not make you discoverable.
 
 ## Running Tests
 

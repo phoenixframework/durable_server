@@ -218,7 +218,7 @@ defmodule DurableServer.SynEventHandler do
   def on_process_registered(scope, key, pid, meta, _reason) do
     case parse_scope(scope) do
       {supervisor_name, cluster} when is_binary(key) ->
-        DurableServer.Cluster.__broadcast__(supervisor_name, :registered, key, pid, meta, %{
+        DurableServer.Cluster.__dispatch__(supervisor_name, :registered, key, pid, meta, %{
           cluster: cluster
         })
 
@@ -233,7 +233,7 @@ defmodule DurableServer.SynEventHandler do
   def on_process_unregistered(scope, key, pid, meta, reason) do
     case parse_scope(scope) do
       {supervisor_name, cluster} when is_binary(key) ->
-        DurableServer.Cluster.__broadcast__(supervisor_name, :unregistered, key, pid, meta, %{
+        DurableServer.Cluster.__dispatch__(supervisor_name, :unregistered, key, pid, meta, %{
           reason: reason,
           cluster: cluster
         })
@@ -246,18 +246,8 @@ defmodule DurableServer.SynEventHandler do
   end
 
   @impl true
-  def on_registry_process_updated(scope, key, pid, meta, _reason) do
-    # 5-arity version without previous_meta
-    case parse_scope(scope) do
-      {supervisor_name, cluster} when is_binary(key) ->
-        DurableServer.Cluster.__broadcast__(supervisor_name, :updated, key, pid, meta, %{
-          cluster: cluster
-        })
-
-      _ ->
-        :ok
-    end
-
+  def on_registry_process_updated(_scope, _key, _pid, _meta, _reason) do
+    # no-op: the 6-arity version fires right after with previous_meta included
     :ok
   end
 
@@ -266,7 +256,7 @@ defmodule DurableServer.SynEventHandler do
     # 6-arity version with previous_meta
     case parse_scope(scope) do
       {supervisor_name, cluster} when is_binary(key) ->
-        DurableServer.Cluster.__broadcast__(supervisor_name, :updated, key, pid, meta, %{
+        DurableServer.Cluster.__dispatch__(supervisor_name, :updated, key, pid, meta, %{
           previous_meta: extract_user_meta(previous_meta),
           cluster: cluster
         })
@@ -286,7 +276,29 @@ defmodule DurableServer.SynEventHandler do
     # Only dispatch for string keys (actual keys), not atom groups (sup_name, module)
     case parse_scope(scope) do
       {supervisor_name, cluster} when is_binary(group) ->
-        DurableServer.Cluster.__broadcast__(supervisor_name, :joined, group, pid, meta, %{
+        DurableServer.Cluster.__dispatch__(supervisor_name, :joined, group, pid, meta, %{
+          cluster: cluster
+        })
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  @impl true
+  def on_group_process_updated(_scope, _group, _pid, _meta, _reason) do
+    # no-op: the 6-arity version fires right after with previous_meta included
+    :ok
+  end
+
+  @impl true
+  def on_group_process_updated(scope, group, pid, previous_meta, meta, _reason) do
+    case parse_scope(scope) do
+      {supervisor_name, cluster} when is_binary(group) ->
+        DurableServer.Cluster.__dispatch__(supervisor_name, :updated, group, pid, meta, %{
+          previous_meta: extract_user_meta(previous_meta),
           cluster: cluster
         })
 
@@ -302,7 +314,7 @@ defmodule DurableServer.SynEventHandler do
     # Only dispatch for string keys (actual keys), not atom groups (sup_name, module)
     case parse_scope(scope) do
       {supervisor_name, cluster} when is_binary(group) ->
-        DurableServer.Cluster.__broadcast__(supervisor_name, :left, group, pid, meta, %{
+        DurableServer.Cluster.__dispatch__(supervisor_name, :left, group, pid, meta, %{
           reason: reason,
           cluster: cluster
         })

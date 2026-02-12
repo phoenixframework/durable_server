@@ -1480,14 +1480,15 @@ defmodule DurableServer.Supervisor do
     case DurableServer.Cluster.register(sup_name, key, meta) do
       :ok ->
         # Join internal tracking groups (by supervisor name and module)
-        :ok = DurableServer.Cluster.join_group(sup_name, sup_name, meta)
+        # Use join or update: first join may succeed, subsequent calls update metadata
+        join_or_update_group(sup_name, sup_name, meta)
 
         # Also join module-specific group for per-module counting
         if module = meta[:module] do
           [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
 
           if is_map(limits[:max_children]) and Map.has_key?(limits[:max_children], module) do
-            :ok = DurableServer.Cluster.join_group(sup_name, module, meta)
+            join_or_update_group(sup_name, module, meta)
           end
         end
 
@@ -1495,6 +1496,13 @@ defmodule DurableServer.Supervisor do
 
       {:error, :taken} ->
         {:error, :taken}
+    end
+  end
+
+  defp join_or_update_group(sup_name, group, meta) do
+    case DurableServer.Cluster.join_group(sup_name, group, meta) do
+      :ok -> :ok
+      {:error, :already_member} -> :ok = :syn.join(syn_scope(sup_name), group, self(), meta)
     end
   end
 

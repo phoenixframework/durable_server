@@ -44,12 +44,12 @@ defmodule DurableServer.ClusterTest do
     {:ok, supervisor_name: supervisor_name, prefix: prefix}
   end
 
-  describe "subscribe/2" do
+  describe "monitor/2" do
     test "subscribes to exact key and receives :registered event", %{supervisor_name: sup} do
       key = "user/#{DurableServer.UUID.uuid4()}"
 
       # Subscribe before starting server
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       # Start a DurableServer
       {:ok, {pid, _meta}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
@@ -70,7 +70,7 @@ defmodule DurableServer.ClusterTest do
       key2 = "chat/room2"
       key3 = "other/room"
 
-      :ok = Cluster.subscribe(sup, "chat/")
+      :ok = Cluster.monitor(sup, "chat/")
 
       # Start servers
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key1}})
@@ -90,7 +90,7 @@ defmodule DurableServer.ClusterTest do
       key2 = "chat/room"
       key3 = "anything/else"
 
-      :ok = Cluster.subscribe(sup, :all)
+      :ok = Cluster.monitor(sup, :all)
 
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key1}})
       {:ok, {pid2, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key2}})
@@ -104,7 +104,7 @@ defmodule DurableServer.ClusterTest do
     test "receives :unregistered event when DurableServer stops", %{supervisor_name: sup} do
       key = "user/#{DurableServer.UUID.uuid4()}"
 
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
       assert_receive {:durable_server, :registered, _}, 1000
@@ -125,8 +125,8 @@ defmodule DurableServer.ClusterTest do
     test "double subscribe is idempotent", %{supervisor_name: sup} do
       key = "user/test"
 
-      assert :ok = Cluster.subscribe(sup, key)
-      assert :ok = Cluster.subscribe(sup, key)
+      assert :ok = Cluster.monitor(sup, key)
+      assert :ok = Cluster.monitor(sup, key)
 
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
@@ -136,18 +136,18 @@ defmodule DurableServer.ClusterTest do
     end
   end
 
-  describe "unsubscribe/2" do
+  describe "demonitor/2" do
     test "stops receiving events after unsubscribe", %{supervisor_name: sup} do
       key1 = "user/first"
       key2 = "user/second"
 
-      :ok = Cluster.subscribe(sup, "user/")
+      :ok = Cluster.monitor(sup, "user/")
 
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key1}})
       assert_receive {:durable_server, :registered, %{key: ^key1, pid: ^pid1}}, 1000
 
       # Unsubscribe
-      :ok = Cluster.unsubscribe(sup, "user/")
+      :ok = Cluster.demonitor(sup, "user/")
 
       # Start another server
       {:ok, {_pid2, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key2}})
@@ -157,7 +157,7 @@ defmodule DurableServer.ClusterTest do
     end
 
     test "unsubscribe from non-existent subscription is ok", %{supervisor_name: sup} do
-      assert :ok = Cluster.unsubscribe(sup, "nonexistent/")
+      assert :ok = Cluster.demonitor(sup, "nonexistent/")
     end
   end
 
@@ -178,7 +178,7 @@ defmodule DurableServer.ClusterTest do
       key = "chat/room/#{DurableServer.UUID.uuid4()}"
 
       # Subscribe first
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       # Spawn a process to join
       test_pid = self()
@@ -208,7 +208,7 @@ defmodule DurableServer.ClusterTest do
     test "leave_group/2 removes from members and triggers :left event", %{supervisor_name: sup} do
       key = "chat/room/#{DurableServer.UUID.uuid4()}"
 
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
       :ok = Cluster.join_group(sup, key, %{role: :listener})
 
       assert_receive {:durable_server, :joined, _}, 1000
@@ -229,7 +229,7 @@ defmodule DurableServer.ClusterTest do
     test "process death triggers automatic :left event", %{supervisor_name: sup} do
       key = "chat/room/#{DurableServer.UUID.uuid4()}"
 
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       test_pid = self()
 
@@ -269,16 +269,20 @@ defmodule DurableServer.ClusterTest do
       assert {:error, :not_in_group} = Cluster.leave_group(sup, key)
     end
 
-    test "join_group/3 allows re-joining to update metadata", %{supervisor_name: sup} do
+    test "join_group/3 returns error on re-join", %{supervisor_name: sup} do
       key = "double/join/#{DurableServer.UUID.uuid4()}"
 
       # First join succeeds
       assert :ok = Cluster.join_group(sup, key, %{v: 1})
 
-      # Second join also succeeds and updates metadata
-      assert :ok = Cluster.join_group(sup, key, %{v: 2})
+      # Second join returns already_member error
+      assert {:error, :already_member} = Cluster.join_group(sup, key, %{v: 2})
 
-      # Metadata is updated
+      # Metadata is unchanged — use update_group to change it
+      [{_pid, %{v: 1}}] = Cluster.members(sup, key)
+
+      # update_group works
+      assert :ok = Cluster.update_group(sup, key, %{v: 2})
       [{_pid, %{v: 2}}] = Cluster.members(sup, key)
     end
   end
@@ -290,7 +294,7 @@ defmodule DurableServer.ClusterTest do
       updated_meta = %{status: :active, count: 5}
 
       # Subscribe to receive events
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       # Join with initial metadata
       :ok = Cluster.join_group(sup, key, initial_meta)
@@ -326,7 +330,7 @@ defmodule DurableServer.ClusterTest do
       test_pid = self()
 
       # Subscribe to events
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       # Spawn a process to join
       other_pid =
@@ -366,7 +370,7 @@ defmodule DurableServer.ClusterTest do
     test "multiple updates in sequence", %{supervisor_name: sup} do
       key = "update/sequence/#{DurableServer.UUID.uuid4()}"
 
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
       :ok = Cluster.join_group(sup, key, %{v: 1})
       assert_receive {:durable_server, :joined, _}, 1000
 
@@ -447,7 +451,7 @@ defmodule DurableServer.ClusterTest do
       key = "self/events/#{DurableServer.UUID.uuid4()}"
 
       # Subscribe first
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       # Then join
       :ok = Cluster.join_group(sup, key, %{self: true})
@@ -464,7 +468,7 @@ defmodule DurableServer.ClusterTest do
       key = "integration/test/#{DurableServer.UUID.uuid4()}"
 
       # 1. Subscribe
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       # 2. Start DurableServer
       {:ok, {server_pid, _}} =
@@ -506,7 +510,7 @@ defmodule DurableServer.ClusterTest do
       assert Cluster.members(sup, key) == []
 
       # 10. Unsubscribe
-      :ok = Cluster.unsubscribe(sup, key)
+      :ok = Cluster.demonitor(sup, key)
 
       # 11. Start new server - should NOT receive event
       {:ok, {_new_pid, _}} =
@@ -535,7 +539,7 @@ defmodule DurableServer.ClusterTest do
       key = "shared/key/#{DurableServer.UUID.uuid4()}"
 
       # Subscribe to sup2 only
-      :ok = Cluster.subscribe(supervisor_name_2, :all)
+      :ok = Cluster.monitor(supervisor_name_2, :all)
 
       # Start a DurableServer on sup2
       {:ok, {pid2, _}} =
@@ -547,7 +551,7 @@ defmodule DurableServer.ClusterTest do
                      1000
 
       # Now unsubscribe from sup2 and subscribe to sup1 (from setup)
-      :ok = Cluster.unsubscribe(supervisor_name_2, :all)
+      :ok = Cluster.demonitor(supervisor_name_2, :all)
     end
 
     test "subscribers only receive events from their subscribed supervisor", %{
@@ -569,7 +573,7 @@ defmodule DurableServer.ClusterTest do
       key = "test/isolation/#{DurableServer.UUID.uuid4()}"
 
       # Subscribe to sup1 only
-      :ok = Cluster.subscribe(sup1, :all)
+      :ok = Cluster.monitor(sup1, :all)
 
       # Start a DurableServer on sup1 - should receive event
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup1, {TestServer, %{key: key}})
@@ -580,7 +584,7 @@ defmodule DurableServer.ClusterTest do
       refute_receive {:durable_server, :registered, %{supervisor: ^sup2, pid: ^pid2}}, 200
 
       # Now subscribe to sup2 as well
-      :ok = Cluster.subscribe(sup2, :all)
+      :ok = Cluster.monitor(sup2, :all)
 
       # Join on sup2 - should receive event now
       :ok = Cluster.join_group(sup2, key, %{role: :test})
@@ -658,7 +662,7 @@ defmodule DurableServer.ClusterTest do
       :ok = Cluster.connect(sup, cluster2)
 
       # Subscribe to cluster1 only
-      :ok = Cluster.subscribe(sup, :all, cluster: cluster1)
+      :ok = Cluster.monitor(sup, :all, cluster: cluster1)
 
       # Spawn process to join cluster1
       test_pid = self()
@@ -697,7 +701,7 @@ defmodule DurableServer.ClusterTest do
       refute_receive {:durable_server, :joined, %{pid: ^pid2, cluster: ^cluster2}}, 200
 
       # Now subscribe to cluster2 and verify we can receive events
-      :ok = Cluster.subscribe(sup, :all, cluster: cluster2)
+      :ok = Cluster.monitor(sup, :all, cluster: cluster2)
 
       pid3 =
         spawn(fn ->
@@ -756,7 +760,7 @@ defmodule DurableServer.ClusterTest do
       key = "default/test/#{DurableServer.UUID.uuid4()}"
 
       # Subscribe without cluster option (default cluster)
-      :ok = Cluster.subscribe(sup, key)
+      :ok = Cluster.monitor(sup, key)
 
       # Join without cluster option (default cluster)
       :ok = Cluster.join_group(sup, key, %{v: 1})
@@ -771,7 +775,7 @@ defmodule DurableServer.ClusterTest do
       assert length(members) == 1
     end
 
-    test "broadcast works with cluster: option", %{supervisor_name: sup} do
+    test "dispatch works with cluster: option", %{supervisor_name: sup} do
       cluster = :broadcast_cluster
       key = "broadcast/#{DurableServer.UUID.uuid4()}"
 
@@ -781,25 +785,25 @@ defmodule DurableServer.ClusterTest do
       :ok = Cluster.join_group(sup, key, %{}, cluster: cluster)
 
       # Broadcast to named cluster
-      :ok = Cluster.broadcast(sup, key, {:test_message, :from_cluster}, cluster: cluster)
+      :ok = Cluster.dispatch(sup, key, {:test_message, :from_cluster}, cluster: cluster)
 
       assert_receive {:test_message, :from_cluster}, 1000
 
       # Broadcast to default cluster (we're not there)
-      :ok = Cluster.broadcast(sup, key, {:test_message, :from_default})
+      :ok = Cluster.dispatch(sup, key, {:test_message, :from_default})
 
       # Should NOT receive (we're not in default cluster for this key)
       refute_receive {:test_message, :from_default}, 200
     end
 
-    test "subscribe/unsubscribe work with cluster: option", %{supervisor_name: sup} do
+    test "monitor/demonitor work with cluster: option", %{supervisor_name: sup} do
       cluster = :sub_cluster
       key = "sub/test/#{DurableServer.UUID.uuid4()}"
 
       :ok = Cluster.connect(sup, cluster)
 
       # Subscribe to named cluster
-      :ok = Cluster.subscribe(sup, key, cluster: cluster)
+      :ok = Cluster.monitor(sup, key, cluster: cluster)
 
       # Spawn and join
       test_pid = self()
@@ -819,7 +823,7 @@ defmodule DurableServer.ClusterTest do
       assert_receive {:durable_server, :joined, %{cluster: ^cluster}}, 1000
 
       # Unsubscribe from named cluster
-      :ok = Cluster.unsubscribe(sup, key, cluster: cluster)
+      :ok = Cluster.demonitor(sup, key, cluster: cluster)
 
       # Spawn another process to join
       spawn(fn ->
