@@ -69,7 +69,7 @@ defmodule Group do
   Events are delivered as `%Group{}` structs to monitoring processes:
 
       %Group{
-        type: event_type,
+        event: event_type,
         supervisor: supervisor_name,
         cluster: cluster_name,  # nil for default cluster
         key: key,
@@ -79,12 +79,12 @@ defmodule Group do
         reason: ...             # set on :unregistered/:left events
       }
 
-  | Event Type      | Trigger                                        | Extra Fields        |
-  |-----------------|------------------------------------------------|---------------------|
-  | `:registered`   | Process registered via `register/3` (new or re-register) | `:previous_meta` (`nil` if new, old meta if update) |
-  | `:unregistered` | Process unregistered or died                   | `:reason`           |
-  | `:joined`       | Process joined group via `join/3` (new or re-join)       | `:previous_meta` (`nil` if new, old meta if update) |
-  | `:left`         | Process left group or died                     | `:reason`           |
+  | Event            | Trigger                                        | Extra Fields        |
+  |------------------|------------------------------------------------|---------------------|
+  | `:registered`    | Process registered via `register/3` (new or re-register) | `:previous_meta` (`nil` if new, old meta if update) |
+  | `:unregistered`  | Process unregistered or died                   | `:reason`           |
+  | `:joined`        | Process joined group via `join/3` (new or re-join)       | `:previous_meta` (`nil` if new, old meta if update) |
+  | `:left`          | Process left group or died                     | `:reason`           |
 
   DurableServers automatically register/unregister during their lifecycle, so these
   events can be used to track DurableServer start/stop.
@@ -103,7 +103,7 @@ defmodule Group do
   its own `:joined` event. Similarly for `:left` when leaving. Filter these in your
   handler if needed:
 
-      def handle_info(%Group{type: :joined, pid: pid}, state) when pid == self() do
+      def handle_info(%Group{event: :joined, pid: pid}, state) when pid == self() do
         # Ignore our own join event
         {:noreply, state}
       end
@@ -122,12 +122,12 @@ defmodule Group do
       :ok = Group.monitor(MySup, :all)
 
       # Handle events in a GenServer
-      def handle_info(%Group{type: :registered, key: key, pid: pid}, state) do
+      def handle_info(%Group{event: :registered, key: key, pid: pid}, state) do
         IO.puts("DurableServer started: \#{key}")
         {:noreply, state}
       end
 
-      def handle_info(%Group{type: :unregistered, key: key, reason: reason}, state) do
+      def handle_info(%Group{event: :unregistered, key: key, reason: reason}, state) do
         IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
         {:noreply, state}
       end
@@ -172,7 +172,7 @@ defmodule Group do
     cleanup when member processes die.
   """
 
-  defstruct [:type, :supervisor, :cluster, :key, :pid, :meta, :reason, :previous_meta]
+  defstruct [:event, :supervisor, :cluster, :key, :pid, :meta, :reason, :previous_meta]
 
   @registry Group.Registry
 
@@ -407,7 +407,7 @@ defmodule Group do
 
   The calling process will receive `%Group{}` structs for matching keys:
 
-      %Group{type: :registered, supervisor: sup, key: "user/123", pid: pid, meta: meta, ...}
+      %Group{event: :registered, supervisor: sup, key: "user/123", pid: pid, meta: meta, ...}
 
   ## Patterns
 
@@ -725,7 +725,7 @@ defmodule Group do
     subscribers = get_subscribers_for_key(supervisor_name, cluster, key)
 
     event = %Group{
-      type: event_type,
+      event: event_type,
       supervisor: supervisor_name,
       cluster: cluster,
       key: key,
