@@ -1,0 +1,3 @@
+%{
+  "syn": {:git, "https://github.com/chrismccord/syn.git", "c89895f0553a08114d60f854d9fff88f60a6a23b", []},
+}
