@@ -66,9 +66,18 @@ defmodule Group do
 
   ## Event Types
 
-  Events are delivered as messages to monitoring processes:
+  Events are delivered as `%Group{}` structs to monitoring processes:
 
-      {:durable_server, event_type, payload}
+      %Group{
+        type: event_type,
+        supervisor: supervisor_name,
+        cluster: cluster_name,  # nil for default cluster
+        key: key,
+        pid: pid,
+        meta: meta,             # always user-provided meta (internal keys stripped)
+        previous_meta: ...,     # nil for new, old meta for re-register/re-join
+        reason: ...             # set on :unregistered/:left events
+      }
 
   | Event Type      | Trigger                                        | Extra Fields        |
   |-----------------|------------------------------------------------|---------------------|
@@ -79,8 +88,6 @@ defmodule Group do
 
   DurableServers automatically register/unregister during their lifecycle, so these
   events can be used to track DurableServer start/stop.
-
-  All payloads include: `:supervisor`, `:cluster`, `:key`, `:pid`, `:meta`
 
   ## Pattern Types
 
@@ -96,7 +103,7 @@ defmodule Group do
   its own `:joined` event. Similarly for `:left` when leaving. Filter these in your
   handler if needed:
 
-      def handle_info({:durable_server, :joined, %{pid: pid}}, state) when pid == self() do
+      def handle_info(%Group{type: :joined, pid: pid}, state) when pid == self() do
         # Ignore our own join event
         {:noreply, state}
       end
@@ -115,12 +122,12 @@ defmodule Group do
       :ok = Group.monitor(MySup, :all)
 
       # Handle events in a GenServer
-      def handle_info({:durable_server, :registered, %{key: key, pid: pid}}, state) do
+      def handle_info(%Group{type: :registered, key: key, pid: pid}, state) do
         IO.puts("DurableServer started: \#{key}")
         {:noreply, state}
       end
 
-      def handle_info({:durable_server, :unregistered, %{key: key, reason: reason}}, state) do
+      def handle_info(%Group{type: :unregistered, key: key, reason: reason}, state) do
         IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
         {:noreply, state}
       end
@@ -164,6 +171,8 @@ defmodule Group do
   - **Memberships** use syn process groups for cluster-wide distribution and automatic
     cleanup when member processes die.
   """
+
+  defstruct [:type, :supervisor, :cluster, :key, :pid, :meta, :reason, :previous_meta]
 
   @registry Group.Registry
 
@@ -396,16 +405,9 @@ defmodule Group do
   @doc """
   Monitor lifecycle events matching the given pattern.
 
-  The calling process will receive messages for matching keys:
+  The calling process will receive `%Group{}` structs for matching keys:
 
-      {:durable_server, event_type, %{
-        supervisor: supervisor_name,
-        cluster: cluster_name,  # nil for default cluster
-        key: key,
-        pid: pid,
-        meta: meta,
-        ...
-      }}
+      %Group{type: :registered, supervisor: sup, key: "user/123", pid: pid, meta: meta, ...}
 
   ## Patterns
 
@@ -722,19 +724,16 @@ defmodule Group do
     cluster = Map.get(extra, :cluster)
     subscribers = get_subscribers_for_key(supervisor_name, cluster, key)
 
-    payload =
-      Map.merge(
-        %{
-          supervisor: supervisor_name,
-          cluster: cluster,
-          key: key,
-          pid: pid,
-          meta: extract_user_meta(meta)
-        },
-        Map.delete(extra, :cluster)
-      )
-
-    event = {:durable_server, event_type, payload}
+    event = %Group{
+      type: event_type,
+      supervisor: supervisor_name,
+      cluster: cluster,
+      key: key,
+      pid: pid,
+      meta: extract_user_meta(meta),
+      previous_meta: Map.get(extra, :previous_meta),
+      reason: Map.get(extra, :reason)
+    }
 
     for subscriber_pid <- subscribers do
       send(subscriber_pid, event)
