@@ -211,7 +211,7 @@ defmodule DurableServer.Supervisor do
       iex> {pid, _meta} = DurableServer.Supervisor.lookup(MyDurableUp, "counter123")
   """
   def lookup(sup_name, key) when is_atom(sup_name) and is_binary(key) do
-    case DurableServer.Cluster.lookup(sup_name, key) do
+    case Group.lookup(sup_name, key) do
       {pid, meta} when is_pid(pid) ->
         # handle case where node-local DOWN from a caller races syn cleanup
         if node(pid) == Node.self() && !Process.alive?(pid) do
@@ -466,7 +466,7 @@ defmodule DurableServer.Supervisor do
         # add total capacity if configured
         capacity_map =
           if total_limit = max_children[:total] do
-            current = DurableServer.Cluster.local_registry_count(supervisor_name)
+            current = Group.local_registry_count(supervisor_name)
             Map.put(capacity_map, :total, %{current: current, limit: total_limit})
           else
             capacity_map
@@ -477,7 +477,7 @@ defmodule DurableServer.Supervisor do
           max_children
           |> Enum.reject(fn {k, _v} -> k == :total end)
           |> Enum.reduce(capacity_map, fn {module, limit}, acc ->
-            current = DurableServer.Cluster.local_member_count(supervisor_name, module)
+            current = Group.local_member_count(supervisor_name, module)
             Map.put(acc, module, %{current: current, limit: limit})
           end)
 
@@ -1450,7 +1450,7 @@ defmodule DurableServer.Supervisor do
   """
   def global_members(sup_name) when is_atom(sup_name) do
     sup_name
-    |> DurableServer.Cluster.members(sup_name)
+    |> Group.members(sup_name)
     |> Enum.reduce(%{}, fn {pid, meta}, acc ->
       if node(pid) == Node.self() && !Process.alive?(pid) do
         acc
@@ -1462,7 +1462,7 @@ defmodule DurableServer.Supervisor do
 
   def global_members(sup_name, module) when is_atom(sup_name) and is_atom(module) do
     sup_name
-    |> DurableServer.Cluster.members(module)
+    |> Group.members(module)
     |> Enum.reduce(%{}, fn {pid, meta}, acc ->
       if node(pid) == Node.self() && !Process.alive?(pid) do
         acc
@@ -1477,18 +1477,18 @@ defmodule DurableServer.Supervisor do
       when is_atom(sup_name) and is_binary(key) and is_map(meta) do
     %{ets_table: table_name} = __get_config__(sup_name)
 
-    case DurableServer.Cluster.register(sup_name, key, meta) do
+    case Group.register(sup_name, key, meta) do
       :ok ->
         # Join internal tracking groups (by supervisor name and module)
-        # Use join or update: first join may succeed, subsequent calls update metadata
-        join_or_update_group(sup_name, sup_name, meta)
+        # Re-join updates metadata in place
+        Group.join(sup_name, sup_name, meta)
 
         # Also join module-specific group for per-module counting
         if module = meta[:module] do
           [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
 
           if is_map(limits[:max_children]) and Map.has_key?(limits[:max_children], module) do
-            join_or_update_group(sup_name, module, meta)
+            Group.join(sup_name, module, meta)
           end
         end
 
@@ -1496,13 +1496,6 @@ defmodule DurableServer.Supervisor do
 
       {:error, :taken} ->
         {:error, :taken}
-    end
-  end
-
-  defp join_or_update_group(sup_name, group, meta) do
-    case DurableServer.Cluster.join_group(sup_name, group, meta) do
-      :ok -> :ok
-      {:error, :already_member} -> :ok = :syn.join(syn_scope(sup_name), group, self(), meta)
     end
   end
 

@@ -1,11 +1,11 @@
-defmodule DurableServer.Cluster do
+defmodule Group do
   @moduledoc """
-  Cluster management, distributed registry, and lifecycle monitoring for any process.
+  Distributed process groups, registry, lifecycle monitoring, and isolated subclusters.
 
   This module provides:
   - **Distributed registry**: Unique key => process mapping across all nodes
   - **Process groups**: Allow processes to join/leave keys (many processes per key)
-  - **Cluster management**: Connect/disconnect nodes to isolated subclusters
+  - **Isolated subclusters**: Partition groups and registries into named subclusters for isolated messaging
   - **Lifecycle monitoring**: Monitor lifecycle events for registry and group changes
 
   ## Consistency Model
@@ -13,10 +13,10 @@ defmodule DurableServer.Cluster do
   All operations are **eventually consistent**. The underlying syn library uses
   Erlang distribution to propagate state across nodes, which means:
 
-  - Writes (register, join_group, etc.) return immediately after local update
+  - Writes (register, join, etc.) return immediately after local update
   - Other nodes receive updates asynchronously via Erlang distribution
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved (see `DurableServer.SynEventHandler`)
+  - When partitions heal, conflicts are resolved (see `Group.SynEventHandler`)
 
   ## Clusters
 
@@ -37,7 +37,7 @@ defmodule DurableServer.Cluster do
   DurableServers always register in the **default cluster** to ensure global uniqueness
   via the distributed locking mechanism. Named clusters are purely for isolating your own
   registries, process groups, and subscriptions to isolated subclusters. If a DurableServer
-  wants to participate in an isolated cluster, it can call `connect/2` and `join_group/4`
+  wants to participate in an isolated cluster, it can call `connect/2` and `join/4`
   inside its `init` callback.
 
   ## Core Concepts
@@ -48,7 +48,7 @@ defmodule DurableServer.Cluster do
     when DurableServers or other processes register/join matching keys anywhere in the
     cluster. Supports pattern matching on keys.
 
-  - **Memberships** (`join_group/3`, `leave_group/2`): Make your process discoverable cluster-wide
+  - **Memberships** (`join/3`, `leave/2`): Make your process discoverable cluster-wide
     via `members/2`. Triggers `:joined`/`:left` events to monitors.
 
   These are independent - joining a key does NOT automatically monitor events,
@@ -72,10 +72,9 @@ defmodule DurableServer.Cluster do
 
   | Event Type      | Trigger                                        | Extra Fields        |
   |-----------------|------------------------------------------------|---------------------|
-  | `:registered`   | Process registered via `register/3`            | -                   |
+  | `:registered`   | Process registered via `register/3` (new or re-register) | `:previous_meta` (`nil` if new, old meta if update) |
   | `:unregistered` | Process unregistered or died                   | `:reason`           |
-  | `:updated`      | Registry or group metadata changed             | `:previous_meta`    |
-  | `:joined`       | Process joined group via `join_group/3`        | -                   |
+  | `:joined`       | Process joined group via `join/3` (new or re-join)       | `:previous_meta` (`nil` if new, old meta if update) |
   | `:left`         | Process left group or died                     | `:reason`           |
 
   DurableServers automatically register/unregister during their lifecycle, so these
@@ -107,13 +106,13 @@ defmodule DurableServer.Cluster do
   ### Basic Monitoring
 
       # Monitor all events for a specific key
-      :ok = DurableServer.Cluster.monitor(MySup, "user/123")
+      :ok = Group.monitor(MySup, "user/123")
 
       # Monitor all keys under a prefix
-      :ok = DurableServer.Cluster.monitor(MySup, "chat/")
+      :ok = Group.monitor(MySup, "chat/")
 
       # Monitor all events
-      :ok = DurableServer.Cluster.monitor(MySup, :all)
+      :ok = Group.monitor(MySup, :all)
 
       # Handle events in a GenServer
       def handle_info({:durable_server, :registered, %{key: key, pid: pid}}, state) do
@@ -129,29 +128,29 @@ defmodule DurableServer.Cluster do
   ### Joining as a Member
 
       # Join a key to be discoverable by other processes
-      :ok = DurableServer.Cluster.join_group(MySup, "game/room/42", %{role: :spectator})
+      :ok = Group.join(MySup, "game/room/42", %{role: :spectator})
 
       # Query all members of a key (DurableServers + joined processes)
-      members = DurableServer.Cluster.members(MySup, "game/room/42")
+      members = Group.members(MySup, "game/room/42")
       # => [{#PID<0.150.0>, %{module: GameRoom, ...}}, {#PID<0.200.0>, %{role: :spectator}}]
 
       # Leave when done
-      :ok = DurableServer.Cluster.leave_group(MySup, "game/room/42")
+      :ok = Group.leave(MySup, "game/room/42")
 
   ### Using Named Clusters
 
       # Connect this node to a named cluster
-      :ok = DurableServer.Cluster.connect(MySup, :game_servers)
+      :ok = Group.connect(MySup, :game_servers)
 
       # Join a group in the named cluster
-      :ok = DurableServer.Cluster.join_group(MySup, "room/123", %{role: :member}, cluster: :game_servers)
+      :ok = Group.join(MySup, "room/123", %{role: :member}, cluster: :game_servers)
 
       # Monitor events in the named cluster
-      :ok = DurableServer.Cluster.monitor(MySup, :all, cluster: :game_servers)
+      :ok = Group.monitor(MySup, :all, cluster: :game_servers)
 
       # Members and dispatch also support cluster option
-      DurableServer.Cluster.members(MySup, "room/123", cluster: :game_servers)
-      DurableServer.Cluster.dispatch(MySup, "room/123", {:msg, "hi"}, cluster: :game_servers)
+      Group.members(MySup, "room/123", cluster: :game_servers)
+      Group.dispatch(MySup, "room/123", {:msg, "hi"}, cluster: :game_servers)
 
   ## Architecture Notes
 
@@ -166,10 +165,10 @@ defmodule DurableServer.Cluster do
     cleanup when member processes die.
   """
 
-  @registry DurableServer.Cluster.Registry
+  @registry Group.Registry
 
   # ===========================================================================
-  # Cluster Management (Node ↔ Cluster)
+  # Cluster Management (Node <-> Cluster)
   # ===========================================================================
 
   @doc """
@@ -285,7 +284,7 @@ defmodule DurableServer.Cluster do
   This registers a process with a unique key in the cluster. Only one process
   can be registered with a given key at a time (cluster-wide uniqueness).
 
-  Use `register/4` when you need exactly one process per key. Use `join_group/4`
+  Use `register/4` when you need exactly one process per key. Use `join/4`
   when multiple processes should be able to share the same key.
 
   ## Parameters
@@ -456,7 +455,7 @@ defmodule DurableServer.Cluster do
   end
 
   # ===========================================================================
-  # Process Groups (Process ↔ Group)
+  # Process Groups (Process <-> Group)
   # ===========================================================================
 
   @doc """
@@ -469,6 +468,8 @@ defmodule DurableServer.Cluster do
   **String groups** (e.g., `"room/123"`) trigger `:joined`/`:left` events to monitors.
   **Atom groups** (e.g., `:my_module`) do not trigger events - use for internal tracking.
 
+  Re-joining an already-joined group updates the metadata in place.
+
   Note: Joining does NOT automatically monitor events.
   Call `monitor/2` separately if you want to receive events.
 
@@ -476,7 +477,6 @@ defmodule DurableServer.Cluster do
 
   - `supervisor_name` - The DurableServer.Supervisor name
   - `group` - The group to join (string or atom)
-  - `pid` - The process to add (default: `self()`)
   - `meta` - Metadata map (default: `%{}`)
   - `opts` - Keyword list of options
 
@@ -487,24 +487,19 @@ defmodule DurableServer.Cluster do
   ## Returns
 
   - `:ok` on success
-  - `{:error, :already_member}` if already a member (use `update_group/4` to change metadata)
-  - `{:error, reason}` on other failures
+  - `{:error, reason}` on failure
   """
-  def join_group(supervisor_name, group, meta \\ %{}, opts \\ [])
+  def join(supervisor_name, group, meta \\ %{}, opts \\ [])
 
-  def join_group(supervisor_name, group, meta, opts)
+  def join(supervisor_name, group, meta, opts)
       when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_map(meta) and
              is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
     scope = resolve_scope(supervisor_name, cluster)
 
-    if :syn.is_member(scope, group, self()) do
-      {:error, :already_member}
-    else
-      case :syn.join(scope, group, self(), meta) do
-        :ok -> :ok
-        {:error, reason} -> {:error, reason}
-      end
+    case :syn.join(scope, group, self(), meta) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -526,9 +521,9 @@ defmodule DurableServer.Cluster do
   - `:ok` on success
   - `{:error, :not_in_group}` if not a member
   """
-  def leave_group(supervisor_name, group, opts \\ [])
+  def leave(supervisor_name, group, opts \\ [])
 
-  def leave_group(supervisor_name, group, opts)
+  def leave(supervisor_name, group, opts)
       when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
     scope = resolve_scope(supervisor_name, cluster)
@@ -540,49 +535,6 @@ defmodule DurableServer.Cluster do
     end
   end
 
-  @doc """
-  Update metadata for a process's membership in a key.
-
-  This updates the metadata associated with the process in the given key's
-  member list. Syn fires `on_group_process_updated` callbacks cluster-wide
-  on re-join, which broadcasts the `:updated` event to monitors.
-
-  ## Parameters
-
-  - `supervisor_name` - The DurableServer.Supervisor name
-  - `key` - The exact key the process has joined
-  - `new_meta` - The new metadata map
-  - `pid` - The pid to update (defaults to `self()`)
-  - `opts` - Keyword list of options
-
-  ## Options
-
-  - `:cluster` - Update in a named cluster instead of the default cluster
-
-  ## Returns
-
-  - `:ok` on success
-  - `{:error, :not_a_member}` if the process is not a member of the key
-  - `{:error, reason}` on other failures
-  """
-  def update_group(supervisor_name, key, new_meta, pid \\ self(), opts \\ [])
-
-  def update_group(supervisor_name, key, new_meta, pid, opts)
-      when is_atom(supervisor_name) and is_binary(key) and is_map(new_meta) and is_pid(pid) and
-             is_list(opts) do
-    cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
-
-    if :syn.is_member(scope, key, pid) do
-      case :syn.join(scope, key, pid, new_meta) do
-        :ok -> :ok
-        {:error, reason} -> {:error, reason}
-      end
-    else
-      {:error, :not_a_member}
-    end
-  end
-
   # ===========================================================================
   # Queries
   # ===========================================================================
@@ -591,7 +543,7 @@ defmodule DurableServer.Cluster do
   List all members of a group.
 
   For **string groups**: Returns both registered processes (via `register/5`) and
-  joined processes (via `join_group/5`) - this is typical for application keys
+  joined processes (via `join/5`) - this is typical for application keys
   like `"room/123"`.
 
   For **atom groups**: Returns only joined processes - atom groups are used for
@@ -715,7 +667,7 @@ defmodule DurableServer.Cluster do
   @doc """
   Dispatch a message to all members of a key.
 
-  Sends `message` to all processes that have joined the key via `join_group/3`, as well as
+  Sends `message` to all processes that have joined the key via `join/3`, as well as
   any DurableServer registered at that key. This is useful for application-level
   messaging between a DurableServer and connected clients (e.g., Phoenix Channels).
 
@@ -738,7 +690,7 @@ defmodule DurableServer.Cluster do
   `dispatch/3` sends to all members. If you need to filter by metadata (e.g., only
   send to members with `%{type: :channel}`), use `members/2` directly:
 
-      for {pid, %{type: :channel}} <- DurableServer.Cluster.members(sup, key) do
+      for {pid, %{type: :channel}} <- Group.members(sup, key) do
         send(pid, message)
       end
 

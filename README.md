@@ -108,9 +108,9 @@ State is synchronized to storage in these scenarios:
 2. **Automatic sync**: When `:auto_sync` is enabled, changes sync on the `:sync_every_ms` interval
 3. **Graceful shutdown**: State is always synced before termination
 
-## Cluster
+## Group
 
-`DurableServer.Cluster` provides cluster management, lifecycle monitoring, and process group coordination.
+`Group` provides distributed process groups, registry, lifecycle monitoring, and isolated subclusters.
 
 ### Monitoring Events
 
@@ -118,20 +118,20 @@ Monitor lifecycle events for DurableServers:
 
 ```elixir
 # Monitor a specific key
-:ok = DurableServer.Cluster.monitor(MyDurableSup, "user/123")
+:ok = Group.monitor(MyDurableSup, "user/123")
 
 # Monitor all keys with a prefix
-:ok = DurableServer.Cluster.monitor(MyDurableSup, "user/")
+:ok = Group.monitor(MyDurableSup, "user/")
 
 # Monitor all events
-:ok = DurableServer.Cluster.monitor(MyDurableSup, :all)
+:ok = Group.monitor(MyDurableSup, :all)
 ```
 
 Monitors receive messages in their mailbox:
 
 ```elixir
-def handle_info({:durable_server, :registered, %{key: key, pid: pid}}, state) do
-  # A DurableServer started
+def handle_info({:durable_server, :registered, %{key: key, pid: pid, previous_meta: nil}}, state) do
+  # A DurableServer started (previous_meta is nil for first registration)
 end
 
 def handle_info({:durable_server, :unregistered, %{key: key, reason: reason}}, state) do
@@ -139,7 +139,9 @@ def handle_info({:durable_server, :unregistered, %{key: key, reason: reason}}, s
 end
 ```
 
-Event types: `:registered`, `:unregistered`, `:updated`, `:joined`, `:left`
+Event types: `:registered`, `:unregistered`, `:joined`, `:left`
+
+`:registered` and `:joined` events include a `previous_meta` field (`nil` for new, old meta for re-register/re-join).
 
 ### Joining as a Member
 
@@ -147,18 +149,17 @@ Non-DurableServer processes can join keys to be discoverable and receive dispatc
 
 ```elixir
 # Join a key (e.g., from a Phoenix Channel)
-:ok = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{type: :channel})
+:ok = Group.join(MyDurableSup, "room/123", %{type: :channel})
 
-# Re-joining returns an error — use update_group to change metadata
-{:error, :already_member} = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{type: :channel})
-:ok = DurableServer.Cluster.update_group(MyDurableSup, "room/123", %{type: :channel, status: :active})
+# Re-joining updates metadata in place
+:ok = Group.join(MyDurableSup, "room/123", %{type: :channel, status: :active})
 
 # Query all members of a key (DurableServers + joined processes)
-members = DurableServer.Cluster.members(MyDurableSup, "room/123")
+members = Group.members(MyDurableSup, "room/123")
 # => [{#PID<0.150.0>, %{...}}, {#PID<0.200.0>, %{type: :channel, status: :active}}]
 
 # Leave when done (also happens automatically on process death)
-:ok = DurableServer.Cluster.leave_group(MyDurableSup, "room/123")
+:ok = Group.leave(MyDurableSup, "room/123")
 ```
 
 ### Dispatching to Members
@@ -167,7 +168,7 @@ Send messages to all members of a key:
 
 ```elixir
 # From a DurableServer, broadcast to all connected channels
-DurableServer.Cluster.dispatch(MyDurableSup, state.key, {:new_message, message})
+Group.dispatch(MyDurableSup, state.key, {:new_message, message})
 ```
 
 ### Named Clusters
@@ -176,20 +177,19 @@ For advanced use cases, you can create isolated subclusters where only connected
 
 ```elixir
 # Connect this node to a named cluster
-:ok = DurableServer.Cluster.connect(MyDurableSup, :game_servers)
+:ok = Group.connect(MyDurableSup, :game_servers)
 
 # Join/monitor/dispatch with the cluster: option
-:ok = DurableServer.Cluster.join_group(MyDurableSup, "room/123", %{}, cluster: :game_servers)
-:ok = DurableServer.Cluster.monitor(MyDurableSup, :all, cluster: :game_servers)
+:ok = Group.join(MyDurableSup, "room/123", %{}, cluster: :game_servers)
+:ok = Group.monitor(MyDurableSup, :all, cluster: :game_servers)
 ```
 
 Note: DurableServers always register in the default cluster to ensure global uniqueness. Named clusters are purely for the pub/sub layer.
 
-### Monitor vs Join vs Update
+### Monitor vs Join
 
-- **`monitor/2`**: Receive lifecycle events (`:registered`, `:unregistered`, `:updated`, `:joined`, `:left`) - system-generated
-- **`join_group/3`**: Be discoverable via `members/2` and receive `dispatch/3` messages - application-level
-- **`update_group/4`**: Update metadata for an existing group membership, triggers `:updated` events cluster-wide
+- **`monitor/2`**: Receive lifecycle events (`:registered`, `:unregistered`, `:joined`, `:left`) - system-generated
+- **`join/3`**: Be discoverable via `members/2` and receive `dispatch/3` messages - application-level
 
 These are independent - joining does not monitor events, and monitoring does not make you discoverable.
 
