@@ -1,22 +1,22 @@
-defmodule DurableServer.Cluster do
+defmodule Group do
   @moduledoc """
-  Cluster management, distributed registry, and pubsub system for DurableServer.
+  Distributed process groups, registry, lifecycle monitoring, and isolated subclusters.
 
   This module provides:
   - **Distributed registry**: Unique key => process mapping across all nodes
   - **Process groups**: Allow processes to join/leave keys (many processes per key)
-  - **Cluster management**: Connect/disconnect nodes to isolated subclusters
-  - **Pubsub interface**: Subscribe to lifecycle events for registry and group changes
+  - **Isolated subclusters**: Partition groups and registries into named subclusters for isolated messaging
+  - **Lifecycle monitoring**: Monitor lifecycle events for registry and group changes
 
   ## Consistency Model
 
   All operations are **eventually consistent**. The underlying syn library uses
   Erlang distribution to propagate state across nodes, which means:
 
-  - Writes (register, join_group, etc.) return immediately after local update
+  - Writes (register, join, etc.) return immediately after local update
   - Other nodes receive updates asynchronously via Erlang distribution
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved (see `DurableServer.SynEventHandler`)
+  - When partitions heal, conflicts are resolved (see `Group.SynEventHandler`)
 
   ## Clusters
 
@@ -37,55 +37,64 @@ defmodule DurableServer.Cluster do
   DurableServers always register in the **default cluster** to ensure global uniqueness
   via the distributed locking mechanism. Named clusters are purely for isolating your own
   registries, process groups, and subscriptions to isolated subclusters. If a DurableServer
-  wants to participate in an isolated cluster, it can call `connect/2` and `join_group/4`
+  wants to participate in an isolated cluster, it can call `connect/2` and `join/4`
   inside its `init` callback.
 
   ## Core Concepts
 
-  ### Subscriptions vs Memberships
+  ### Monitoring vs Memberships
 
-  - **Subscriptions** (`subscribe/2`, `unsubscribe/2`): Receive events in your mailbox
+  - **Monitoring** (`monitor/2`, `demonitor/2`): Receive events in your mailbox
     when DurableServers or other processes register/join matching keys anywhere in the
     cluster. Supports pattern matching on keys.
 
-  - **Memberships** (`join_group/3`, `leave_group/2`): Make your process discoverable cluster-wide
-    via `members/2`. Triggers `:joined`/`:left` events to subscribers.
+  - **Memberships** (`join/3`, `leave/2`): Make your process discoverable cluster-wide
+    via `members/2`. Triggers `:joined`/`:left` events to monitors.
 
-  These are independent - joining a key does NOT automatically subscribe you to events,
-  and subscribing does NOT make you discoverable via `members/2`.
+  These are independent - joining a key does NOT automatically monitor events,
+  and monitoring does NOT make you discoverable via `members/2`.
 
   ### String Groups vs Atom Groups
 
   Process groups can use either **string** or **atom** names:
 
   - **String groups** (e.g., `"room/123"`): Trigger `:joined`/`:left` pub/sub events.
-    Subscribers can pattern-match on these using prefix patterns like `"room/"`.
+    Monitors can pattern-match on these using prefix patterns like `"room/"`.
 
   - **Atom groups** (e.g., `:my_module`): Do NOT trigger pub/sub events. Useful for
     internal bookkeeping where you do not need or want pubsub network overhead.
 
   ## Event Types
 
-  Events are delivered as messages to subscribed processes:
+  Events are delivered as `%Group.Event{}` structs to monitoring processes:
 
-      {:durable_server, event_type, payload}
+      %Group.Event{
+        type: event_type,
+        supervisor: supervisor_name,
+        cluster: cluster_name,  # nil for default cluster
+        key: key,
+        pid: pid,
+        meta: meta,             # always user-provided meta (internal keys stripped)
+        previous_meta: ...,     # nil for new, old meta for re-register/re-join
+        reason: ...             # set on :unregistered/:left events
+      }
 
-  | Event Type      | Trigger                                        | Extra Fields        |
-  |-----------------|------------------------------------------------|---------------------|
-  | `:registered`   | Process registered via `register/3`            | -                   |
-  | `:unregistered` | Process unregistered or died                   | `:reason`           |
-  | `:updated`      | Registry or group metadata changed             | `:previous_meta`    |
-  | `:joined`       | Process joined group via `join_group/3`        | -                   |
-  | `:left`         | Process left group or died                     | `:reason`           |
+  | Event           | Trigger                           | Extra Fields     |
+  |-----------------|-----------------------------------|------------------|
+  | `:registered`   | `register/3` (new or re-register) | `:previous_meta` |
+  | `:unregistered` | Process unregistered or died      | `:reason`        |
+  | `:joined`       | `join/3` (new or re-join)         | `:previous_meta` |
+  | `:left`         | Process left group or died        | `:reason`        |
+
+  `:previous_meta` is `nil` for new registrations/joins, or the old
+  metadata map when re-registering/re-joining.
 
   DurableServers automatically register/unregister during their lifecycle, so these
   events can be used to track DurableServer start/stop.
 
-  All payloads include: `:supervisor`, `:cluster`, `:key`, `:pid`, `:meta`
-
   ## Pattern Types
 
-  Subscriptions support three pattern types:
+  Monitors support three pattern types:
 
   - `"user/123"` - Exact match, only events for this specific key
   - `"user/"` - Prefix match, all keys starting with "user/"
@@ -93,35 +102,35 @@ defmodule DurableServer.Cluster do
 
   ## Self-Events
 
-  A process that subscribes to a pattern and then joins a matching key will receive
+  A process that monitors a pattern and then joins a matching key will receive
   its own `:joined` event. Similarly for `:left` when leaving. Filter these in your
   handler if needed:
 
-      def handle_info({:durable_server, :joined, %{pid: pid}}, state) when pid == self() do
+      def handle_info(%Group.Event{type: :joined, pid: pid}, state) when pid == self() do
         # Ignore our own join event
         {:noreply, state}
       end
 
   ## Examples
 
-  ### Basic Subscription
+  ### Basic Monitoring
 
-      # Subscribe to all events for a specific key
-      :ok = DurableServer.Cluster.subscribe(MySup, "user/123")
+      # Monitor all events for a specific key
+      :ok = Group.monitor(MySup, "user/123")
 
-      # Subscribe to all keys under a prefix
-      :ok = DurableServer.Cluster.subscribe(MySup, "chat/")
+      # Monitor all keys under a prefix
+      :ok = Group.monitor(MySup, "chat/")
 
-      # Subscribe to all events
-      :ok = DurableServer.Cluster.subscribe(MySup, :all)
+      # Monitor all events
+      :ok = Group.monitor(MySup, :all)
 
       # Handle events in a GenServer
-      def handle_info({:durable_server, :registered, %{key: key, pid: pid}}, state) do
+      def handle_info(%Group.Event{type: :registered, key: key, pid: pid}, state) do
         IO.puts("DurableServer started: \#{key}")
         {:noreply, state}
       end
 
-      def handle_info({:durable_server, :unregistered, %{key: key, reason: reason}}, state) do
+      def handle_info(%Group.Event{type: :unregistered, key: key, reason: reason}, state) do
         IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
         {:noreply, state}
       end
@@ -129,47 +138,47 @@ defmodule DurableServer.Cluster do
   ### Joining as a Member
 
       # Join a key to be discoverable by other processes
-      :ok = DurableServer.Cluster.join_group(MySup, "game/room/42", %{role: :spectator})
+      :ok = Group.join(MySup, "game/room/42", %{role: :spectator})
 
       # Query all members of a key (DurableServers + joined processes)
-      members = DurableServer.Cluster.members(MySup, "game/room/42")
+      members = Group.members(MySup, "game/room/42")
       # => [{#PID<0.150.0>, %{module: GameRoom, ...}}, {#PID<0.200.0>, %{role: :spectator}}]
 
       # Leave when done
-      :ok = DurableServer.Cluster.leave_group(MySup, "game/room/42")
+      :ok = Group.leave(MySup, "game/room/42")
 
   ### Using Named Clusters
 
       # Connect this node to a named cluster
-      :ok = DurableServer.Cluster.connect(MySup, :game_servers)
+      :ok = Group.connect(MySup, :game_servers)
 
       # Join a group in the named cluster
-      :ok = DurableServer.Cluster.join_group(MySup, "room/123", %{role: :member}, cluster: :game_servers)
+      :ok = Group.join(MySup, "room/123", %{role: :member}, cluster: :game_servers)
 
-      # Subscribe to events in the named cluster
-      :ok = DurableServer.Cluster.subscribe(MySup, :all, cluster: :game_servers)
+      # Monitor events in the named cluster
+      :ok = Group.monitor(MySup, :all, cluster: :game_servers)
 
-      # Members and broadcast also support cluster option
-      DurableServer.Cluster.members(MySup, "room/123", cluster: :game_servers)
-      DurableServer.Cluster.broadcast(MySup, "room/123", {:msg, "hi"}, cluster: :game_servers)
+      # Members and dispatch also support cluster option
+      Group.members(MySup, "room/123", cluster: :game_servers)
+      Group.dispatch(MySup, "room/123", {:msg, "hi"}, cluster: :game_servers)
 
   ## Architecture Notes
 
   - **Events are cluster-wide**: syn callbacks (`on_process_registered`, `on_process_joined`,
-    etc.) fire on ALL nodes in the cluster. This means a subscriber on Node A receives
+    etc.) fire on ALL nodes in the cluster. This means a monitor on Node A receives
     events when a DurableServer registers on Node B.
 
-  - **Subscriptions** are stored per-node in an Elixir `Registry`, enabling pattern matching
-    and automatic cleanup when subscriber processes die.
+  - **Monitors** are stored per-node in an Elixir `Registry`, enabling pattern matching
+    and automatic cleanup when monitoring processes die.
 
   - **Memberships** use syn process groups for cluster-wide distribution and automatic
     cleanup when member processes die.
   """
 
-  @registry DurableServer.Cluster.Registry
+  @registry Group.Registry
 
   # ===========================================================================
-  # Cluster Management (Node ↔ Cluster)
+  # Cluster Management (Node <-> Cluster)
   # ===========================================================================
 
   @doc """
@@ -285,7 +294,7 @@ defmodule DurableServer.Cluster do
   This registers a process with a unique key in the cluster. Only one process
   can be registered with a given key at a time (cluster-wide uniqueness).
 
-  Use `register/4` when you need exactly one process per key. Use `join_group/4`
+  Use `register/4` when you need exactly one process per key. Use `join/4`
   when multiple processes should be able to share the same key.
 
   ## Parameters
@@ -391,22 +400,15 @@ defmodule DurableServer.Cluster do
   end
 
   # ===========================================================================
-  # Subscriptions
+  # Lifecycle Monitoring
   # ===========================================================================
 
   @doc """
-  Subscribe to DurableServer registry events matching the given pattern.
+  Monitor lifecycle events matching the given pattern.
 
-  The calling process will receive messages for matching keys:
+  The calling process will receive `%Group.Event{}` structs for matching keys:
 
-      {:durable_server, event_type, %{
-        supervisor: supervisor_name,
-        cluster: cluster_name,  # nil for default cluster
-        key: key,
-        pid: pid,
-        meta: meta,
-        ...
-      }}
+      %Group.Event{type: :registered, supervisor: sup, key: "user/123", pid: pid, meta: meta, ...}
 
   ## Patterns
 
@@ -416,14 +418,14 @@ defmodule DurableServer.Cluster do
 
   ## Options
 
-  - `:cluster` - Subscribe to events from a named cluster (default: nil for default cluster)
+  - `:cluster` - Monitor events from a named cluster (default: nil for default cluster)
 
   ## Returns
 
   - `:ok` on success
   - `{:error, reason}` on failure
   """
-  def subscribe(supervisor_name, pattern_string, opts \\ [])
+  def monitor(supervisor_name, pattern_string, opts \\ [])
       when is_atom(supervisor_name) and (is_binary(pattern_string) or pattern_string == :all) do
     cluster = Keyword.get(opts, :cluster)
     pattern = parse_pattern(pattern_string)
@@ -437,17 +439,17 @@ defmodule DurableServer.Cluster do
   end
 
   @doc """
-  Unsubscribe from DurableServer registry events for the given pattern.
+  Stop monitoring lifecycle events for the given pattern.
 
   ## Options
 
-  - `:cluster` - The cluster to unsubscribe from (default: nil for default cluster)
+  - `:cluster` - The cluster to demonitor from (default: nil for default cluster)
 
   ## Returns
 
-  - `:ok` always (unsubscribing from a non-existent subscription is a no-op)
+  - `:ok` always (demonitoring a non-existent monitor is a no-op)
   """
-  def unsubscribe(supervisor_name, pattern_string, opts \\ []) when is_atom(supervisor_name) do
+  def demonitor(supervisor_name, pattern_string, opts \\ []) when is_atom(supervisor_name) do
     cluster = Keyword.get(opts, :cluster)
     pattern = parse_pattern(pattern_string)
     key = {supervisor_name, cluster, pattern}
@@ -456,7 +458,7 @@ defmodule DurableServer.Cluster do
   end
 
   # ===========================================================================
-  # Process Groups (Process ↔ Group)
+  # Process Groups (Process <-> Group)
   # ===========================================================================
 
   @doc """
@@ -466,17 +468,18 @@ defmodule DurableServer.Cluster do
   - Be discoverable via `members/2`
   - Be automatically removed when it dies
 
-  **String groups** (e.g., `"room/123"`) trigger `:joined`/`:left` events to subscribers.
+  **String groups** (e.g., `"room/123"`) trigger `:joined`/`:left` events to monitors.
   **Atom groups** (e.g., `:my_module`) do not trigger events - use for internal tracking.
 
-  Note: Joining does NOT automatically subscribe the process to events.
-  Call `subscribe/2` separately if you want to receive events.
+  Re-joining an already-joined group updates the metadata in place.
+
+  Note: Joining does NOT automatically monitor events.
+  Call `monitor/2` separately if you want to receive events.
 
   ## Parameters
 
   - `supervisor_name` - The DurableServer.Supervisor name
   - `group` - The group to join (string or atom)
-  - `pid` - The process to add (default: `self()`)
   - `meta` - Metadata map (default: `%{}`)
   - `opts` - Keyword list of options
 
@@ -487,12 +490,11 @@ defmodule DurableServer.Cluster do
   ## Returns
 
   - `:ok` on success
-  - `{:error, :already_member}` if already a member (use `update_group/4` to change metadata)
-  - `{:error, reason}` on other failures
+  - `{:error, reason}` on failure
   """
-  def join_group(supervisor_name, group, meta \\ %{}, opts \\ [])
+  def join(supervisor_name, group, meta \\ %{}, opts \\ [])
 
-  def join_group(supervisor_name, group, meta, opts)
+  def join(supervisor_name, group, meta, opts)
       when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_map(meta) and
              is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
@@ -522,9 +524,9 @@ defmodule DurableServer.Cluster do
   - `:ok` on success
   - `{:error, :not_in_group}` if not a member
   """
-  def leave_group(supervisor_name, group, opts \\ [])
+  def leave(supervisor_name, group, opts \\ [])
 
-  def leave_group(supervisor_name, group, opts)
+  def leave(supervisor_name, group, opts)
       when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
     scope = resolve_scope(supervisor_name, cluster)
@@ -536,90 +538,6 @@ defmodule DurableServer.Cluster do
     end
   end
 
-  @doc """
-  Update metadata for a process's membership in a key.
-
-  This updates the metadata associated with the process in the given key's
-  member list and broadcasts an `:updated` event to subscribers.
-
-  Syn's process groups don't natively fire callbacks on metadata updates,
-  so this function manually broadcasts the event after updating the metadata
-  in syn. The order of operations is:
-
-  1. Fetch the current metadata for the process
-  2. Update the metadata in syn (via re-join)
-  3. Broadcast `:updated` event to subscribers
-
-  This ensures that `members/2` will return the new metadata before subscribers
-  receive the event.
-
-  Note: The `:updated` event is the same type used for DurableServer metadata
-  changes. If you need to distinguish between DurableServer and member updates,
-  you can check if the pid is registered in the syn registry (DurableServer) or
-  only in the process group (member).
-
-  ## Parameters
-
-  - `supervisor_name` - The DurableServer.Supervisor name
-  - `key` - The exact key the process has joined
-  - `new_meta` - The new metadata map
-  - `pid` - The pid to update (defaults to `self()`)
-  - `opts` - Keyword list of options
-
-  ## Options
-
-  - `:cluster` - Update in a named cluster instead of the default cluster
-
-  ## Returns
-
-  - `:ok` on success
-  - `{:error, :not_a_member}` if the process is not a member of the key
-  - `{:error, reason}` on other failures
-  """
-  def update_group(supervisor_name, key, new_meta, pid \\ self(), opts \\ [])
-
-  def update_group(supervisor_name, key, new_meta, pid, opts)
-      when is_atom(supervisor_name) and is_binary(key) and is_map(new_meta) and is_pid(pid) and
-             is_list(opts) do
-    cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
-
-    # Get current metadata before updating
-    case get_group_member_meta(scope, key, pid) do
-      {:ok, old_meta} ->
-        # Update metadata in syn (re-join updates in place, no callback fired)
-        case :syn.join(scope, key, pid, new_meta) do
-          :ok ->
-            # Broadcast the update event
-            __broadcast__(supervisor_name, :updated, key, pid, new_meta, %{
-              previous_meta: old_meta,
-              cluster: cluster
-            })
-
-            :ok
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      :error ->
-        {:error, :not_a_member}
-    end
-  end
-
-  # Get metadata for a specific pid in a process group
-  defp get_group_member_meta(scope, key, pid) do
-    try do
-      case Enum.find(:syn.members(scope, key), fn {p, _meta} -> p == pid end) do
-        {^pid, meta} -> {:ok, meta}
-        nil -> :error
-      end
-    rescue
-      # syn raises ArgumentError if the group doesn't exist
-      ArgumentError -> :error
-    end
-  end
-
   # ===========================================================================
   # Queries
   # ===========================================================================
@@ -628,7 +546,7 @@ defmodule DurableServer.Cluster do
   List all members of a group.
 
   For **string groups**: Returns both registered processes (via `register/5`) and
-  joined processes (via `join_group/5`) - this is typical for application keys
+  joined processes (via `join/5`) - this is typical for application keys
   like `"room/123"`.
 
   For **atom groups**: Returns only joined processes - atom groups are used for
@@ -746,50 +664,50 @@ defmodule DurableServer.Cluster do
   end
 
   # ===========================================================================
-  # Broadcast
+  # Dispatch
   # ===========================================================================
 
   @doc """
-  Broadcast a message to all members of a key.
+  Dispatch a message to all members of a key.
 
-  Sends `message` to all processes that have joined the key via `join_group/3`, as well as
+  Sends `message` to all processes that have joined the key via `join/3`, as well as
   any DurableServer registered at that key. This is useful for application-level
   messaging between a DurableServer and connected clients (e.g., Phoenix Channels).
 
-  ## Broadcast vs Subscribe
+  ## Dispatch vs Monitor
 
   There are two ways to receive messages in this module:
 
-  - **`subscribe/2`** - Receive *lifecycle events* (`:registered`, `:unregistered`, etc.)
+  - **`monitor/2`** - Receive *lifecycle events* (`:registered`, `:unregistered`, etc.)
     when DurableServers or processes join/leave keys matching a pattern. These are
     system-generated events.
 
-  - **`broadcast/3`** - Receive *application messages* sent explicitly by your code.
+  - **`dispatch/3`** - Receive *application messages* sent explicitly by your code.
     Only members of the exact key receive the message.
 
-  Use `subscribe` to react to lifecycle changes. Use `broadcast` to send your own
+  Use `monitor` to react to lifecycle changes. Use `dispatch` to send your own
   messages to members.
 
   ## Filtering by Metadata
 
-  `broadcast/3` sends to all members. If you need to filter by metadata (e.g., only
+  `dispatch/3` sends to all members. If you need to filter by metadata (e.g., only
   send to members with `%{type: :channel}`), use `members/2` directly:
 
-      for {pid, %{type: :channel}} <- DurableServer.Cluster.members(sup, key) do
+      for {pid, %{type: :channel}} <- Group.members(sup, key) do
         send(pid, message)
       end
 
   ## Options
 
-  - `:cluster` - Broadcast to a named cluster instead of the default cluster
+  - `:cluster` - Dispatch to a named cluster instead of the default cluster
 
   ## Returns
 
   - `:ok` always
   """
-  def broadcast(supervisor_name, key, message, opts \\ [])
+  def dispatch(supervisor_name, key, message, opts \\ [])
 
-  def broadcast(supervisor_name, key, message, opts)
+  def dispatch(supervisor_name, key, message, opts)
       when is_atom(supervisor_name) and is_binary(key) and is_list(opts) do
     for {pid, _meta} <- members(supervisor_name, key, opts) do
       send(pid, message)
@@ -803,23 +721,20 @@ defmodule DurableServer.Cluster do
   # ===========================================================================
 
   @doc false
-  def __broadcast__(supervisor_name, event_type, key, pid, meta, extra \\ %{}) do
+  def __dispatch__(supervisor_name, event_type, key, pid, meta, extra \\ %{}) do
     cluster = Map.get(extra, :cluster)
     subscribers = get_subscribers_for_key(supervisor_name, cluster, key)
 
-    payload =
-      Map.merge(
-        %{
-          supervisor: supervisor_name,
-          cluster: cluster,
-          key: key,
-          pid: pid,
-          meta: extract_user_meta(meta)
-        },
-        Map.delete(extra, :cluster)
-      )
-
-    event = {:durable_server, event_type, payload}
+    event = %Group.Event{
+      type: event_type,
+      supervisor: supervisor_name,
+      cluster: cluster,
+      key: key,
+      pid: pid,
+      meta: extract_user_meta(meta),
+      previous_meta: Map.get(extra, :previous_meta),
+      reason: Map.get(extra, :reason)
+    }
 
     for subscriber_pid <- subscribers do
       send(subscriber_pid, event)
