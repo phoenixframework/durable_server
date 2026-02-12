@@ -79,12 +79,15 @@ defmodule Group do
         reason: ...             # set on :unregistered/:left events
       }
 
-  | Event            | Trigger                                        | Extra Fields        |
-  |------------------|------------------------------------------------|---------------------|
-  | `:registered`    | Process registered via `register/3` (new or re-register) | `:previous_meta` (`nil` if new, old meta if update) |
-  | `:unregistered`  | Process unregistered or died                   | `:reason`           |
-  | `:joined`        | Process joined group via `join/3` (new or re-join)       | `:previous_meta` (`nil` if new, old meta if update) |
-  | `:left`          | Process left group or died                     | `:reason`           |
+  | Event           | Trigger                           | Extra Fields     |
+  |-----------------|-----------------------------------|------------------|
+  | `:registered`   | `register/3` (new or re-register) | `:previous_meta` |
+  | `:unregistered` | Process unregistered or died      | `:reason`        |
+  | `:joined`       | `join/3` (new or re-join)         | `:previous_meta` |
+  | `:left`         | Process left group or died        | `:reason`        |
+
+  `:previous_meta` is `nil` for new registrations/joins, or the old
+  metadata map when re-registering/re-joining.
 
   DurableServers automatically register/unregister during their lifecycle, so these
   events can be used to track DurableServer start/stop.

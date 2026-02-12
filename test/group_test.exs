@@ -443,7 +443,8 @@ defmodule GroupTest do
         DurableServer.Supervisor.start_child(supervisor_name_2, {TestServer, %{key: key}})
 
       # Should receive event from sup2
-      assert_receive %Group.Event{type: :registered, supervisor: ^supervisor_name_2, pid: ^pid2}, 1000
+      assert_receive %Group.Event{type: :registered, supervisor: ^supervisor_name_2, pid: ^pid2},
+                     1000
 
       # Now unsubscribe from sup2 and subscribe to sup1 (from setup)
       :ok = Group.demonitor(supervisor_name_2, :all)
