@@ -2372,6 +2372,10 @@ defmodule DurableServer do
   end
 
   @doc false
+  def extract_user_meta(%{user_meta: user_meta}), do: user_meta
+  def extract_user_meta(meta) when is_map(meta), do: meta
+
+  @doc false
   def __fetch_stored_state_for_conflict_resolution__(supervisor_name, storage_key)
       when is_atom(supervisor_name) and is_binary(storage_key) do
     # Fetch the current etag from storage for conflict resolution
