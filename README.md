@@ -127,14 +127,14 @@ Monitor lifecycle events for DurableServers:
 :ok = Group.monitor(MyDurableSup, :all)
 ```
 
-Monitors receive `%Group{}` structs in their mailbox:
+Monitors receive `%Group.Event{}` structs in their mailbox:
 
 ```elixir
-def handle_info(%Group{event: :registered, key: key, pid: pid, previous_meta: nil}, state) do
+def handle_info(%Group.Event{type: :registered, key: key, pid: pid, previous_meta: nil}, state) do
   # A DurableServer started (previous_meta is nil for first registration)
 end
 
-def handle_info(%Group{event: :unregistered, key: key, reason: reason}, state) do
+def handle_info(%Group.Event{type: :unregistered, key: key, reason: reason}, state) do
   # A DurableServer stopped
 end
 ```

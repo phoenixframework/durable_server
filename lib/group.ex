@@ -66,10 +66,10 @@ defmodule Group do
 
   ## Event Types
 
-  Events are delivered as `%Group{}` structs to monitoring processes:
+  Events are delivered as `%Group.Event{}` structs to monitoring processes:
 
-      %Group{
-        event: event_type,
+      %Group.Event{
+        type: event_type,
         supervisor: supervisor_name,
         cluster: cluster_name,  # nil for default cluster
         key: key,
@@ -103,7 +103,7 @@ defmodule Group do
   its own `:joined` event. Similarly for `:left` when leaving. Filter these in your
   handler if needed:
 
-      def handle_info(%Group{event: :joined, pid: pid}, state) when pid == self() do
+      def handle_info(%Group.Event{type: :joined, pid: pid}, state) when pid == self() do
         # Ignore our own join event
         {:noreply, state}
       end
@@ -122,12 +122,12 @@ defmodule Group do
       :ok = Group.monitor(MySup, :all)
 
       # Handle events in a GenServer
-      def handle_info(%Group{event: :registered, key: key, pid: pid}, state) do
+      def handle_info(%Group.Event{type: :registered, key: key, pid: pid}, state) do
         IO.puts("DurableServer started: \#{key}")
         {:noreply, state}
       end
 
-      def handle_info(%Group{event: :unregistered, key: key, reason: reason}, state) do
+      def handle_info(%Group.Event{type: :unregistered, key: key, reason: reason}, state) do
         IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
         {:noreply, state}
       end
@@ -171,8 +171,6 @@ defmodule Group do
   - **Memberships** use syn process groups for cluster-wide distribution and automatic
     cleanup when member processes die.
   """
-
-  defstruct [:event, :supervisor, :cluster, :key, :pid, :meta, :reason, :previous_meta]
 
   @registry Group.Registry
 
@@ -405,9 +403,9 @@ defmodule Group do
   @doc """
   Monitor lifecycle events matching the given pattern.
 
-  The calling process will receive `%Group{}` structs for matching keys:
+  The calling process will receive `%Group.Event{}` structs for matching keys:
 
-      %Group{event: :registered, supervisor: sup, key: "user/123", pid: pid, meta: meta, ...}
+      %Group.Event{type: :registered, supervisor: sup, key: "user/123", pid: pid, meta: meta, ...}
 
   ## Patterns
 
@@ -724,8 +722,8 @@ defmodule Group do
     cluster = Map.get(extra, :cluster)
     subscribers = get_subscribers_for_key(supervisor_name, cluster, key)
 
-    event = %Group{
-      event: event_type,
+    event = %Group.Event{
+      type: event_type,
       supervisor: supervisor_name,
       cluster: cluster,
       key: key,
