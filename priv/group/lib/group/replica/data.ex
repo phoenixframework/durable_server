@@ -276,6 +276,33 @@ defmodule Group.Replica.Data do
     {reg_entries, pg_entries}
   end
 
+  def local_data_by_cluster(name, shard, clusters) do
+    cluster_set = MapSet.new(clusters)
+    local_node = node()
+
+    reg_table = reg_by_key_table(name, shard)
+
+    reg_by_cluster =
+      :ets.select(reg_table, [
+        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"}, [{:==, :"$6", local_node}],
+         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+      ])
+      |> Enum.filter(fn {cluster, _, _, _, _} -> MapSet.member?(cluster_set, cluster) end)
+      |> Enum.group_by(&elem(&1, 0), fn {_, key, pid, meta, time} -> {key, pid, meta, time} end)
+
+    pg_table = pg_by_key_table(name, shard)
+
+    pg_by_cluster =
+      :ets.select(pg_table, [
+        {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6"}, [{:==, :"$6", local_node}],
+         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+      ])
+      |> Enum.filter(fn {cluster, _, _, _, _} -> MapSet.member?(cluster_set, cluster) end)
+      |> Enum.group_by(&elem(&1, 0), fn {_, key, pid, meta, time} -> {key, pid, meta, time} end)
+
+    {reg_by_cluster, pg_by_cluster}
+  end
+
   def purge_node(name, shard, dead_node) do
     reg_table = reg_by_key_table(name, shard)
     reg_pid_table = reg_by_pid_table(name, shard)

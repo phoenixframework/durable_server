@@ -509,10 +509,9 @@ defmodule Group.Replica do
       {:peer_connect_ack, self(), shard, state.num_shards, my_clusters}
     )
 
-    # Send cluster_state for each shared cluster
-    for cluster <- shared do
-      send_cluster_state(state, cluster, remote_node)
-    end
+    # Send cluster_state for all shared clusters in one pass (single table scan
+    # instead of one scan per cluster — O(N) vs O(C×N))
+    send_cluster_states(state, shared, remote_node)
 
     {:noreply, state}
   end
@@ -556,10 +555,8 @@ defmodule Group.Replica do
         %{state | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid)}
       end
 
-    # Send cluster_state for each shared cluster
-    for cluster <- shared do
-      send_cluster_state(state, cluster, remote_node)
-    end
+    # Send cluster_state for all shared clusters in one pass
+    send_cluster_states(state, shared, remote_node)
 
     {:noreply, state}
   end
@@ -1029,6 +1026,22 @@ defmodule Group.Replica do
   defp send_cluster_data_to_nodes(state, cluster, target_nodes) do
     for target_node <- target_nodes, target_node != node() do
       send_cluster_state(state, cluster, target_node)
+    end
+  end
+
+  # Gather local data for all shared clusters in ONE table scan (instead of C scans)
+  # and send per-cluster cluster_state messages. One O(N) scan vs C × O(N) scans.
+  defp send_cluster_states(state, clusters, target_node) do
+    %{name: name, shard_index: shard} = state
+    {reg_by_cluster, pg_by_cluster} = Data.local_data_by_cluster(name, shard, clusters)
+
+    for cluster <- clusters do
+      reg_data = Map.get(reg_by_cluster, cluster, [])
+      pg_data = Map.get(pg_by_cluster, cluster, [])
+
+      if reg_data != [] or pg_data != [] do
+        send_to_peer(state, target_node, {:cluster_state, cluster, reg_data, pg_data})
+      end
     end
   end
 
