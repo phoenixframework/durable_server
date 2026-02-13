@@ -25,8 +25,8 @@ defmodule Group do
 
   ### Default vs Named Clusters
 
-  - **Default cluster**: Uses scope `:"durable_<supervisor_name>"` - all nodes share this
-  - **Named clusters**: Use scope `:"durable_<supervisor_name>__cluster__<cluster_name>"`
+  - **Default cluster**: Uses scope `:"group_<name>"` - all nodes share this
+  - **Named clusters**: Use scope `:"group_<name>__cluster__<cluster_name>"`
 
   Named clusters are useful when you want to partition your registry/pubsub layer while still
   maintaining global uniqueness for DurableServers (which always register in the default
@@ -54,23 +54,13 @@ defmodule Group do
   These are independent - joining a key does NOT automatically monitor events,
   and monitoring does NOT make you discoverable via `members/2`.
 
-  ### String Groups vs Atom Groups
-
-  Process groups can use either **string** or **atom** names:
-
-  - **String groups** (e.g., `"room/123"`): Trigger `:joined`/`:left` pub/sub events.
-    Monitors can pattern-match on these using prefix patterns like `"room/"`.
-
-  - **Atom groups** (e.g., `:my_module`): Do NOT trigger pub/sub events. Useful for
-    internal bookkeeping where you do not need or want pubsub network overhead.
-
   ## Event Types
 
   Events are delivered as `%Group.Event{}` structs to monitoring processes:
 
       %Group.Event{
         type: event_type,
-        supervisor: supervisor_name,
+        supervisor: name,
         cluster: cluster_name,  # nil for default cluster
         key: key,
         pid: pid,
@@ -175,7 +165,42 @@ defmodule Group do
     cleanup when member processes die.
   """
 
-  @registry Group.Registry
+  # ===========================================================================
+  # Startup
+  # ===========================================================================
+
+  def child_spec(opts) do
+    name = Keyword.fetch!(opts, :name)
+    %{id: {__MODULE__, name}, start: {__MODULE__, :start_link, [opts]}, type: :supervisor}
+  end
+
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    callbacks = Keyword.get(opts, :callbacks, %{})
+    extract_meta = Keyword.get(opts, :extract_meta)
+    resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)
+    scope = scope(name)
+
+    :syn.add_node_to_scopes([scope])
+
+    # Store config in persistent_term for fast access
+    config = %{scope: scope, callbacks: callbacks}
+    config = if extract_meta, do: Map.put(config, :extract_meta, extract_meta), else: config
+
+    config =
+      if resolve_registry_conflict,
+        do: Map.put(config, :resolve_registry_conflict, resolve_registry_conflict),
+        else: config
+
+    :persistent_term.put({__MODULE__, name}, config)
+
+    # Start a supervisor with the local monitor Registry
+    children = [
+      {Registry, keys: :duplicate, name: registry_name(name)}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: :"#{name}_group_sup")
+  end
 
   # ===========================================================================
   # Cluster Management (Node <-> Cluster)
@@ -189,7 +214,7 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `cluster_name` - The name of the cluster to connect to (atom)
 
   ## Returns
@@ -197,9 +222,9 @@ defmodule Group do
   - `:ok` on success
   - `{:error, reason}` on failure
   """
-  def connect(supervisor_name, cluster_name)
-      when is_atom(supervisor_name) and is_atom(cluster_name) do
-    scope = cluster_scope(supervisor_name, cluster_name)
+  def connect(name, cluster_name)
+      when is_atom(name) and is_atom(cluster_name) do
+    scope = cluster_scope(name, cluster_name)
 
     case :syn.add_node_to_scopes([scope]) do
       :ok -> :ok
@@ -212,16 +237,16 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `cluster_name` - The name of the cluster to disconnect from (atom)
 
   ## Returns
 
   - `:ok` always
   """
-  def disconnect(supervisor_name, cluster_name)
-      when is_atom(supervisor_name) and is_atom(cluster_name) do
-    scope = cluster_scope(supervisor_name, cluster_name)
+  def disconnect(name, cluster_name)
+      when is_atom(name) and is_atom(cluster_name) do
+    scope = cluster_scope(name, cluster_name)
     :syn.remove_node_from_scopes([scope])
   end
 
@@ -230,7 +255,7 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `cluster_name` - The name of the cluster to check
 
   ## Returns
@@ -238,9 +263,9 @@ defmodule Group do
   - `true` if connected
   - `false` if not connected
   """
-  def connected?(supervisor_name, cluster_name)
-      when is_atom(supervisor_name) and is_atom(cluster_name) do
-    scope = cluster_scope(supervisor_name, cluster_name)
+  def connected?(name, cluster_name)
+      when is_atom(name) and is_atom(cluster_name) do
+    scope = cluster_scope(name, cluster_name)
     scope in :syn.node_scopes()
   end
 
@@ -249,17 +274,17 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `cluster_name` - The cluster name (optional, defaults to nil for default cluster)
 
   ## Returns
 
   - List of node atoms
   """
-  def nodes(supervisor_name, cluster_name \\ nil)
+  def nodes(name, cluster_name \\ nil)
 
-  def nodes(supervisor_name, nil) when is_atom(supervisor_name) do
-    scope = DurableServer.Supervisor.syn_scope(supervisor_name)
+  def nodes(name, nil) when is_atom(name) do
+    scope = scope(name)
 
     try do
       :syn.subcluster_nodes(:pg, scope)
@@ -271,9 +296,9 @@ defmodule Group do
     end
   end
 
-  def nodes(supervisor_name, cluster_name)
-      when is_atom(supervisor_name) and is_atom(cluster_name) do
-    scope = cluster_scope(supervisor_name, cluster_name)
+  def nodes(name, cluster_name)
+      when is_atom(name) and is_atom(cluster_name) do
+    scope = cluster_scope(name, cluster_name)
 
     try do
       :syn.subcluster_nodes(:pg, scope)
@@ -299,7 +324,7 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `key` - The unique key to register under
   - `meta` - Metadata map to associate with the registration
   - `opts` - Keyword list of options
@@ -313,12 +338,12 @@ defmodule Group do
   - `:ok` on success
   - `{:error, :taken}` if another process is already registered with this key
   """
-  def register(supervisor_name, key, meta, opts \\ [])
+  def register(name, key, meta, opts \\ [])
 
-  def register(supervisor_name, key, meta, opts)
-      when is_atom(supervisor_name) and is_binary(key) and is_map(meta) and is_list(opts) do
+  def register(name, key, meta, opts)
+      when is_atom(name) and is_binary(key) and is_map(meta) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
 
     case :syn.register(scope, key, self(), meta) do
       :ok -> :ok
@@ -335,7 +360,7 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `key` - The key to unregister
   - `opts` - Keyword list of options
 
@@ -348,12 +373,12 @@ defmodule Group do
   - `:ok` on success
   - `{:error, reason}` on failure
   """
-  def unregister(supervisor_name, key, opts \\ [])
+  def unregister(name, key, opts \\ [])
 
-  def unregister(supervisor_name, key, opts)
-      when is_atom(supervisor_name) and is_binary(key) and is_list(opts) do
+  def unregister(name, key, opts)
+      when is_atom(name) and is_binary(key) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
 
     case :syn.unregister(scope, key) do
       :ok -> :ok
@@ -369,29 +394,31 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `key` - The key to look up
   - `opts` - Keyword list of options
 
   ## Options
 
   - `:cluster` - Look up in a named cluster instead of the default cluster
+  - `:extract_meta` - Override the configured extract_meta callback for this call
 
   ## Returns
 
   - `{pid, meta}` if a process is registered at the key
   - `nil` if no process is registered
   """
-  def lookup(supervisor_name, key, opts \\ [])
+  def lookup(name, key, opts \\ [])
 
-  def lookup(supervisor_name, key, opts)
-      when is_atom(supervisor_name) and is_binary(key) and is_list(opts) do
+  def lookup(name, key, opts)
+      when is_atom(name) and is_binary(key) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
+    extract_meta_fn = resolve_extract_meta(name, opts)
 
     try do
       case :syn.lookup(scope, key) do
-        {pid, meta} when is_pid(pid) -> {pid, meta}
+        {pid, meta} when is_pid(pid) -> {pid, extract_meta_fn.(meta)}
         :undefined -> nil
       end
     catch
@@ -425,13 +452,13 @@ defmodule Group do
   - `:ok` on success
   - `{:error, reason}` on failure
   """
-  def monitor(supervisor_name, pattern_string, opts \\ [])
-      when is_atom(supervisor_name) and (is_binary(pattern_string) or pattern_string == :all) do
+  def monitor(name, pattern_string, opts \\ [])
+      when is_atom(name) and (is_binary(pattern_string) or pattern_string == :all) do
     cluster = Keyword.get(opts, :cluster)
     pattern = parse_pattern(pattern_string)
-    key = {supervisor_name, cluster, pattern}
+    key = {name, cluster, pattern}
 
-    case Registry.register(@registry, key, nil) do
+    case Registry.register(registry_name(name), key, nil) do
       {:ok, _} -> :ok
       {:error, {:already_registered, _}} -> :ok
       {:error, reason} -> {:error, reason}
@@ -449,11 +476,11 @@ defmodule Group do
 
   - `:ok` always (demonitoring a non-existent monitor is a no-op)
   """
-  def demonitor(supervisor_name, pattern_string, opts \\ []) when is_atom(supervisor_name) do
+  def demonitor(name, pattern_string, opts \\ []) when is_atom(name) do
     cluster = Keyword.get(opts, :cluster)
     pattern = parse_pattern(pattern_string)
-    key = {supervisor_name, cluster, pattern}
-    Registry.unregister(@registry, key)
+    key = {name, cluster, pattern}
+    Registry.unregister(registry_name(name), key)
     :ok
   end
 
@@ -468,9 +495,6 @@ defmodule Group do
   - Be discoverable via `members/2`
   - Be automatically removed when it dies
 
-  **String groups** (e.g., `"room/123"`) trigger `:joined`/`:left` events to monitors.
-  **Atom groups** (e.g., `:my_module`) do not trigger events - use for internal tracking.
-
   Re-joining an already-joined group updates the metadata in place.
 
   Note: Joining does NOT automatically monitor events.
@@ -478,8 +502,8 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
-  - `group` - The group to join (string or atom)
+  - `name` - The Group name
+  - `group` - The group to join (string)
   - `meta` - Metadata map (default: `%{}`)
   - `opts` - Keyword list of options
 
@@ -492,13 +516,13 @@ defmodule Group do
   - `:ok` on success
   - `{:error, reason}` on failure
   """
-  def join(supervisor_name, group, meta \\ %{}, opts \\ [])
+  def join(name, group, meta \\ %{}, opts \\ [])
 
-  def join(supervisor_name, group, meta, opts)
-      when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_map(meta) and
+  def join(name, group, meta, opts)
+      when is_atom(name) and is_binary(group) and is_map(meta) and
              is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
 
     case :syn.join(scope, group, self(), meta) do
       :ok -> :ok
@@ -511,8 +535,8 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
-  - `group` - The group to leave (string or atom)
+  - `name` - The Group name
+  - `group` - The group to leave (string)
   - `opts` - Keyword list of options
 
   ## Options
@@ -524,12 +548,12 @@ defmodule Group do
   - `:ok` on success
   - `{:error, :not_in_group}` if not a member
   """
-  def leave(supervisor_name, group, opts \\ [])
+  def leave(name, group, opts \\ [])
 
-  def leave(supervisor_name, group, opts)
-      when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_list(opts) do
+  def leave(name, group, opts)
+      when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
     pid = self()
 
     case :syn.leave(scope, group, pid) do
@@ -545,38 +569,36 @@ defmodule Group do
   @doc """
   List all members of a group.
 
-  For **string groups**: Returns both registered processes (via `register/5`) and
-  joined processes (via `join/5`) - this is typical for application keys
-  like `"room/123"`.
-
-  For **atom groups**: Returns only joined processes - atom groups are used for
-  internal tracking (e.g., all processes of a module).
+  Returns both registered processes (via `register/5`) and
+  joined processes (via `join/5`).
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
-  - `group` - The group to query (string or atom)
+  - `name` - The Group name
+  - `group` - The group to query (string)
   - `opts` - Keyword list of options
 
   ## Options
 
   - `:cluster` - Query a named cluster instead of the default cluster
+  - `:extract_meta` - Override the configured extract_meta callback for this call
 
   ## Returns
 
   - List of `{pid, meta}` tuples
   """
-  def members(supervisor_name, group, opts \\ [])
+  def members(name, group, opts \\ [])
 
-  def members(supervisor_name, group, opts)
-      when is_atom(supervisor_name) and is_binary(group) and is_list(opts) do
+  def members(name, group, opts)
+      when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
+    extract_meta_fn = resolve_extract_meta(name, opts)
 
     # DurableServer from registry (one or none)
     registry_result =
       case :syn.lookup(scope, group) do
-        {pid, meta} -> [{pid, extract_user_meta(meta)}]
+        {pid, meta} -> [{pid, extract_meta_fn.(meta)}]
         :undefined -> []
       end
 
@@ -592,19 +614,6 @@ defmodule Group do
     registry_result ++ group_members
   end
 
-  def members(supervisor_name, group, opts)
-      when is_atom(supervisor_name) and is_atom(group) and is_list(opts) do
-    cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
-
-    # Atom groups are only process groups, no registry lookup
-    try do
-      :syn.members(scope, group)
-    rescue
-      ArgumentError -> []
-    end
-  end
-
   @doc """
   Count processes registered in the local node's registry.
 
@@ -612,7 +621,7 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
+  - `name` - The Group name
   - `opts` - Keyword list of options
 
   ## Options
@@ -623,12 +632,12 @@ defmodule Group do
 
   - Integer count
   """
-  def local_registry_count(supervisor_name, opts \\ [])
+  def local_registry_count(name, opts \\ [])
 
-  def local_registry_count(supervisor_name, opts)
-      when is_atom(supervisor_name) and is_list(opts) do
+  def local_registry_count(name, opts)
+      when is_atom(name) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
     :syn.local_registry_count(scope)
   end
 
@@ -637,8 +646,8 @@ defmodule Group do
 
   ## Parameters
 
-  - `supervisor_name` - The DurableServer.Supervisor name
-  - `group` - The group to count (string or atom)
+  - `name` - The Group name
+  - `group` - The group to count (string)
   - `opts` - Keyword list of options
 
   ## Options
@@ -649,12 +658,12 @@ defmodule Group do
 
   - Integer count
   """
-  def local_member_count(supervisor_name, group, opts \\ [])
+  def local_member_count(name, group, opts \\ [])
 
-  def local_member_count(supervisor_name, group, opts)
-      when is_atom(supervisor_name) and (is_binary(group) or is_atom(group)) and is_list(opts) do
+  def local_member_count(name, group, opts)
+      when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(supervisor_name, cluster)
+    scope = resolve_scope(name, cluster)
 
     try do
       :syn.local_member_count(scope, group)
@@ -705,11 +714,11 @@ defmodule Group do
 
   - `:ok` always
   """
-  def dispatch(supervisor_name, key, message, opts \\ [])
+  def dispatch(name, key, message, opts \\ [])
 
-  def dispatch(supervisor_name, key, message, opts)
-      when is_atom(supervisor_name) and is_binary(key) and is_list(opts) do
-    for {pid, _meta} <- members(supervisor_name, key, opts) do
+  def dispatch(name, key, message, opts)
+      when is_atom(name) and is_binary(key) and is_list(opts) do
+    for {pid, _meta} <- members(name, key, opts) do
       send(pid, message)
     end
 
@@ -717,22 +726,39 @@ defmodule Group do
   end
 
   # ===========================================================================
+  # Public Helpers
+  # ===========================================================================
+
+  @doc false
+  def scope(name) when is_atom(name), do: :"group_#{name}"
+
+  @doc false
+  def get_config(name) when is_atom(name) do
+    :persistent_term.get({__MODULE__, name}, nil)
+  end
+
+  # ===========================================================================
   # Internal
   # ===========================================================================
 
   @doc false
-  def __dispatch__(supervisor_name, event_type, key, pid, meta, extra \\ %{}) do
+  def __dispatch__(name, event_type, key, pid, meta, extra \\ %{}) do
     cluster = Map.get(extra, :cluster)
-    subscribers = get_subscribers_for_key(supervisor_name, cluster, key)
+    extract_meta_fn = resolve_extract_meta(name, [])
+    subscribers = get_subscribers_for_key(name, cluster, key)
 
     event = %Group.Event{
       type: event_type,
-      supervisor: supervisor_name,
+      supervisor: name,
       cluster: cluster,
       key: key,
       pid: pid,
-      meta: extract_user_meta(meta),
-      previous_meta: Map.get(extra, :previous_meta),
+      meta: extract_meta_fn.(meta),
+      previous_meta:
+        case Map.get(extra, :previous_meta) do
+          nil -> nil
+          prev -> extract_meta_fn.(prev)
+        end,
       reason: Map.get(extra, :reason)
     }
 
@@ -745,19 +771,16 @@ defmodule Group do
 
   # Compute the syn scope for a named cluster.
   # Uses __cluster__ (double underscore) as delimiter to avoid ambiguity with
-  # supervisor names that might contain underscores.
-  defp cluster_scope(supervisor_name, cluster_name) do
-    :"durable_#{supervisor_name}__cluster__#{cluster_name}"
+  # names that might contain underscores.
+  defp cluster_scope(name, cluster_name) do
+    :"group_#{name}__cluster__#{cluster_name}"
   end
 
-  # Resolve the syn scope: default cluster uses Supervisor.syn_scope, named clusters use cluster_scope
-  defp resolve_scope(supervisor_name, nil) do
-    DurableServer.Supervisor.syn_scope(supervisor_name)
-  end
+  # Resolve the syn scope: default cluster uses scope(name), named clusters use cluster_scope
+  defp resolve_scope(name, nil), do: scope(name)
+  defp resolve_scope(name, cluster_name), do: cluster_scope(name, cluster_name)
 
-  defp resolve_scope(supervisor_name, cluster_name) do
-    cluster_scope(supervisor_name, cluster_name)
-  end
+  defp registry_name(name) when is_atom(name), do: :"#{name}_group_registry"
 
   # Parse a pattern into an internal pattern representation
   # - :all matches all keys
@@ -779,14 +802,14 @@ defmodule Group do
   defp matches_pattern?({:prefix, prefix}, key), do: String.starts_with?(key, prefix)
 
   # Get all local subscriber pids whose patterns match the given key and cluster
-  defp get_subscribers_for_key(supervisor_name, cluster, key) do
+  defp get_subscribers_for_key(name, cluster, key) do
     # Get all registrations and filter by pattern match
-    # Registry keys are {supervisor_name, cluster, pattern}
-    @registry
+    # Registry keys are {name, cluster, pattern}
+    registry_name(name)
     |> Registry.select([
       {
         {{:"$1", :"$2", :"$3"}, :"$4", :_},
-        [{:andalso, {:==, :"$1", supervisor_name}, {:==, :"$2", cluster}}],
+        [{:andalso, {:==, :"$1", name}, {:==, :"$2", cluster}}],
         [{{:"$3", :"$4"}}]
       }
     ])
@@ -795,11 +818,24 @@ defmodule Group do
     |> Enum.uniq()
   rescue
     # Registry doesn't exist yet during startup
-    # (syn callbacks can fire before DurableServer.Application starts the registry)
+    # (syn callbacks can fire before the registry is started)
     ArgumentError -> []
   end
 
-  # Extract user_meta from DurableServer meta, or return the meta as-is for joined pids
-  defp extract_user_meta(%{user_meta: user_meta}), do: user_meta
-  defp extract_user_meta(meta) when is_map(meta), do: meta
+  # Resolve the extract_meta function: per-call override > persistent_term config > identity
+  defp resolve_extract_meta(name, opts) do
+    case Keyword.get(opts, :extract_meta) do
+      nil ->
+        case :persistent_term.get({__MODULE__, name}, nil) do
+          %{extract_meta: {mod, func, args}} -> fn meta -> apply(mod, func, [meta | args]) end
+          _ -> & &1
+        end
+
+      {mod, func, args} ->
+        fn meta -> apply(mod, func, [meta | args]) end
+
+      func when is_function(func, 1) ->
+        func
+    end
+  end
 end
