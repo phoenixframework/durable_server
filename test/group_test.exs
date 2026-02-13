@@ -419,4 +419,43 @@ defmodule GroupTest do
       refute pid1 == pid2
     end
   end
+
+  describe "GroupConflictResolver" do
+    test "syn event handler dispatches to our configured resolver", %{supervisor_name: sup} do
+      key = "conflict/test/#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
+
+      # Get the raw internal metadata (bypassing extract_meta)
+      {^pid, meta} = Group.lookup(sup, key, extract_meta: & &1)
+      assert is_binary(meta.etag)
+
+      # Spawn a fake "conflicting" process
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      ref_real = Process.monitor(pid)
+      ref_fake = Process.monitor(fake_pid)
+
+      time = System.system_time()
+
+      # Call through syn's event handler with the real scope — this is what syn
+      # would call during partition healing. It should dispatch to our configured
+      # DurableServer.GroupConflictResolver (not syn's default resolver).
+      scope = Group.scope(sup)
+
+      winner =
+        Group.SynEventHandler.resolve_registry_conflict(
+          scope,
+          key,
+          {pid, meta, time},
+          {fake_pid, %{meta | etag: "stale_etag"}, time + 1}
+        )
+
+      # Our resolver picks the pid with the matching storage etag
+      assert winner == pid
+
+      # Our resolver kills both for clean restart (syn's default only kills the loser)
+      assert_receive {:DOWN, ^ref_real, :process, ^pid, _}, 1000
+      assert_receive {:DOWN, ^ref_fake, :process, ^fake_pid, _}, 1000
+    end
+  end
 end
