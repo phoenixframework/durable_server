@@ -7,8 +7,7 @@ defmodule Group.TestCluster do
     code_paths = :code.get_path()
 
     args =
-      [~c"-setcookie", ~c"#{cookie}",
-       ~c"-kernel", ~c"prevent_overlapping_partitions", ~c"false"] ++
+      [~c"-setcookie", ~c"#{cookie}", ~c"-kernel", ~c"prevent_overlapping_partitions", ~c"false"] ++
         Enum.flat_map(code_paths, fn p -> [~c"-pa", p] end)
 
     for _i <- 1..count do
@@ -107,10 +106,12 @@ defmodule Group.TestCluster do
   @doc "Spawn a process that registers and then exits after optional delay"
   def spawn_register_then_kill(node, name, key, meta, delay \\ 0) do
     :erpc.call(node, fn ->
-      pid = spawn(fn ->
-        :ok = Group.register(name, key, meta)
-        if delay > 0, do: Process.sleep(delay)
-      end)
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, key, meta)
+          if delay > 0, do: Process.sleep(delay)
+        end)
+
       pid
     end)
   end

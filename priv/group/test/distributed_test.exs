@@ -95,13 +95,19 @@ defmodule Group.DistributedTest do
 
       # Register and join on A
       TestCluster.spawn_register_and_join(
-        node_a, name, "user/1", %{type: :reg}, "room/1", %{type: :pg}
+        node_a,
+        name,
+        "user/1",
+        %{type: :reg},
+        "room/1",
+        %{type: :pg}
       )
 
       Process.sleep(200)
 
       # Start a 3rd node
       [{late_pid, node_c}] = TestCluster.start_peers(1)
+
       on_exit(fn ->
         TestCluster.stop_peers(peers)
         TestCluster.stop_peers([{late_pid, node_c}])
@@ -130,7 +136,12 @@ defmodule Group.DistributedTest do
 
       # Register and join on node B
       TestCluster.spawn_register_and_join(
-        node_b, name, "user/1", %{node: :b}, "room/1", %{node: :b}
+        node_b,
+        name,
+        "user/1",
+        %{node: :b},
+        "room/1",
+        %{node: :b}
       )
 
       Process.sleep(200)
@@ -144,11 +155,14 @@ defmodule Group.DistributedTest do
       :peer.stop(peer_b_pid)
 
       # Node A should clean up B's entries
-      TestCluster.assert_eventually(fn ->
-        lookup = TestCluster.rpc!(node_a, Group, :lookup, [name, "user/1"])
-        members = TestCluster.rpc!(node_a, Group, :members, [name, "room/1"])
-        lookup == nil and members == []
-      end, timeout: 5000)
+      TestCluster.assert_eventually(
+        fn ->
+          lookup = TestCluster.rpc!(node_a, Group, :lookup, [name, "user/1"])
+          members = TestCluster.rpc!(node_a, Group, :members, [name, "room/1"])
+          lookup == nil and members == []
+        end,
+        timeout: 5000
+      )
 
       # Clean up remaining peer
       [{peer_a_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_a end)
@@ -210,8 +224,12 @@ defmodule Group.DistributedTest do
 
       # A should see both (connected to both clusters)
       TestCluster.assert_eventually(fn ->
-        game_members = TestCluster.rpc!(node_a, Group, :members, [name, "room/1", [cluster: "game"]])
-        chat_members = TestCluster.rpc!(node_a, Group, :members, [name, "room/1", [cluster: "chat"]])
+        game_members =
+          TestCluster.rpc!(node_a, Group, :members, [name, "room/1", [cluster: "game"]])
+
+        chat_members =
+          TestCluster.rpc!(node_a, Group, :members, [name, "room/1", [cluster: "chat"]])
+
         length(game_members) == 1 and length(chat_members) == 1
       end)
 
@@ -241,8 +259,7 @@ defmodule Group.DistributedTest do
       opts = [
         name: name,
         shards: 2,
-        resolve_registry_conflict:
-          {Group.TestConflictResolver, :resolve, []}
+        resolve_registry_conflict: {Group.TestConflictResolver, :resolve, []}
       ]
 
       start_group_on_peers(peers, opts)
@@ -533,9 +550,15 @@ defmodule Group.DistributedTest do
       assert shard_reg != shard_join
 
       # Spawn one process that registers under reg_key and joins join_key
-      pid = TestCluster.spawn_register_and_join_keys(
-        node_a, name, reg_key, %{type: :reg}, join_key, %{type: :pg}
-      )
+      pid =
+        TestCluster.spawn_register_and_join_keys(
+          node_a,
+          name,
+          reg_key,
+          %{type: :reg},
+          join_key,
+          %{type: :pg}
+        )
 
       # Verify both entries visible on B
       TestCluster.assert_eventually(fn ->
@@ -578,7 +601,11 @@ defmodule Group.DistributedTest do
 
       # On A: register with meta v:1, re-register with meta v:2, then unregister
       TestCluster.spawn_register_update_unregister(
-        node_a, name, "user/ordered", %{v: 1}, %{v: 2}
+        node_a,
+        name,
+        "user/ordered",
+        %{v: 1},
+        %{v: 2}
       )
 
       # Assert B receives events in order
@@ -595,8 +622,7 @@ defmodule Group.DistributedTest do
                       }},
                      5000
 
-      assert_receive {:got_event,
-                      %Group.Event{type: :unregistered, key: "user/ordered"}},
+      assert_receive {:got_event, %Group.Event{type: :unregistered, key: "user/ordered"}},
                      5000
     end
   end
@@ -679,7 +705,10 @@ defmodule Group.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           members = TestCluster.rpc!(node_a, Group, :members, [name, "room/1", [cluster: "game"]])
-          lookup = TestCluster.rpc!(node_a, Group, :lookup, [name, "game_user/1", [cluster: "game"]])
+
+          lookup =
+            TestCluster.rpc!(node_a, Group, :lookup, [name, "game_user/1", [cluster: "game"]])
+
           length(members) == 1 and lookup != nil
         end,
         timeout: 5000
@@ -692,7 +721,10 @@ defmodule Group.DistributedTest do
       TestCluster.assert_eventually(
         fn ->
           members = TestCluster.rpc!(node_c, Group, :members, [name, "room/1", [cluster: "game"]])
-          lookup = TestCluster.rpc!(node_c, Group, :lookup, [name, "game_user/1", [cluster: "game"]])
+
+          lookup =
+            TestCluster.rpc!(node_c, Group, :lookup, [name, "game_user/1", [cluster: "game"]])
+
           length(members) == 1 and lookup != nil
         end,
         timeout: 10_000

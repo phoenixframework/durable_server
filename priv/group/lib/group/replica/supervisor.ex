@@ -17,7 +17,8 @@ defmodule Group.Replica.Supervisor do
       for i <- 0..(num_shards - 1) do
         %{
           id: {Group.Replica, i},
-          start: {Group.Replica, :start_link, [[name: name, shard_index: i, num_shards: num_shards]]}
+          start:
+            {Group.Replica, :start_link, [[name: name, shard_index: i, num_shards: num_shards]]}
         }
       end
 

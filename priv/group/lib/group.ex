@@ -160,54 +160,16 @@ defmodule Group do
   alias Group.Replica
   alias Group.Replica.Data
 
-  @default_shards System.schedulers_online()
-
   # ===========================================================================
   # Startup
   # ===========================================================================
 
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
-    %{id: {__MODULE__, name}, start: {__MODULE__, :start_link, [opts]}, type: :supervisor}
+    %{id: {__MODULE__, name}, start: {Group.Supervisor, :start_link, [opts]}, type: :supervisor}
   end
 
-  def start_link(opts) do
-    name = Keyword.fetch!(opts, :name)
-    callbacks = Keyword.get(opts, :callbacks, %{})
-    extract_meta = Keyword.get(opts, :extract_meta)
-    resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)
-    num_shards = Keyword.get(opts, :shards, @default_shards)
-
-    # Store config in persistent_term for fast access
-    config = %{callbacks: callbacks, num_shards: num_shards}
-    config = if extract_meta, do: Map.put(config, :extract_meta, extract_meta), else: config
-
-    config =
-      if resolve_registry_conflict,
-        do: Map.put(config, :resolve_registry_conflict, resolve_registry_conflict),
-        else: config
-
-    :persistent_term.put({__MODULE__, name}, config)
-
-    # Initialize default cluster with all known nodes
-    # (will be populated after Data starts)
-
-    children = [
-      {Data, name: name, num_shards: num_shards},
-      {Replica.Supervisor, name: name, num_shards: num_shards},
-      {Registry, keys: :duplicate, name: registry_name(name)}
-    ]
-
-    case Supervisor.start_link(children, strategy: :rest_for_one, name: :"#{name}_group_sup") do
-      {:ok, pid} ->
-        # Initialize default cluster membership (nil cluster = all nodes)
-        Data.put_cluster_nodes(name, nil, MapSet.new(Node.list()))
-        {:ok, pid}
-
-      error ->
-        error
-    end
-  end
+  def start_link(opts), do: Group.Supervisor.start_link(opts)
 
   # ===========================================================================
   # Cluster Management (Node <-> Cluster)
@@ -231,8 +193,7 @@ defmodule Group do
   def connect(name, cluster_name)
       when is_atom(name) and is_binary(cluster_name) do
     # Update shared cluster_nodes table synchronously
-    current = Data.cluster_nodes(name, cluster_name)
-    Data.put_cluster_nodes(name, cluster_name, MapSet.put(current, node()))
+    Data.add_cluster_node(name, cluster_name, node())
 
     # Broadcast to all shards to inform remote nodes
     num_shards = get_config(name).num_shards
@@ -258,15 +219,7 @@ defmodule Group do
   """
   def disconnect(name, cluster_name)
       when is_atom(name) and is_binary(cluster_name) do
-    # Update shared cluster_nodes table
-    current = Data.cluster_nodes(name, cluster_name)
-    new_nodes = MapSet.delete(current, node())
-
-    if MapSet.size(new_nodes) == 0 do
-      Data.delete_cluster_nodes(name, cluster_name)
-    else
-      Data.put_cluster_nodes(name, cluster_name, new_nodes)
-    end
+    Data.remove_cluster_node(name, cluster_name, node())
 
     # Broadcast disconnect to all shards
     num_shards = get_config(name).num_shards
@@ -293,36 +246,42 @@ defmodule Group do
   """
   def connected?(name, cluster_name)
       when is_atom(name) and is_binary(cluster_name) do
-    nodes = Data.cluster_nodes(name, cluster_name)
-    MapSet.member?(nodes, node())
+    node() in Data.cluster_nodes(name, cluster_name)
   end
 
   @doc """
-  List all nodes in a cluster.
+  List all nodes in the default cluster.
+
+  Returns the currently connected Erlang nodes (equivalent to `Node.list()`).
 
   ## Parameters
 
-  - `name` - The Group name
-  - `cluster_name` - The cluster name (optional, defaults to nil for default cluster)
+  - `name` - The Group name (unused, but kept for API consistency)
 
   ## Returns
 
   - List of node atoms
   """
-  def nodes(name, cluster_name \\ nil)
-
-  def nodes(name, nil) when is_atom(name) do
-    try do
-      Data.cluster_nodes(name, nil) |> MapSet.to_list()
-    rescue
-      ArgumentError -> []
-    end
+  def nodes(name) when is_atom(name) do
+    Node.list()
   end
 
+  @doc """
+  List all nodes in a named cluster.
+
+  ## Parameters
+
+  - `name` - The Group name
+  - `cluster_name` - The cluster name (binary string)
+
+  ## Returns
+
+  - List of node atoms
+  """
   def nodes(name, cluster_name)
       when is_atom(name) and is_binary(cluster_name) do
     try do
-      Data.cluster_nodes(name, cluster_name) |> MapSet.to_list()
+      Data.cluster_nodes(name, cluster_name)
     rescue
       ArgumentError -> []
     end
@@ -435,7 +394,7 @@ defmodule Group do
         shard = Replica.shard_index_for(cluster, key, num_shards)
 
         case Data.registry_lookup(name, shard, cluster, key) do
-          {pid, meta, _time, _mref, _node} ->
+          {pid, meta, _time, _node} ->
             {pid, extract_meta_fn.(meta)}
 
           nil ->
@@ -612,7 +571,7 @@ defmodule Group do
     # DurableServer from registry (one or none)
     registry_result =
       case Data.registry_lookup(name, shard, cluster, group) do
-        {pid, meta, _time, _mref, _node} -> [{pid, extract_meta_fn.(meta)}]
+        {pid, meta, _time, _node} -> [{pid, extract_meta_fn.(meta)}]
         nil -> []
       end
 
@@ -771,7 +730,8 @@ defmodule Group do
     :ok
   end
 
-  defp registry_name(name) when is_atom(name), do: :"#{name}_group_registry"
+  @doc false
+  def registry_name(name) when is_atom(name), do: :"#{name}_group_registry"
 
   # Parse a pattern into an internal pattern representation
   # - :all matches all keys
