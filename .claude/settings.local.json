@@ -5,7 +5,10 @@
       "Bash(mix test:*)",
       "Bash(notify \"Testing notification system\" --continue)",
       "Bash(mix compile:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(echo:*)",
+      "Bash(mix run:*)",
+      "Bash(elixir:*)"
     ]
   }
 }

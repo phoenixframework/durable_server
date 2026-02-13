@@ -16,7 +16,8 @@ defmodule Group do
   - Writes (register, join, etc.) return immediately after local update
   - Other nodes receive updates asynchronously via Erlang distribution
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved
+  - When partitions heal, conflicts are resolved. The losing process is killed
+    with `{:group_registry_conflict, key, meta}`
 
   ## Clusters
 
