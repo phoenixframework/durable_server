@@ -211,9 +211,9 @@ defmodule DurableServer.Supervisor do
       iex> {pid, _meta} = DurableServer.Supervisor.lookup(MyDurableUp, "counter123")
   """
   def lookup(sup_name, key) when is_atom(sup_name) and is_binary(key) do
-    case Group.lookup(sup_name, key) do
+    case Group.lookup(sup_name, key, extract_meta: & &1) do
       {pid, meta} when is_pid(pid) ->
-        # handle case where node-local DOWN from a caller races syn cleanup
+        # handle case where node-local DOWN from a caller races group cleanup
         if node(pid) == Node.self() && !Process.alive?(pid) do
           nil
         else
@@ -477,7 +477,7 @@ defmodule DurableServer.Supervisor do
           max_children
           |> Enum.reject(fn {k, _v} -> k == :total end)
           |> Enum.reduce(capacity_map, fn {module, limit}, acc ->
-            current = Group.local_member_count(supervisor_name, module)
+            current = Group.local_member_count(supervisor_name, inspect(module))
             Map.put(acc, module, %{current: current, limit: limit})
           end)
 
@@ -622,7 +622,7 @@ defmodule DurableServer.Supervisor do
                 "start_child expects a map with :key field, got: #{inspect(init_arg)}"
       end
 
-    # Check syn first to avoid spawning a process that will just fail at registration
+    # Check group first to avoid spawning a process that will just fail at registration
     case lookup(supervisor, key) do
       {pid, meta} when node(pid) == node() ->
         # Local pid - verify it's actually alive before returning already_started
@@ -678,7 +678,7 @@ defmodule DurableServer.Supervisor do
             # wait up to 100ms * max retries (2.5s) for metadata to be synced before giving up on retries
             if retries > 0, do: Process.sleep(250)
             # we raced a start, retry start child to grab raced pid's metadata
-            # node-local syn meta will be immediately there, but remote node meta could still be in flight (or pid is already DOWN)
+            # node-local group meta will be immediately there, but remote node meta could still be in flight (or pid is already DOWN)
             # if we find there is nothing in the registry, we RPC out to get remote node's meta.
             # if we find nothing there, we retry the start + lookup combo which will either get
             # the already started pid and its now synced metadata, or we end up starting ourselves up to @max_start_child_tries tries
@@ -690,8 +690,8 @@ defmodule DurableServer.Supervisor do
               nil ->
                 remote_node = node(pid)
 
-                # If we raced syn registration, immediately try to rpc out to the owning node for its node-local
-                # syn metadata - as long as the node appears healthy.
+                # If we raced group registration, immediately try to rpc out to the owning node for its node-local
+                # group metadata - as long as the node appears healthy.
                 #
                 # If the node does not appear healthy, we retry the start
                 case LifecycleManager.lookup_node_health(%{
@@ -1450,7 +1450,7 @@ defmodule DurableServer.Supervisor do
   """
   def global_members(sup_name) when is_atom(sup_name) do
     sup_name
-    |> Group.members(sup_name)
+    |> Group.members(Atom.to_string(sup_name), extract_meta: & &1)
     |> Enum.reduce(%{}, fn {pid, meta}, acc ->
       if node(pid) == Node.self() && !Process.alive?(pid) do
         acc
@@ -1462,7 +1462,7 @@ defmodule DurableServer.Supervisor do
 
   def global_members(sup_name, module) when is_atom(sup_name) and is_atom(module) do
     sup_name
-    |> Group.members(module)
+    |> Group.members(inspect(module), extract_meta: & &1)
     |> Enum.reduce(%{}, fn {pid, meta}, acc ->
       if node(pid) == Node.self() && !Process.alive?(pid) do
         acc
@@ -1481,14 +1481,14 @@ defmodule DurableServer.Supervisor do
       :ok ->
         # Join internal tracking groups (by supervisor name and module)
         # Re-join updates metadata in place
-        Group.join(sup_name, sup_name, meta)
+        Group.join(sup_name, Atom.to_string(sup_name), meta)
 
         # Also join module-specific group for per-module counting
         if module = meta[:module] do
           [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
 
           if is_map(limits[:max_children]) and Map.has_key?(limits[:max_children], module) do
-            Group.join(sup_name, module, meta)
+            Group.join(sup_name, inspect(module), meta)
           end
         end
 
@@ -1600,9 +1600,6 @@ defmodule DurableServer.Supervisor do
     node_ref = System.system_time(:microsecond)
     :ets.insert(table_name, {:node_ref, node_ref})
 
-    syn_sup_scope = syn_scope(name)
-    :syn.add_node_to_scopes([syn_sup_scope])
-
     # create CircuitBreaker struct and initialize ETS table
     circuit_breaker =
       CircuitBreaker.new(name, %{
@@ -1624,7 +1621,6 @@ defmodule DurableServer.Supervisor do
     # store configuration in ETS for child processes to access
     config = %{
       name: name,
-      syn_scope: syn_sup_scope,
       prefix: prefix,
       object_store: object_store,
       discovery_interval_ms: Keyword.get(opts, :discovery_interval_ms, 60_000),
@@ -1656,6 +1652,10 @@ defmodule DurableServer.Supervisor do
     shutdown_timeout = config.supervisor_shutdown_timeout_ms
 
     children = [
+      {Group,
+       name: name,
+       extract_meta: {DurableServer, :extract_user_meta, []},
+       resolve_registry_conflict: {DurableServer.GroupConflictResolver, :resolve, []}},
       {Task.Supervisor, name: task_sup_name},
       {DynamicSupervisor,
        name: dynamic_sup_name,
@@ -1678,9 +1678,6 @@ defmodule DurableServer.Supervisor do
 
     Supervisor.init(children, strategy: :one_for_all)
   end
-
-  @doc false
-  def syn_scope(sup_name) when is_atom(sup_name), do: :"durable_#{sup_name}"
 
   @doc false
   def __get_config__(supervisor_name) do

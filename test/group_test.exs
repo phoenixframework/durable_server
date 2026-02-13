@@ -27,6 +27,10 @@ defmodule GroupTest do
       new_state = %{state | count: count + 1}
       {:reply, count + 1, new_state, :sync}
     end
+
+    def handle_call({:update_meta, new_meta}, _from, state) do
+      {:reply, :ok, state, meta: new_meta}
+    end
   end
 
   setup do
@@ -52,14 +56,14 @@ defmodule GroupTest do
       # Start a DurableServer
       {:ok, {pid, _meta}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
-      # Should receive :registered event
+      # Should receive :registered event with extracted user meta
       assert_receive %Group.Event{type: :registered} = event, 1000
       assert event.supervisor == sup
       assert event.key == key
       assert event.pid == pid
       assert event.cluster == nil
       assert event.previous_meta == nil
-      assert is_map(event.meta)
+      assert event.meta == %{module: TestServer}
     end
 
     test "subscribes to prefix pattern and receives events for matching keys", %{
@@ -76,9 +80,22 @@ defmodule GroupTest do
       {:ok, {pid2, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key2}})
       {:ok, {_pid3, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key3}})
 
-      # Should receive events for chat/ keys
-      assert_receive %Group.Event{type: :registered, key: ^key1, pid: ^pid1}, 1000
-      assert_receive %Group.Event{type: :registered, key: ^key2, pid: ^pid2}, 1000
+      # Should receive events for chat/ keys with extracted user meta
+      assert_receive %Group.Event{
+                       type: :registered,
+                       key: ^key1,
+                       pid: ^pid1,
+                       meta: %{module: TestServer}
+                     },
+                     1000
+
+      assert_receive %Group.Event{
+                       type: :registered,
+                       key: ^key2,
+                       pid: ^pid2,
+                       meta: %{module: TestServer}
+                     },
+                     1000
 
       # Should NOT receive event for other/ keys
       refute_receive %Group.Event{type: :registered, key: ^key3}, 100
@@ -95,9 +112,16 @@ defmodule GroupTest do
       {:ok, {pid2, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key2}})
       {:ok, {pid3, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key3}})
 
-      assert_receive %Group.Event{type: :registered, key: ^key1, pid: ^pid1}, 1000
-      assert_receive %Group.Event{type: :registered, key: ^key2, pid: ^pid2}, 1000
-      assert_receive %Group.Event{type: :registered, key: ^key3, pid: ^pid3}, 1000
+      server_meta = %{module: TestServer}
+
+      assert_receive %Group.Event{type: :registered, key: ^key1, pid: ^pid1, meta: ^server_meta},
+                     1000
+
+      assert_receive %Group.Event{type: :registered, key: ^key2, pid: ^pid2, meta: ^server_meta},
+                     1000
+
+      assert_receive %Group.Event{type: :registered, key: ^key3, pid: ^pid3, meta: ^server_meta},
+                     1000
     end
 
     test "receives :unregistered event when DurableServer stops", %{supervisor_name: sup} do
@@ -106,19 +130,48 @@ defmodule GroupTest do
       :ok = Group.monitor(sup, key)
 
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
-      assert_receive %Group.Event{type: :registered}, 1000
+      assert_receive %Group.Event{type: :registered, meta: %{module: TestServer}}, 1000
 
       # Stop the server
       ref = Process.monitor(pid)
       :ok = DurableServer.Supervisor.terminate_child(sup, pid)
       assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1000
 
-      # Should receive :unregistered event
+      # Should receive :unregistered event with extracted user meta
       assert_receive %Group.Event{type: :unregistered} = event, 1000
       assert event.supervisor == sup
       assert event.key == key
       assert event.pid == pid
+      assert event.meta == %{module: TestServer}
       assert event.reason != nil
+    end
+
+    test "receives :registered event with previous_meta when DurableServer updates meta", %{
+      supervisor_name: sup
+    } do
+      key = "user/#{DurableServer.UUID.uuid4()}"
+
+      :ok = Group.monitor(sup, key)
+
+      {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
+
+      # Initial registration
+      assert_receive %Group.Event{
+                       type: :registered,
+                       pid: ^pid,
+                       meta: %{module: TestServer},
+                       previous_meta: nil
+                     },
+                     1000
+
+      # Update meta
+      :ok = GenServer.call(pid, {:update_meta, %{module: TestServer, status: :active}})
+
+      # Should receive :registered event with previous_meta showing the old extracted meta
+      assert_receive %Group.Event{type: :registered} = event, 1000
+      assert event.pid == pid
+      assert event.meta == %{module: TestServer, status: :active}
+      assert event.previous_meta == %{module: TestServer}
     end
 
     test "double subscribe is idempotent", %{supervisor_name: sup} do
@@ -129,8 +182,8 @@ defmodule GroupTest do
 
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
-      # Should only receive one event (not duplicated)
-      assert_receive %Group.Event{type: :registered, pid: ^pid}, 1000
+      # Should only receive one event (not duplicated), with extracted user meta
+      assert_receive %Group.Event{type: :registered, pid: ^pid, meta: %{module: TestServer}}, 1000
       refute_receive %Group.Event{type: :registered, pid: ^pid}, 100
     end
   end
@@ -143,7 +196,14 @@ defmodule GroupTest do
       :ok = Group.monitor(sup, "user/")
 
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key1}})
-      assert_receive %Group.Event{type: :registered, key: ^key1, pid: ^pid1}, 1000
+
+      assert_receive %Group.Event{
+                       type: :registered,
+                       key: ^key1,
+                       pid: ^pid1,
+                       meta: %{module: TestServer}
+                     },
+                     1000
 
       # Unsubscribe
       :ok = Group.demonitor(sup, "user/")
@@ -157,137 +217,6 @@ defmodule GroupTest do
 
     test "unsubscribe from non-existent subscription is ok", %{supervisor_name: sup} do
       assert :ok = Group.demonitor(sup, "nonexistent/")
-    end
-  end
-
-  describe "join/3 and leave/2" do
-    test "joined process appears in members/2", %{supervisor_name: sup} do
-      key = "chat/room/#{DurableServer.UUID.uuid4()}"
-      meta = %{role: :listener}
-
-      :ok = Group.join(sup, key, meta)
-
-      members = Group.members(sup, key)
-      assert length(members) == 1
-      my_pid = self()
-      assert {^my_pid, ^meta} = hd(members)
-    end
-
-    test "joined process triggers :joined event to subscribers", %{supervisor_name: sup} do
-      key = "chat/room/#{DurableServer.UUID.uuid4()}"
-
-      # Subscribe first
-      :ok = Group.monitor(sup, key)
-
-      # Spawn a process to join
-      test_pid = self()
-
-      spawn_pid =
-        spawn(fn ->
-          :ok = Group.join(sup, key, %{role: :worker})
-          send(test_pid, :joined)
-          # Keep alive to avoid immediate :left event
-          Process.sleep(5000)
-        end)
-
-      receive do
-        :joined -> :ok
-      after
-        1000 -> flunk("Spawned process didn't join in time")
-      end
-
-      # Should receive :joined event
-      assert_receive %Group.Event{type: :joined} = event, 1000
-      assert event.supervisor == sup
-      assert event.key == key
-      assert event.pid == spawn_pid
-      assert event.meta == %{role: :worker}
-      assert event.previous_meta == nil
-    end
-
-    test "leave/2 removes from members and triggers :left event", %{supervisor_name: sup} do
-      key = "chat/room/#{DurableServer.UUID.uuid4()}"
-
-      :ok = Group.monitor(sup, key)
-      :ok = Group.join(sup, key, %{role: :listener})
-
-      assert_receive %Group.Event{type: :joined}, 1000
-
-      assert length(Group.members(sup, key)) == 1
-
-      :ok = Group.leave(sup, key)
-
-      # Should receive :left event
-      assert_receive %Group.Event{type: :left} = event, 1000
-      assert event.key == key
-      assert event.pid == self()
-      assert event.reason != nil
-
-      assert Group.members(sup, key) == []
-    end
-
-    test "process death triggers automatic :left event", %{supervisor_name: sup} do
-      key = "chat/room/#{DurableServer.UUID.uuid4()}"
-
-      :ok = Group.monitor(sup, key)
-
-      test_pid = self()
-
-      pid =
-        spawn(fn ->
-          :ok = Group.join(sup, key, %{role: :temp})
-          send(test_pid, :ready)
-
-          receive do
-            :exit -> :ok
-          end
-        end)
-
-      receive do
-        :ready -> :ok
-      after
-        1000 -> flunk("Process didn't join in time")
-      end
-
-      assert_receive %Group.Event{type: :joined, pid: ^pid}, 1000
-      assert length(Group.members(sup, key)) == 1
-
-      # Kill the process
-      Process.exit(pid, :kill)
-
-      # Should receive :left event
-      assert_receive %Group.Event{type: :left} = event, 1000
-      assert event.pid == pid
-      assert event.key == key
-
-      # Should be removed from members
-      assert Group.members(sup, key) == []
-    end
-
-    test "leave/2 returns error when not a member", %{supervisor_name: sup} do
-      key = "nonexistent/key"
-      assert {:error, :not_in_group} = Group.leave(sup, key)
-    end
-
-    test "re-join updates metadata in place", %{supervisor_name: sup} do
-      key = "rejoin/test/#{DurableServer.UUID.uuid4()}"
-
-      :ok = Group.monitor(sup, key)
-
-      # First join succeeds
-      assert :ok = Group.join(sup, key, %{v: 1})
-      assert_receive %Group.Event{type: :joined, previous_meta: nil, meta: %{v: 1}}, 1000
-
-      # Second join also succeeds and updates metadata
-      assert :ok = Group.join(sup, key, %{v: 2})
-
-      # Should receive :joined event with previous_meta
-      assert_receive %Group.Event{type: :joined} = event, 1000
-      assert event.meta == %{v: 2}
-      assert event.previous_meta == %{v: 1}
-
-      # Metadata is updated
-      [{_pid, %{v: 2}}] = Group.members(sup, key)
     end
   end
 
@@ -306,18 +235,13 @@ defmodule GroupTest do
       members = Group.members(sup, key)
       assert length(members) == 2
 
-      pids = Enum.map(members, fn {pid, _} -> pid end)
-      assert server_pid in pids
-      assert self() in pids
+      # DurableServer member has extracted user meta
+      {^server_pid, %{module: TestServer}} =
+        Enum.find(members, fn {pid, _} -> pid == server_pid end)
 
-      # Find our joined entry
-      {^listener_meta, _} =
-        Enum.find(members, fn {pid, _meta} -> pid == self() end)
-        |> then(fn {pid, meta} -> {meta, pid} end)
-    end
-
-    test "returns empty list for non-existent key", %{supervisor_name: sup} do
-      assert Group.members(sup, "nonexistent/key") == []
+      # Joined member has raw meta
+      my_pid = self()
+      {^my_pid, ^listener_meta} = Enum.find(members, fn {pid, _} -> pid == self() end)
     end
 
     test "returns only DurableServer when no joined processes", %{supervisor_name: sup} do
@@ -326,37 +250,7 @@ defmodule GroupTest do
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
       members = Group.members(sup, key)
-      assert length(members) == 1
-      assert {^pid, _meta} = hd(members)
-    end
-
-    test "returns only joined processes when no DurableServer", %{supervisor_name: sup} do
-      key = "only/joined/#{DurableServer.UUID.uuid4()}"
-
-      :ok = Group.join(sup, key, %{role: :standalone})
-
-      members = Group.members(sup, key)
-      assert length(members) == 1
-      my_pid = self()
-      assert {^my_pid, %{role: :standalone}} = hd(members)
-    end
-  end
-
-  describe "self-events" do
-    test "joining process receives its own :joined event if subscribed", %{supervisor_name: sup} do
-      key = "self/events/#{DurableServer.UUID.uuid4()}"
-
-      # Subscribe first
-      :ok = Group.monitor(sup, key)
-
-      # Then join
-      :ok = Group.join(sup, key, %{self: true})
-
-      # Should receive our own :joined event
-      assert_receive %Group.Event{type: :joined} = event, 1000
-      assert event.pid == self()
-      assert event.meta == %{self: true}
-      assert event.previous_meta == nil
+      assert [{^pid, %{module: TestServer}}] = members
     end
   end
 
@@ -371,11 +265,16 @@ defmodule GroupTest do
       {:ok, {server_pid, _}} =
         DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
-      assert_receive %Group.Event{type: :registered, pid: ^server_pid}, 1000
+      assert_receive %Group.Event{
+                       type: :registered,
+                       pid: ^server_pid,
+                       meta: %{module: TestServer},
+                       previous_meta: nil
+                     },
+                     1000
 
-      # 3. Verify members shows DurableServer
-      members = Group.members(sup, key)
-      assert length(members) == 1
+      # 3. Verify members shows DurableServer with extracted meta
+      assert [{^server_pid, %{module: TestServer}}] = Group.members(sup, key)
 
       # 4. Join as listener
       :ok = Group.join(sup, key, %{role: :listener})
@@ -390,13 +289,17 @@ defmodule GroupTest do
       ref = Process.monitor(server_pid)
       :ok = DurableServer.Supervisor.terminate_child(sup, server_pid)
       assert_receive {:DOWN, ^ref, :process, ^server_pid, _}, 1000
-      assert_receive %Group.Event{type: :unregistered, pid: ^server_pid}, 1000
+
+      assert_receive %Group.Event{
+                       type: :unregistered,
+                       pid: ^server_pid,
+                       meta: %{module: TestServer}
+                     },
+                     1000
 
       # 7. Verify members shows only joined process
-      members = Group.members(sup, key)
-      assert length(members) == 1
       my_pid = self()
-      assert {^my_pid, _} = hd(members)
+      assert [{^my_pid, %{role: :listener}}] = Group.members(sup, key)
 
       # 8. Leave
       :ok = Group.leave(sup, key)
@@ -442,8 +345,13 @@ defmodule GroupTest do
       {:ok, {pid2, _}} =
         DurableServer.Supervisor.start_child(supervisor_name_2, {TestServer, %{key: key}})
 
-      # Should receive event from sup2
-      assert_receive %Group.Event{type: :registered, supervisor: ^supervisor_name_2, pid: ^pid2},
+      # Should receive event from sup2 with extracted user meta
+      assert_receive %Group.Event{
+                       type: :registered,
+                       supervisor: ^supervisor_name_2,
+                       pid: ^pid2,
+                       meta: %{module: TestServer}
+                     },
                      1000
 
       # Now unsubscribe from sup2 and subscribe to sup1 (from setup)
@@ -471,9 +379,16 @@ defmodule GroupTest do
       # Subscribe to sup1 only
       :ok = Group.monitor(sup1, :all)
 
-      # Start a DurableServer on sup1 - should receive event
+      # Start a DurableServer on sup1 - should receive event with extracted meta
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup1, {TestServer, %{key: key}})
-      assert_receive %Group.Event{type: :registered, supervisor: ^sup1, pid: ^pid1}, 1000
+
+      assert_receive %Group.Event{
+                       type: :registered,
+                       supervisor: ^sup1,
+                       pid: ^pid1,
+                       meta: %{module: TestServer}
+                     },
+                     1000
 
       # Start a DurableServer on sup2 - should NOT receive event
       {:ok, {pid2, _}} = DurableServer.Supervisor.start_child(sup2, {TestServer, %{key: key}})
@@ -490,253 +405,57 @@ defmodule GroupTest do
       :ok = Group.join(sup1, key, %{role: :test})
       assert_receive %Group.Event{type: :joined, supervisor: ^sup1}, 1000
 
-      # Members are isolated per supervisor
-      sup1_members = Group.members(sup1, key)
-      sup2_members = Group.members(sup2, key)
+      # Members are isolated per supervisor with correct metadata shapes
+      sup1_members = Group.members(sup1, key) |> Map.new()
+      sup2_members = Group.members(sup2, key) |> Map.new()
 
-      # Each should have 2 members: the DurableServer + our joined process
-      assert length(sup1_members) == 2
-      assert length(sup2_members) == 2
+      my_pid = self()
 
-      # But the pids are different (different DurableServers)
-      sup1_pids = Enum.map(sup1_members, fn {pid, _} -> pid end)
-      sup2_pids = Enum.map(sup2_members, fn {pid, _} -> pid end)
+      # DurableServer has extracted user meta, joined process has raw meta
+      assert sup1_members == %{pid1 => %{module: TestServer}, my_pid => %{role: :test}}
+      assert sup2_members == %{pid2 => %{module: TestServer}, my_pid => %{role: :test}}
 
-      assert pid1 in sup1_pids
-      assert pid2 in sup2_pids
-      refute pid1 in sup2_pids
-      refute pid2 in sup1_pids
+      # DurableServer pids are different across supervisors
+      refute pid1 == pid2
     end
   end
 
-  describe "named clusters" do
-    test "connect/disconnect/connected? manage cluster lifecycle", %{supervisor_name: sup} do
-      cluster = :game_servers
+  describe "GroupConflictResolver" do
+    test "conflict resolver is configured and callable", %{supervisor_name: sup} do
+      key = "conflict/test/#{DurableServer.UUID.uuid4()}"
 
-      # Initially not connected
-      refute Group.connected?(sup, cluster)
+      {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
-      # Connect
-      assert :ok = Group.connect(sup, cluster)
-      assert Group.connected?(sup, cluster)
+      # Get the raw internal metadata (bypassing extract_meta)
+      {^pid, meta} = Group.lookup(sup, key, extract_meta: & &1)
+      assert is_binary(meta.etag)
 
-      # Disconnect (note: this is a no-op in current implementation)
-      assert :ok = Group.disconnect(sup, cluster)
-    end
+      # Spawn a fake "conflicting" process
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      ref_real = Process.monitor(pid)
+      ref_fake = Process.monitor(fake_pid)
 
-    test "join/leave work with cluster: option", %{supervisor_name: sup} do
-      cluster = :game_cluster
-      key = "room/#{DurableServer.UUID.uuid4()}"
+      time = System.system_time()
 
-      # Connect to the cluster first
-      :ok = Group.connect(sup, cluster)
+      # Call the conflict resolver directly — this is what Group.Replica
+      # calls during partition healing when it detects a conflict.
+      config = Group.get_config(sup)
+      {mod, func, extra_args} = config.resolve_registry_conflict
 
-      # Join in the named cluster
-      :ok = Group.join(sup, key, %{role: :player}, cluster: cluster)
+      winner =
+        apply(mod, func, [
+          sup,
+          key,
+          {pid, meta, time},
+          {fake_pid, %{meta | etag: "stale_etag"}, time + 1} | extra_args
+        ])
 
-      # Should appear in named cluster members
-      members = Group.members(sup, key, cluster: cluster)
-      assert length(members) == 1
-      my_pid = self()
-      assert [{^my_pid, %{role: :player}}] = members
+      # Our resolver picks the pid with the matching storage etag
+      assert winner == pid
 
-      # Should NOT appear in default cluster members
-      assert Group.members(sup, key) == []
-
-      # Leave the named cluster
-      :ok = Group.leave(sup, key, cluster: cluster)
-      assert Group.members(sup, key, cluster: cluster) == []
-    end
-
-    test "events in one cluster don't leak to another", %{supervisor_name: sup} do
-      cluster1 = :cluster_a
-      cluster2 = :cluster_b
-      key = "shared/key/#{DurableServer.UUID.uuid4()}"
-
-      # Connect to both clusters
-      :ok = Group.connect(sup, cluster1)
-      :ok = Group.connect(sup, cluster2)
-
-      # Subscribe to cluster1 only
-      :ok = Group.monitor(sup, :all, cluster: cluster1)
-
-      # Spawn process to join cluster1
-      test_pid = self()
-
-      pid1 =
-        spawn(fn ->
-          :ok = Group.join(sup, key, %{cluster: 1}, cluster: cluster1)
-          send(test_pid, {:joined, 1})
-          Process.sleep(5000)
-        end)
-
-      receive do
-        {:joined, 1} -> :ok
-      after
-        1000 -> flunk("Process didn't join cluster1 in time")
-      end
-
-      # Should receive event from cluster1
-      assert_receive %Group.Event{type: :joined, pid: ^pid1, cluster: ^cluster1}, 1000
-
-      # Spawn process to join cluster2
-      pid2 =
-        spawn(fn ->
-          :ok = Group.join(sup, key, %{cluster: 2}, cluster: cluster2)
-          send(test_pid, {:joined, 2})
-          Process.sleep(5000)
-        end)
-
-      receive do
-        {:joined, 2} -> :ok
-      after
-        1000 -> flunk("Process didn't join cluster2 in time")
-      end
-
-      # Should NOT receive event from cluster2
-      refute_receive %Group.Event{type: :joined, pid: ^pid2, cluster: ^cluster2}, 200
-
-      # Now subscribe to cluster2 and verify we can receive events
-      :ok = Group.monitor(sup, :all, cluster: cluster2)
-
-      pid3 =
-        spawn(fn ->
-          :ok = Group.join(sup, key, %{cluster: 2, extra: true}, cluster: cluster2)
-          send(test_pid, {:joined, 3})
-          Process.sleep(5000)
-        end)
-
-      receive do
-        {:joined, 3} -> :ok
-      after
-        1000 -> flunk("Process didn't join cluster2 in time")
-      end
-
-      assert_receive %Group.Event{type: :joined, pid: ^pid3, cluster: ^cluster2}, 1000
-    end
-
-    test "members/3 returns only members from specified cluster", %{supervisor_name: sup} do
-      cluster = :isolated_cluster
-      key = "room/#{DurableServer.UUID.uuid4()}"
-
-      :ok = Group.connect(sup, cluster)
-
-      # Join default cluster
-      :ok = Group.join(sup, key, %{location: :default})
-
-      # Join named cluster (need different process since same pid can't join same key twice)
-      test_pid = self()
-
-      other_pid =
-        spawn(fn ->
-          :ok = Group.join(sup, key, %{location: :named}, cluster: cluster)
-          send(test_pid, :ready)
-          Process.sleep(5000)
-        end)
-
-      receive do
-        :ready -> :ok
-      after
-        1000 -> flunk("Process didn't join in time")
-      end
-
-      # Default cluster should only have our process
-      default_members = Group.members(sup, key)
-      assert length(default_members) == 1
-      my_pid = self()
-      assert [{^my_pid, %{location: :default}}] = default_members
-
-      # Named cluster should only have the spawned process
-      named_members = Group.members(sup, key, cluster: cluster)
-      assert length(named_members) == 1
-      assert [{^other_pid, %{location: :named}}] = named_members
-    end
-
-    test "default cluster works without cluster: option", %{supervisor_name: sup} do
-      key = "default/test/#{DurableServer.UUID.uuid4()}"
-
-      # Subscribe without cluster option (default cluster)
-      :ok = Group.monitor(sup, key)
-
-      # Join without cluster option (default cluster)
-      :ok = Group.join(sup, key, %{v: 1})
-
-      # Should receive event with cluster: nil
-      assert_receive %Group.Event{type: :joined} = event, 1000
-      assert event.cluster == nil
-      assert event.meta == %{v: 1}
-      assert event.previous_meta == nil
-
-      # Members without cluster option
-      members = Group.members(sup, key)
-      assert length(members) == 1
-    end
-
-    test "dispatch works with cluster: option", %{supervisor_name: sup} do
-      cluster = :broadcast_cluster
-      key = "broadcast/#{DurableServer.UUID.uuid4()}"
-
-      :ok = Group.connect(sup, cluster)
-
-      # Join the named cluster
-      :ok = Group.join(sup, key, %{}, cluster: cluster)
-
-      # Broadcast to named cluster
-      :ok = Group.dispatch(sup, key, {:test_message, :from_cluster}, cluster: cluster)
-
-      assert_receive {:test_message, :from_cluster}, 1000
-
-      # Broadcast to default cluster (we're not there)
-      :ok = Group.dispatch(sup, key, {:test_message, :from_default})
-
-      # Should NOT receive (we're not in default cluster for this key)
-      refute_receive {:test_message, :from_default}, 200
-    end
-
-    test "monitor/demonitor work with cluster: option", %{supervisor_name: sup} do
-      cluster = :sub_cluster
-      key = "sub/test/#{DurableServer.UUID.uuid4()}"
-
-      :ok = Group.connect(sup, cluster)
-
-      # Subscribe to named cluster
-      :ok = Group.monitor(sup, key, cluster: cluster)
-
-      # Spawn and join
-      test_pid = self()
-
-      spawn(fn ->
-        :ok = Group.join(sup, key, %{}, cluster: cluster)
-        send(test_pid, :joined)
-        Process.sleep(5000)
-      end)
-
-      receive do
-        :joined -> :ok
-      after
-        1000 -> flunk("Process didn't join in time")
-      end
-
-      assert_receive %Group.Event{type: :joined, cluster: ^cluster}, 1000
-
-      # Unsubscribe from named cluster
-      :ok = Group.demonitor(sup, key, cluster: cluster)
-
-      # Spawn another process to join
-      spawn(fn ->
-        :ok = Group.join(sup, key, %{second: true}, cluster: cluster)
-        send(test_pid, :joined2)
-        Process.sleep(5000)
-      end)
-
-      receive do
-        :joined2 -> :ok
-      after
-        1000 -> flunk("Second process didn't join in time")
-      end
-
-      # Should NOT receive event after unsubscribe
-      refute_receive %Group.Event{type: :joined}, 200
+      # Our resolver kills both for clean restart
+      assert_receive {:DOWN, ^ref_real, :process, ^pid, _}, 1000
+      assert_receive {:DOWN, ^ref_fake, :process, ^fake_pid, _}, 1000
     end
   end
 end

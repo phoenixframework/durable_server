@@ -1136,7 +1136,7 @@ defmodule DurableServer do
       object_store: object_store,
       # full key with prefix for use in all storage ops
       key: key,
-      # original unprefixed key passed by user, used for syn registry
+      # original unprefixed key passed by user, used for group registry
       prefix: prefix,
       vsn: config.vsn,
       etag: etag,
@@ -1292,7 +1292,7 @@ defmodule DurableServer do
   end
 
   defp update_registry_meta(%DurableServer{} = state, new_user_meta) when is_map(new_user_meta) do
-    # update syn registry with new user metadata while preserving internal metadata
+    # update group registry with new user metadata while preserving internal metadata
     register_pid(%{state | user_meta: new_user_meta})
   end
 
@@ -1518,7 +1518,7 @@ defmodule DurableServer do
   end
 
   @impl true
-  # custom syn handler
+  # custom group registry resolver
   def handle_info(
         {:EXIT, _pid, {:shutdown, {@durable, {:fatal_exit, :registry_conflict}}}},
         %__MODULE__{} = state
@@ -1532,8 +1532,8 @@ defmodule DurableServer do
     fatal_exit!(reason)
   end
 
-  # default syn handler
-  def handle_info({:EXIT, _pid, {:syn_resolve_kill, key, _meta}}, %__MODULE__{} = state) do
+  # default group registry resolver
+  def handle_info({:EXIT, _pid, {:group_registry_conflict, key, _meta}}, %__MODULE__{} = state) do
     fatal_exit!(
       "#{state.key} netsplit recovery chose the other side as winner: #{inspect(key: key, node: node(), pid: self())}"
     )
@@ -2372,10 +2372,14 @@ defmodule DurableServer do
   end
 
   @doc false
+  def extract_user_meta(%{user_meta: user_meta}), do: user_meta
+  def extract_user_meta(meta) when is_map(meta), do: meta
+
+  @doc false
   def __fetch_stored_state_for_conflict_resolution__(supervisor_name, storage_key)
       when is_atom(supervisor_name) and is_binary(storage_key) do
     # Fetch the current etag from storage for conflict resolution
-    # This is called during syn conflict resolution
+    # This is called during group conflict resolution
     try do
       %{object_store: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
 

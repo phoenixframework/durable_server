@@ -86,7 +86,7 @@ defmodule DurableServer.CircuitBreaker do
   @doc """
   Checks if the module-wide circuit breaker allows operations.
 
-  Returns `:ok` if operations are allowed, or `{:circuit_open, cooldown_ms}` 
+  Returns `:ok` if operations are allowed, or `{:circuit_open, cooldown_ms}`
   if the circuit breaker is open.
   """
   @spec check_module_circuit_breaker(t(), module()) ::
@@ -176,7 +176,7 @@ defmodule DurableServer.CircuitBreaker do
 
   Called whenever a lock acquisition attempt fails with {:already_started, pid},
   indicating another node owns the lock. During network partition/flapping,
-  this prevents hammering object storage when we can't see remote nodes in syn.
+  this prevents hammering object storage when we can't see remote nodes in group registry.
   """
   @spec increment_global_lock_failures(t()) :: :ok
   def increment_global_lock_failures(%CircuitBreaker{table_name: table}) do

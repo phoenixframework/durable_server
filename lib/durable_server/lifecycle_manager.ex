@@ -45,7 +45,7 @@ defmodule DurableServer.LifecycleManager do
   ### Discovery Process
   1. Write node heartbeat and refresh heartbeat cache
   2. List all DurableServer objects from ObjectStore (paginated with continuation tokens)
-  3. Check health using check_server_health/2 (uses syn + heartbeat cache)
+  3. Check health using check_server_health/2 (uses group + heartbeat cache)
   4. Apply consistent hashing to determine which servers this node should handle
   5. Detect orphaned servers (any node can claim these regardless of hash assignment)
   6. Attempt atomic restart claiming via DurableServer.claim_restart_attempt/2
@@ -81,7 +81,7 @@ defmodule DurableServer.LifecycleManager do
   ### Network Partitions
   - Multiple nodes may attempt restart during partitions
   - Atomic ObjectStore operations ensure only one succeeds
-  - :syn registry eventual consistency provides healing after partition resolution
+  - Group registry eventual consistency provides healing after partition resolution
 
   ### Orphaned Servers
   Any server is considered orphaned and claimable by any node if:
@@ -111,7 +111,6 @@ defmodule DurableServer.LifecycleManager do
             object_store: nil,
             prefix: nil,
             node_module: nil,
-            syn_module: nil,
             current_discovery_task: nil,
             current_heartbeat_task: nil,
             heartbeat_table: nil,
@@ -211,7 +210,6 @@ defmodule DurableServer.LifecycleManager do
       object_store: object_store,
       prefix: config.prefix,
       node_module: Keyword.get(opts, :node_module, Node),
-      syn_module: Keyword.get(opts, :syn_module, :syn),
       current_discovery_task: nil,
       current_heartbeat_task: nil,
       heartbeat_table: hearbeat_tab,
@@ -1226,13 +1224,8 @@ defmodule DurableServer.LifecycleManager do
     end
   end
 
-  defp syn_scope(supervisor_name) when is_atom(supervisor_name) do
-    :"durable_#{supervisor_name}"
-  end
-
   defp check_server_health(%LifecycleManager{} = state, %Meta{} = meta) do
-    %{supervisor_name: supervisor_name, syn_module: syn_module} = state
-    syn_scope = syn_scope(supervisor_name)
+    %{supervisor_name: supervisor_name} = state
 
     cond do
       # if it's stopped, no need to look up
@@ -1241,9 +1234,9 @@ defmodule DurableServer.LifecycleManager do
 
       true ->
         # before taking slow path of checking locks via rpc, first see if server is alive in syn
-        case syn_module.lookup(syn_scope, meta.key) do
-          {pid, syn_meta} when is_pid(pid) ->
-            case syn_meta do
+        case Group.lookup(supervisor_name, meta.key, extract_meta: & &1) do
+          {pid, registry_meta} when is_pid(pid) ->
+            case registry_meta do
               %{node_ref: node_ref} ->
                 if to_string(node(pid)) == meta.node_str and node_ref == meta.node_ref do
                   :healthy
@@ -1255,7 +1248,7 @@ defmodule DurableServer.LifecycleManager do
                 fetch_orphaned_slow_path(meta)
             end
 
-          :undefined ->
+          nil ->
             fetch_orphaned_slow_path(meta)
         end
     end
@@ -1298,7 +1291,7 @@ defmodule DurableServer.LifecycleManager do
   `{:error, {:limit_reached, reason, details}}`
   if any limit is exceeded.
 
-  This function is pure ETS/syn reads with no blocking operations.
+  This function is pure ETS/Group reads with no blocking operations.
 
   ## Options
 
@@ -1316,7 +1309,7 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp check_count_limits(supervisor_name, module) do
-    %{ets_table: table_name, syn_scope: scope} =
+    %{ets_table: table_name} =
       DurableServer.Supervisor.__get_config__(supervisor_name)
 
     [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
@@ -1326,15 +1319,8 @@ defmodule DurableServer.LifecycleManager do
         :ok
 
       max_children_limits ->
-        # read counts directly from syn
-        global_count = :syn.local_registry_count(scope)
-        # get module count, handling case where scope doesn't exist yet
-        module_count =
-          try do
-            :syn.local_member_count(scope, module)
-          rescue
-            _error -> 0
-          end
+        global_count = Group.local_registry_count(supervisor_name)
+        module_count = Group.local_member_count(supervisor_name, inspect(module))
 
         total_limit = max_children_limits[:total]
         module_limit = max_children_limits[module]

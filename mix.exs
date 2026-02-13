@@ -40,7 +40,7 @@ defmodule DurableServer.MixProject do
 
   defp deps do
     [
-      {:syn, "~> 3.3", github: "chrismccord/syn"},
+      {:group, path: "priv/group"},
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
       {:req_s3, "~> 0.2"},

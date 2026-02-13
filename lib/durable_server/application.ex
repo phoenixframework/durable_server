@@ -5,13 +5,8 @@ defmodule DurableServer.Application do
 
   @impl true
   def start(_type, _args) do
-    # TODO: Extract Group into its own library (group/ path dep) with its own Application.
-    # These two children (syn event_handler config + Group.Registry) belong there.
-    Application.put_env(:syn, :event_handler, Group.SynEventHandler)
-
     children = [
       {Finch, name: DurableServer.Finch},
-      {Registry, keys: :duplicate, name: Group.Registry},
       {Task.Supervisor, name: DurableServer.TaskSupervisor}
     ]
 
