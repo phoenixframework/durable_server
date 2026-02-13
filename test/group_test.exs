@@ -421,7 +421,7 @@ defmodule GroupTest do
   end
 
   describe "GroupConflictResolver" do
-    test "syn event handler dispatches to our configured resolver", %{supervisor_name: sup} do
+    test "conflict resolver is configured and callable", %{supervisor_name: sup} do
       key = "conflict/test/#{DurableServer.UUID.uuid4()}"
 
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
@@ -437,23 +437,23 @@ defmodule GroupTest do
 
       time = System.system_time()
 
-      # Call through syn's event handler with the real scope — this is what syn
-      # would call during partition healing. It should dispatch to our configured
-      # DurableServer.GroupConflictResolver (not syn's default resolver).
-      scope = Group.scope(sup)
+      # Call the conflict resolver directly — this is what Group.Replica
+      # calls during partition healing when it detects a conflict.
+      config = Group.get_config(sup)
+      {mod, func, extra_args} = config.resolve_registry_conflict
 
       winner =
-        Group.SynEventHandler.resolve_registry_conflict(
-          scope,
+        apply(mod, func, [
+          sup,
           key,
           {pid, meta, time},
-          {fake_pid, %{meta | etag: "stale_etag"}, time + 1}
-        )
+          {fake_pid, %{meta | etag: "stale_etag"}, time + 1} | extra_args
+        ])
 
       # Our resolver picks the pid with the matching storage etag
       assert winner == pid
 
-      # Our resolver kills both for clean restart (syn's default only kills the loser)
+      # Our resolver kills both for clean restart
       assert_receive {:DOWN, ^ref_real, :process, ^pid, _}, 1000
       assert_receive {:DOWN, ^ref_fake, :process, ^fake_pid, _}, 1000
     end

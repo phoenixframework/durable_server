@@ -10,27 +10,20 @@ defmodule Group do
 
   ## Consistency Model
 
-  All operations are **eventually consistent**. The underlying syn library uses
+  All operations are **eventually consistent**. The built-in replication layer uses
   Erlang distribution to propagate state across nodes, which means:
 
   - Writes (register, join, etc.) return immediately after local update
   - Other nodes receive updates asynchronously via Erlang distribution
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved (see `Group.SynEventHandler`)
+  - When partitions heal, conflicts are resolved
 
   ## Clusters
 
-  By default, all operations use the supervisor's default cluster (syn scope). You can
+  By default, all operations use the default cluster (`nil`). You can
   optionally create isolated subclusters where only connected nodes receive events.
 
-  ### Default vs Named Clusters
-
-  - **Default cluster**: Uses scope `:"group_<name>"` - all nodes share this
-  - **Named clusters**: Use scope `:"group_<name>__cluster__<cluster_name>"`
-
-  Named clusters are useful when you want to partition your registry/pubsub layer while still
-  maintaining global uniqueness for DurableServers (which always register in the default
-  cluster).
+  Named clusters use string names (e.g., `"game_servers"`).
 
   ### Important: DurableServer Registration
 
@@ -140,30 +133,34 @@ defmodule Group do
   ### Using Named Clusters
 
       # Connect this node to a named cluster
-      :ok = Group.connect(MySup, :game_servers)
+      :ok = Group.connect(MySup, "game_servers")
 
       # Join a group in the named cluster
-      :ok = Group.join(MySup, "room/123", %{role: :member}, cluster: :game_servers)
+      :ok = Group.join(MySup, "room/123", %{role: :member}, cluster: "game_servers")
 
       # Monitor events in the named cluster
-      :ok = Group.monitor(MySup, :all, cluster: :game_servers)
+      :ok = Group.monitor(MySup, :all, cluster: "game_servers")
 
       # Members and dispatch also support cluster option
-      Group.members(MySup, "room/123", cluster: :game_servers)
-      Group.dispatch(MySup, "room/123", {:msg, "hi"}, cluster: :game_servers)
+      Group.members(MySup, "room/123", cluster: "game_servers")
+      Group.dispatch(MySup, "room/123", {:msg, "hi"}, cluster: "game_servers")
 
   ## Architecture Notes
 
-  - **Events are cluster-wide**: syn callbacks (`on_process_registered`, `on_process_joined`,
-    etc.) fire on ALL nodes in the cluster. This means a monitor on Node A receives
-    events when a DurableServer registers on Node B.
+  - **Events are cluster-wide**: Replication callbacks fire on ALL nodes in the cluster.
+    This means a monitor on Node A receives events when a DurableServer registers on Node B.
 
   - **Monitors** are stored per-node in an Elixir `Registry`, enabling pattern matching
     and automatic cleanup when monitoring processes die.
 
-  - **Memberships** use syn process groups for cluster-wide distribution and automatic
+  - **Memberships** use built-in process groups for cluster-wide distribution and automatic
     cleanup when member processes die.
   """
+
+  alias Group.Replica
+  alias Group.Replica.Data
+
+  @default_shards System.schedulers_online()
 
   # ===========================================================================
   # Startup
@@ -179,12 +176,10 @@ defmodule Group do
     callbacks = Keyword.get(opts, :callbacks, %{})
     extract_meta = Keyword.get(opts, :extract_meta)
     resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)
-    scope = scope(name)
-
-    :syn.add_node_to_scopes([scope])
+    num_shards = Keyword.get(opts, :shards, @default_shards)
 
     # Store config in persistent_term for fast access
-    config = %{scope: scope, callbacks: callbacks}
+    config = %{callbacks: callbacks, num_shards: num_shards}
     config = if extract_meta, do: Map.put(config, :extract_meta, extract_meta), else: config
 
     config =
@@ -194,12 +189,24 @@ defmodule Group do
 
     :persistent_term.put({__MODULE__, name}, config)
 
-    # Start a supervisor with the local monitor Registry
+    # Initialize default cluster with all known nodes
+    # (will be populated after Data starts)
+
     children = [
+      {Data, name: name, num_shards: num_shards},
+      {Replica.Supervisor, name: name, num_shards: num_shards},
       {Registry, keys: :duplicate, name: registry_name(name)}
     ]
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: :"#{name}_group_sup")
+    case Supervisor.start_link(children, strategy: :rest_for_one, name: :"#{name}_group_sup") do
+      {:ok, pid} ->
+        # Initialize default cluster membership (nil cluster = all nodes)
+        Data.put_cluster_nodes(name, nil, MapSet.new(Node.list()))
+        {:ok, pid}
+
+      error ->
+        error
+    end
   end
 
   # ===========================================================================
@@ -209,27 +216,32 @@ defmodule Group do
   @doc """
   Connect the local node to a named cluster.
 
-  This adds the current node to the syn scope for the named cluster, allowing it
-  to send and receive process group events within that cluster.
+  This adds the current node to the cluster, allowing it to send and receive
+  process group events within that cluster.
 
   ## Parameters
 
   - `name` - The Group name
-  - `cluster_name` - The name of the cluster to connect to (atom)
+  - `cluster_name` - The name of the cluster to connect to (binary string)
 
   ## Returns
 
   - `:ok` on success
-  - `{:error, reason}` on failure
   """
   def connect(name, cluster_name)
-      when is_atom(name) and is_atom(cluster_name) do
-    scope = cluster_scope(name, cluster_name)
+      when is_atom(name) and is_binary(cluster_name) do
+    # Update shared cluster_nodes table synchronously
+    current = Data.cluster_nodes(name, cluster_name)
+    Data.put_cluster_nodes(name, cluster_name, MapSet.put(current, node()))
 
-    case :syn.add_node_to_scopes([scope]) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
+    # Broadcast to all shards to inform remote nodes
+    num_shards = get_config(name).num_shards
+
+    for i <- 0..(num_shards - 1) do
+      GenServer.call(Replica.shard_name(name, i), {:cluster_connect, cluster_name})
     end
+
+    :ok
   end
 
   @doc """
@@ -238,16 +250,32 @@ defmodule Group do
   ## Parameters
 
   - `name` - The Group name
-  - `cluster_name` - The name of the cluster to disconnect from (atom)
+  - `cluster_name` - The name of the cluster to disconnect from (binary string)
 
   ## Returns
 
   - `:ok` always
   """
   def disconnect(name, cluster_name)
-      when is_atom(name) and is_atom(cluster_name) do
-    scope = cluster_scope(name, cluster_name)
-    :syn.remove_node_from_scopes([scope])
+      when is_atom(name) and is_binary(cluster_name) do
+    # Update shared cluster_nodes table
+    current = Data.cluster_nodes(name, cluster_name)
+    new_nodes = MapSet.delete(current, node())
+
+    if MapSet.size(new_nodes) == 0 do
+      Data.delete_cluster_nodes(name, cluster_name)
+    else
+      Data.put_cluster_nodes(name, cluster_name, new_nodes)
+    end
+
+    # Broadcast disconnect to all shards
+    num_shards = get_config(name).num_shards
+
+    for i <- 0..(num_shards - 1) do
+      GenServer.call(Replica.shard_name(name, i), {:cluster_disconnect, cluster_name})
+    end
+
+    :ok
   end
 
   @doc """
@@ -256,7 +284,7 @@ defmodule Group do
   ## Parameters
 
   - `name` - The Group name
-  - `cluster_name` - The name of the cluster to check
+  - `cluster_name` - The name of the cluster to check (binary string)
 
   ## Returns
 
@@ -264,9 +292,9 @@ defmodule Group do
   - `false` if not connected
   """
   def connected?(name, cluster_name)
-      when is_atom(name) and is_atom(cluster_name) do
-    scope = cluster_scope(name, cluster_name)
-    scope in :syn.node_scopes()
+      when is_atom(name) and is_binary(cluster_name) do
+    nodes = Data.cluster_nodes(name, cluster_name)
+    MapSet.member?(nodes, node())
   end
 
   @doc """
@@ -284,28 +312,19 @@ defmodule Group do
   def nodes(name, cluster_name \\ nil)
 
   def nodes(name, nil) when is_atom(name) do
-    scope = scope(name)
-
     try do
-      :syn.subcluster_nodes(:pg, scope)
+      Data.cluster_nodes(name, nil) |> MapSet.to_list()
     rescue
-      # If scope doesn't exist yet
       ArgumentError -> []
-    catch
-      :exit, _ -> []
     end
   end
 
   def nodes(name, cluster_name)
-      when is_atom(name) and is_atom(cluster_name) do
-    scope = cluster_scope(name, cluster_name)
-
+      when is_atom(name) and is_binary(cluster_name) do
     try do
-      :syn.subcluster_nodes(:pg, scope)
+      Data.cluster_nodes(name, cluster_name) |> MapSet.to_list()
     rescue
       ArgumentError -> []
-    catch
-      :exit, _ -> []
     end
   end
 
@@ -343,13 +362,9 @@ defmodule Group do
   def register(name, key, meta, opts)
       when is_atom(name) and is_binary(key) and is_map(meta) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
+    shard = Replica.shard_for(name, cluster, key)
 
-    case :syn.register(scope, key, self(), meta) do
-      :ok -> :ok
-      {:error, :taken} -> {:error, :taken}
-      {:error, reason} -> {:error, reason}
-    end
+    GenServer.call(shard, {:register, cluster, key, self(), meta})
   end
 
   @doc """
@@ -378,12 +393,9 @@ defmodule Group do
   def unregister(name, key, opts)
       when is_atom(name) and is_binary(key) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
+    shard = Replica.shard_for(name, cluster, key)
 
-    case :syn.unregister(scope, key) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+    GenServer.call(shard, {:unregister, cluster, key})
   end
 
   @doc """
@@ -412,18 +424,26 @@ defmodule Group do
 
   def lookup(name, key, opts)
       when is_atom(name) and is_binary(key) and is_list(opts) do
-    cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
-    extract_meta_fn = resolve_extract_meta(name, opts)
+    case get_config(name) do
+      nil ->
+        nil
 
-    try do
-      case :syn.lookup(scope, key) do
-        {pid, meta} when is_pid(pid) -> {pid, extract_meta_fn.(meta)}
-        :undefined -> nil
-      end
-    catch
-      :error, {:invalid_scope, _} -> nil
+      config ->
+        cluster = Keyword.get(opts, :cluster)
+        extract_meta_fn = resolve_extract_meta(name, opts)
+        num_shards = config.num_shards
+        shard = Replica.shard_index_for(cluster, key, num_shards)
+
+        case Data.registry_lookup(name, shard, cluster, key) do
+          {pid, meta, _time, _mref, _node} ->
+            {pid, extract_meta_fn.(meta)}
+
+          nil ->
+            nil
+        end
     end
+  rescue
+    ArgumentError -> nil
   end
 
   # ===========================================================================
@@ -522,12 +542,9 @@ defmodule Group do
       when is_atom(name) and is_binary(group) and is_map(meta) and
              is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
+    shard = Replica.shard_for(name, cluster, group)
 
-    case :syn.join(scope, group, self(), meta) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+    GenServer.call(shard, {:join, cluster, group, self(), meta})
   end
 
   @doc """
@@ -553,13 +570,9 @@ defmodule Group do
   def leave(name, group, opts)
       when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
-    pid = self()
+    shard = Replica.shard_for(name, cluster, group)
 
-    case :syn.leave(scope, group, pid) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+    GenServer.call(shard, {:leave, cluster, group, self()})
   end
 
   # ===========================================================================
@@ -592,24 +605,21 @@ defmodule Group do
   def members(name, group, opts)
       when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
     extract_meta_fn = resolve_extract_meta(name, opts)
+    num_shards = get_config(name).num_shards
+    shard = Replica.shard_index_for(cluster, group, num_shards)
 
     # DurableServer from registry (one or none)
     registry_result =
-      case :syn.lookup(scope, group) do
-        {pid, meta} -> [{pid, extract_meta_fn.(meta)}]
-        :undefined -> []
+      case Data.registry_lookup(name, shard, cluster, group) do
+        {pid, meta, _time, _mref, _node} -> [{pid, extract_meta_fn.(meta)}]
+        nil -> []
       end
 
     # Joined pids from process group (zero or more)
     group_members =
-      try do
-        :syn.members(scope, group)
-      rescue
-        # syn raises ArgumentError if the group doesn't exist
-        ArgumentError -> []
-      end
+      Data.pg_members(name, shard, cluster, group)
+      |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
 
     registry_result ++ group_members
   end
@@ -637,8 +647,8 @@ defmodule Group do
   def local_registry_count(name, opts)
       when is_atom(name) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
-    :syn.local_registry_count(scope)
+    num_shards = get_config(name).num_shards
+    Data.local_registry_count(name, num_shards, cluster)
   end
 
   @doc """
@@ -663,13 +673,8 @@ defmodule Group do
   def local_member_count(name, group, opts)
       when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
-    scope = resolve_scope(name, cluster)
-
-    try do
-      :syn.local_member_count(scope, group)
-    rescue
-      ArgumentError -> 0
-    end
+    num_shards = get_config(name).num_shards
+    Data.local_pg_count(name, num_shards, cluster, group)
   end
 
   # ===========================================================================
@@ -730,9 +735,6 @@ defmodule Group do
   # ===========================================================================
 
   @doc false
-  def scope(name) when is_atom(name), do: :"group_#{name}"
-
-  @doc false
   def get_config(name) when is_atom(name) do
     :persistent_term.get({__MODULE__, name}, nil)
   end
@@ -768,17 +770,6 @@ defmodule Group do
 
     :ok
   end
-
-  # Compute the syn scope for a named cluster.
-  # Uses __cluster__ (double underscore) as delimiter to avoid ambiguity with
-  # names that might contain underscores.
-  defp cluster_scope(name, cluster_name) do
-    :"group_#{name}__cluster__#{cluster_name}"
-  end
-
-  # Resolve the syn scope: default cluster uses scope(name), named clusters use cluster_scope
-  defp resolve_scope(name, nil), do: scope(name)
-  defp resolve_scope(name, cluster_name), do: cluster_scope(name, cluster_name)
 
   defp registry_name(name) when is_atom(name), do: :"#{name}_group_registry"
 
@@ -818,7 +809,6 @@ defmodule Group do
     |> Enum.uniq()
   rescue
     # Registry doesn't exist yet during startup
-    # (syn callbacks can fire before the registry is started)
     ArgumentError -> []
   end
 

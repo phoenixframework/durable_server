@@ -5,7 +5,7 @@ defmodule GroupTest do
 
   setup do
     name = :"test_group_#{System.unique_integer([:positive])}"
-    start_supervised!({Group, name: name})
+    start_supervised!({Group, name: name, shards: 4})
     {:ok, name: name}
   end
 
@@ -140,6 +140,104 @@ defmodule GroupTest do
     end
   end
 
+  describe "register/unregister" do
+    test "register makes process discoverable via lookup", %{name: name} do
+      key = "user/#{System.unique_integer([:positive])}"
+
+      :ok = Group.register(name, key, %{module: :test})
+
+      {pid, meta} = Group.lookup(name, key)
+      assert pid == self()
+      assert meta == %{module: :test}
+    end
+
+    test "register triggers :registered event", %{name: name} do
+      key = "user/#{System.unique_integer([:positive])}"
+
+      :ok = Group.monitor(name, key)
+      :ok = Group.register(name, key, %{module: :test})
+
+      assert_receive %Group.Event{type: :registered} = event, 1000
+      assert event.key == key
+      assert event.pid == self()
+      assert event.meta == %{module: :test}
+      assert event.previous_meta == nil
+    end
+
+    test "double register returns :taken", %{name: name} do
+      key = "user/#{System.unique_integer([:positive])}"
+
+      :ok = Group.register(name, key, %{module: :test})
+
+      # Another process tries to register same key
+      test_pid = self()
+
+      spawn(fn ->
+        result = Group.register(name, key, %{module: :other})
+        send(test_pid, {:register_result, result})
+      end)
+
+      assert_receive {:register_result, {:error, :taken}}, 1000
+    end
+
+    test "re-register by same process updates meta", %{name: name} do
+      key = "user/#{System.unique_integer([:positive])}"
+
+      :ok = Group.monitor(name, key)
+      :ok = Group.register(name, key, %{v: 1})
+      assert_receive %Group.Event{type: :registered, previous_meta: nil}, 1000
+
+      :ok = Group.register(name, key, %{v: 2})
+      assert_receive %Group.Event{type: :registered, meta: %{v: 2}, previous_meta: %{v: 1}}, 1000
+
+      {_pid, %{v: 2}} = Group.lookup(name, key)
+    end
+
+    test "unregister removes from lookup and fires event", %{name: name} do
+      key = "user/#{System.unique_integer([:positive])}"
+
+      :ok = Group.monitor(name, key)
+      :ok = Group.register(name, key, %{module: :test})
+      assert_receive %Group.Event{type: :registered}, 1000
+
+      :ok = Group.unregister(name, key)
+      assert_receive %Group.Event{type: :unregistered} = event, 1000
+      assert event.key == key
+      assert event.reason == :unregister
+
+      assert Group.lookup(name, key) == nil
+    end
+
+    test "process death auto-unregisters", %{name: name} do
+      key = "user/#{System.unique_integer([:positive])}"
+
+      :ok = Group.monitor(name, key)
+
+      test_pid = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, key, %{module: :test})
+          send(test_pid, :ready)
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        :ready -> :ok
+      after
+        1000 -> flunk("Process didn't register in time")
+      end
+
+      assert_receive %Group.Event{type: :registered, pid: ^pid}, 1000
+      assert Group.lookup(name, key) != nil
+
+      Process.exit(pid, :kill)
+
+      assert_receive %Group.Event{type: :unregistered, pid: ^pid}, 1000
+      assert Group.lookup(name, key) == nil
+    end
+  end
+
   describe "members/2" do
     test "returns only joined processes", %{name: name} do
       key = "only/joined/#{System.unique_integer([:positive])}"
@@ -154,6 +252,32 @@ defmodule GroupTest do
 
     test "returns empty list for non-existent key", %{name: name} do
       assert Group.members(name, "nonexistent/key") == []
+    end
+
+    test "returns both registered and joined processes", %{name: name} do
+      key = "both/#{System.unique_integer([:positive])}"
+
+      :ok = Group.register(name, key, %{type: :server})
+
+      test_pid = self()
+
+      joiner =
+        spawn(fn ->
+          :ok = Group.join(name, key, %{type: :client})
+          send(test_pid, :joined)
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        :joined -> :ok
+      after
+        1000 -> flunk("Process didn't join")
+      end
+
+      members = Group.members(name, key)
+      assert length(members) == 2
+      assert {^test_pid, %{type: :server}} = Enum.find(members, fn {p, _} -> p == test_pid end)
+      assert {^joiner, %{type: :client}} = Enum.find(members, fn {p, _} -> p == joiner end)
     end
   end
 
@@ -246,7 +370,7 @@ defmodule GroupTest do
 
   describe "named clusters" do
     test "connect/disconnect/connected? manage cluster lifecycle", %{name: name} do
-      cluster = :game_servers
+      cluster = "game_servers"
 
       # Initially not connected
       refute Group.connected?(name, cluster)
@@ -260,7 +384,7 @@ defmodule GroupTest do
     end
 
     test "join/leave work with cluster: option", %{name: name} do
-      cluster = :game_cluster
+      cluster = "game_cluster"
       key = "room/#{System.unique_integer([:positive])}"
 
       # Connect to the cluster first
@@ -284,8 +408,8 @@ defmodule GroupTest do
     end
 
     test "events in one cluster don't leak to another", %{name: name} do
-      cluster1 = :cluster_a
-      cluster2 = :cluster_b
+      cluster1 = "cluster_a"
+      cluster2 = "cluster_b"
       key = "shared/key/#{System.unique_integer([:positive])}"
 
       # Connect to both clusters
@@ -351,7 +475,7 @@ defmodule GroupTest do
     end
 
     test "members/3 returns only members from specified cluster", %{name: name} do
-      cluster = :isolated_cluster
+      cluster = "isolated_cluster"
       key = "room/#{System.unique_integer([:positive])}"
 
       :ok = Group.connect(name, cluster)
@@ -408,7 +532,7 @@ defmodule GroupTest do
     end
 
     test "dispatch works with cluster: option", %{name: name} do
-      cluster = :broadcast_cluster
+      cluster = "broadcast_cluster"
       key = "broadcast/#{System.unique_integer([:positive])}"
 
       :ok = Group.connect(name, cluster)
@@ -429,7 +553,7 @@ defmodule GroupTest do
     end
 
     test "monitor/demonitor work with cluster: option", %{name: name} do
-      cluster = :sub_cluster
+      cluster = "sub_cluster"
       key = "sub/test/#{System.unique_integer([:positive])}"
 
       :ok = Group.connect(name, cluster)
@@ -472,6 +596,123 @@ defmodule GroupTest do
 
       # Should NOT receive event after unsubscribe
       refute_receive %Group.Event{type: :joined}, 200
+    end
+  end
+
+  describe "local_registry_count/1" do
+    test "counts registered processes", %{name: name} do
+      assert Group.local_registry_count(name) == 0
+
+      :ok = Group.register(name, "key1", %{})
+      assert Group.local_registry_count(name) == 1
+
+      test_pid = self()
+
+      spawn(fn ->
+        :ok = Group.register(name, "key2", %{})
+        send(test_pid, :registered)
+        Process.sleep(:infinity)
+      end)
+
+      receive do
+        :registered -> :ok
+      after
+        1000 -> flunk("didn't register")
+      end
+
+      assert Group.local_registry_count(name) == 2
+    end
+  end
+
+  describe "local_member_count/2" do
+    test "counts local group members", %{name: name} do
+      group = "my_group"
+      assert Group.local_member_count(name, group) == 0
+
+      :ok = Group.join(name, group, %{})
+      assert Group.local_member_count(name, group) == 1
+
+      test_pid = self()
+
+      spawn(fn ->
+        :ok = Group.join(name, group, %{})
+        send(test_pid, :joined)
+        Process.sleep(:infinity)
+      end)
+
+      receive do
+        :joined -> :ok
+      after
+        1000 -> flunk("didn't join")
+      end
+
+      assert Group.local_member_count(name, group) == 2
+    end
+  end
+
+  describe "concurrent operations" do
+    test "concurrent join/leave on same key doesn't produce duplicates", %{name: name} do
+      key = "concurrent/#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      pids =
+        for _i <- 1..10 do
+          spawn(fn ->
+            :ok = Group.join(name, key, %{})
+            send(test_pid, {:joined, self()})
+            Process.sleep(:infinity)
+          end)
+        end
+
+      for _ <- 1..10 do
+        receive do
+          {:joined, _} -> :ok
+        after
+          2000 -> flunk("timeout waiting for joins")
+        end
+      end
+
+      members = Group.members(name, key)
+      member_pids = Enum.map(members, fn {pid, _} -> pid end)
+      assert length(member_pids) == length(Enum.uniq(member_pids))
+      assert length(member_pids) == 10
+
+      # Kill a few and verify cleanup
+      Enum.take(pids, 3)
+      |> Enum.each(&Process.exit(&1, :kill))
+
+      Process.sleep(100)
+
+      members = Group.members(name, key)
+      assert length(members) == 7
+    end
+
+    test "concurrent register attempts on same key", %{name: name} do
+      key = "race/#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      for _i <- 1..5 do
+        spawn(fn ->
+          result = Group.register(name, key, %{pid: self()})
+          send(test_pid, {:result, self(), result})
+          Process.sleep(:infinity)
+        end)
+      end
+
+      results =
+        for _ <- 1..5 do
+          receive do
+            {:result, pid, result} -> {pid, result}
+          after
+            2000 -> flunk("timeout")
+          end
+        end
+
+      ok_results = Enum.filter(results, fn {_, r} -> r == :ok end)
+      error_results = Enum.filter(results, fn {_, r} -> r == {:error, :taken} end)
+
+      assert length(ok_results) == 1
+      assert length(error_results) == 4
     end
   end
 end

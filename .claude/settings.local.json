@@ -4,7 +4,8 @@
       "Bash(grep:*)",
       "Bash(mix test:*)",
       "Bash(notify \"Testing notification system\" --continue)",
-      "Bash(mix compile:*)"
+      "Bash(mix compile:*)",
+      "Bash(ls:*)"
     ]
   }
 }
