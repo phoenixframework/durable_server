@@ -250,20 +250,26 @@ defmodule Group do
   end
 
   @doc """
-  List all nodes in the default cluster.
+  List all nodes running this Group instance.
 
-  Returns the currently connected Erlang nodes (equivalent to `Node.list()`).
+  Returns nodes that have completed the peer discovery handshake, excluding
+  the local node. Unlike `Node.list()`, this only includes nodes actually
+  running this Group instance, not all connected Erlang nodes.
 
   ## Parameters
 
-  - `name` - The Group name (unused, but kept for API consistency)
+  - `name` - The Group name
 
   ## Returns
 
   - List of node atoms
   """
   def nodes(name) when is_atom(name) do
-    Node.list()
+    try do
+      Data.cluster_nodes(name, nil) -- [node()]
+    rescue
+      ArgumentError -> []
+    end
   end
 
   @doc """

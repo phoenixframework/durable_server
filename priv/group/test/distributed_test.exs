@@ -26,8 +26,6 @@ defmodule Group.DistributedTest do
       # Register on node A
       remote_pid = TestCluster.spawn_register(node_a, name, "user/1", %{role: :server})
 
-      Process.sleep(200)
-
       # Should be visible on node B
       TestCluster.assert_eventually(fn ->
         case TestCluster.rpc!(node_b, Group, :lookup, [name, "user/1"]) do
@@ -59,8 +57,6 @@ defmodule Group.DistributedTest do
 
       # Join on node A
       remote_pid = TestCluster.spawn_join(node_a, name, "room/1", %{role: :player})
-
-      Process.sleep(200)
 
       # Should be visible on node B
       TestCluster.assert_eventually(fn ->
@@ -103,7 +99,10 @@ defmodule Group.DistributedTest do
         %{type: :pg}
       )
 
-      Process.sleep(200)
+      # Wait for replication to B before starting C
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "user/1"]) != nil
+      end)
 
       # Start a 3rd node
       [{late_pid, node_c}] = TestCluster.start_peers(1)
@@ -144,8 +143,6 @@ defmodule Group.DistributedTest do
         %{node: :b}
       )
 
-      Process.sleep(200)
-
       # Verify data on node A
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, Group, :lookup, [name, "user/1"]) != nil
@@ -181,11 +178,15 @@ defmodule Group.DistributedTest do
 
       start_group_on_peers(peers, opts)
 
+      # Wait for peer discovery to complete
+      TestCluster.assert_eventually(fn ->
+        nodes = TestCluster.rpc!(node_a, Group, :nodes, [name])
+        node_b in nodes
+      end)
+
       # Set up monitor on node A that forwards events to us
       TestCluster.spawn_monitor_forwarder(node_a, name, "user/", self())
-
-      # Wait for monitor setup and peer discovery to complete
-      Process.sleep(300)
+      assert_receive {:monitor_ready, _}, 5000
 
       # Register on node B
       TestCluster.spawn_register(node_b, name, "user/123", %{from: :node_b})
@@ -219,8 +220,6 @@ defmodule Group.DistributedTest do
 
       # Join on C in "chat"
       TestCluster.spawn_join(node_c, name, "room/1", %{type: :chat}, cluster: "chat")
-
-      Process.sleep(300)
 
       # A should see both (connected to both clusters)
       TestCluster.assert_eventually(fn ->
@@ -278,16 +277,22 @@ defmodule Group.DistributedTest do
         TestCluster.rpc!(node_b, Group, :lookup, [name, "user/init"]) == nil
       end)
 
+      # Set up nodedown monitors so we know when disconnect takes effect on both sides
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+
       # Disconnect A from B
       TestCluster.disconnect_nodes(node_a, node_b)
-      Process.sleep(500)
+
+      # Wait for both sides to confirm the disconnect
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
 
       # Register same key on both sides during partition
+      # spawn_register now waits for registration to complete before returning
       _pid_a = TestCluster.spawn_register(node_a, name, "user/conflict", %{side: :a})
       Process.sleep(50)
       _pid_b = TestCluster.spawn_register(node_b, name, "user/conflict", %{side: :b})
-
-      Process.sleep(200)
 
       # Verify each side sees its own registration
       assert TestCluster.rpc!(node_a, Group, :lookup, [name, "user/conflict"]) != nil
@@ -327,18 +332,35 @@ defmodule Group.DistributedTest do
       opts = [name: name, shards: 2]
 
       start_group_on_peers(peers, opts)
-      Process.sleep(300)
+
+      # Wait for Erlang-level connectivity so disconnect_nodes actually works
+      TestCluster.assert_eventually(
+        fn ->
+          c_nodes = TestCluster.rpc!(node_c, Node, :list, [])
+          node_a in c_nodes and node_b in c_nodes
+        end,
+        timeout: 5000
+      )
+
+      # Set up nodedown monitor on A
+      TestCluster.monitor_nodes_on(node_a, self())
 
       # Disconnect C from A and B
       TestCluster.disconnect_nodes(node_c, node_a)
       TestCluster.disconnect_nodes(node_c, node_b)
-      Process.sleep(500)
+
+      # Wait for A to confirm it saw C go down
+      assert_receive {:nodedown_on_remote, ^node_c}, 5000
 
       # While partitioned: register keys on A, join groups on C
-      TestCluster.spawn_register(node_a, name, "user/from_a", %{origin: :a})
+      # flush_shards ensures nodedown is processed before registering
+      TestCluster.spawn_register(node_a, name, "user/from_a", %{origin: :a}, flush_shards: 2)
       TestCluster.spawn_join(node_c, name, "room/from_c", %{origin: :c})
 
-      Process.sleep(200)
+      # Wait for A's registration to replicate to B before checking isolation
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "user/from_a"]) != nil
+      end)
 
       # Verify A doesn't see C's data and C doesn't see A's data
       assert TestCluster.rpc!(node_c, Group, :lookup, [name, "user/from_a"]) == nil
@@ -377,15 +399,11 @@ defmodule Group.DistributedTest do
       opts = [name: name, shards: 2]
 
       start_group_on_peers(peers, opts)
-      Process.sleep(200)
 
       # Spawn, register, and immediately kill processes several times
       for i <- 1..5 do
         TestCluster.spawn_register_then_kill(node_a, name, "user/ephemeral_#{i}", %{i: i})
       end
-
-      # Wait for replication and cleanup
-      Process.sleep(500)
 
       # Assert no stale entries on node B
       TestCluster.assert_eventually(
@@ -409,7 +427,6 @@ defmodule Group.DistributedTest do
       opts = [name: name, shards: 2]
 
       start_group_on_peers(peers, opts)
-      Process.sleep(200)
 
       # Simultaneously register the same key on both nodes
       task_a =
@@ -464,12 +481,21 @@ defmodule Group.DistributedTest do
         TestCluster.rpc!(node_b, Group, :lookup, [name, "user/stable"]) != nil
       end)
 
+      # Set up nodedown monitor on A
+      TestCluster.monitor_nodes_on(node_a, self())
+
       # Rapidly disconnect/reconnect B 3 times
       for _i <- 1..3 do
         TestCluster.disconnect_nodes(node_a, node_b)
-        Process.sleep(300)
+        assert_receive {:nodedown_on_remote, ^node_b}, 5000
         TestCluster.reconnect_nodes(node_a, node_b)
-        Process.sleep(500)
+        # Wait for actual data replication to confirm full handshake
+        TestCluster.assert_eventually(
+          fn ->
+            TestCluster.rpc!(node_b, Group, :lookup, [name, "user/stable"]) != nil
+          end,
+          timeout: 5000
+        )
       end
 
       # After final reconnect, data should be consistent on both nodes
@@ -498,8 +524,6 @@ defmodule Group.DistributedTest do
       TestCluster.spawn_register(node_a, name, "user/a", %{node: :a})
       TestCluster.spawn_register(node_b, name, "user/b", %{node: :b})
       TestCluster.spawn_register(node_c, name, "user/c", %{node: :c})
-
-      Process.sleep(300)
 
       # Verify all visible on A
       TestCluster.assert_eventually(fn ->
@@ -539,7 +563,6 @@ defmodule Group.DistributedTest do
       opts = [name: name, shards: num_shards]
 
       start_group_on_peers(peers, opts)
-      Process.sleep(200)
 
       # Find keys that hash to different shards
       {reg_key, join_key} = TestCluster.keys_for_different_shards(num_shards)
@@ -593,11 +616,15 @@ defmodule Group.DistributedTest do
 
       start_group_on_peers(peers, opts)
 
+      # Wait for peer discovery to complete
+      TestCluster.assert_eventually(fn ->
+        nodes = TestCluster.rpc!(node_b, Group, :nodes, [name])
+        node_a in nodes
+      end)
+
       # Set up monitor on B that forwards events to us
       TestCluster.spawn_monitor_forwarder(node_b, name, "user/", self())
-
-      # Wait for monitor setup and peer discovery
-      Process.sleep(300)
+      assert_receive {:monitor_ready, _}, 5000
 
       # On A: register with meta v:1, re-register with meta v:2, then unregister
       TestCluster.spawn_register_update_unregister(
@@ -732,6 +759,244 @@ defmodule Group.DistributedTest do
     end
   end
 
+  describe "Group.nodes tracks actual peers" do
+    test "only returns nodes running Group, not all Erlang nodes" do
+      # Start 3 Erlang nodes, but only start Group on 2 of them
+      peers = TestCluster.start_peers(3)
+
+      [{_, node_a}, {_, node_b}, {_peer_c_pid, node_c}] = peers
+      name = :"dist_nodes_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      # Start Group only on A and B
+      TestCluster.start_group(node_a, opts)
+      TestCluster.start_group(node_b, opts)
+
+      # A should see B but NOT C
+      TestCluster.assert_eventually(fn ->
+        nodes = TestCluster.rpc!(node_a, Group, :nodes, [name])
+        node_b in nodes and node_c not in nodes
+      end)
+
+      # Now start Group on C
+      TestCluster.start_group(node_c, opts)
+
+      # A should now see both B and C
+      TestCluster.assert_eventually(fn ->
+        nodes = TestCluster.rpc!(node_a, Group, :nodes, [name])
+        node_b in nodes and node_c in nodes
+      end)
+
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+    end
+
+    test "nodedown removes peer from Group.nodes" do
+      peers = TestCluster.start_peers(2)
+
+      [{_, node_a}, {peer_b_pid, node_b}] = peers
+      name = :"dist_nodes_down_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      # A should see B
+      TestCluster.assert_eventually(fn ->
+        nodes = TestCluster.rpc!(node_a, Group, :nodes, [name])
+        node_b in nodes
+      end)
+
+      # Stop B
+      :peer.stop(peer_b_pid)
+
+      # A should no longer see B
+      TestCluster.assert_eventually(
+        fn ->
+          nodes = TestCluster.rpc!(node_a, Group, :nodes, [name])
+          node_b not in nodes
+        end,
+        timeout: 5000
+      )
+
+      [{peer_a_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_a end)
+      on_exit(fn -> :peer.stop(peer_a_pid) end)
+    end
+  end
+
+  describe "sender-side filtering" do
+    test "no cross-cluster data leakage" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      name = :"dist_filter_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      # A in "game" + "chat", B in "game" only, C in "chat" only
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_a, Group, :connect, [name, "chat"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_c, Group, :connect, [name, "chat"])
+
+      # Wait for cluster connectivity
+      TestCluster.assert_eventually(fn ->
+        game_on_a = TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
+        chat_on_a = TestCluster.rpc!(node_a, Group, :nodes, [name, "chat"])
+        length(game_on_a) >= 1 and length(chat_on_a) >= 1
+      end)
+
+      # Register in "game" on B, register in "chat" on C
+      TestCluster.spawn_register_in_cluster(node_b, name, "game_key/1", %{from: :b}, "game")
+      TestCluster.spawn_register_in_cluster(node_c, name, "chat_key/1", %{from: :c}, "chat")
+
+      # A should see both (it's in both clusters)
+      TestCluster.assert_eventually(fn ->
+        game_lookup =
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "game_key/1", [cluster: "game"]])
+
+        chat_lookup =
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "chat_key/1", [cluster: "chat"]])
+
+        game_lookup != nil and chat_lookup != nil
+      end)
+
+      # B should have NO "chat" data
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, "chat_key/1", [cluster: "chat"]]) ==
+               nil
+
+      # C should have NO "game" data
+      assert TestCluster.rpc!(node_c, Group, :lookup, [name, "game_key/1", [cluster: "game"]]) ==
+               nil
+    end
+  end
+
+  describe "peer discovery syncs shared clusters" do
+    test "late joiner with named cluster gets both nil and named cluster data" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_shared_cluster_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      # Start Group on A only, connect to "game", add data
+      TestCluster.start_group(node_a, opts)
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.spawn_register(node_a, name, "nil_key", %{cluster: nil})
+
+      TestCluster.spawn_register_in_cluster(
+        node_a,
+        name,
+        "game_key",
+        %{cluster: :game},
+        "game"
+      )
+
+      # Start Group on B, connect to "game"
+      TestCluster.start_group(node_b, opts)
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      # B should eventually see both nil cluster data and "game" cluster data
+      TestCluster.assert_eventually(
+        fn ->
+          nil_lookup = TestCluster.rpc!(node_b, Group, :lookup, [name, "nil_key"])
+
+          game_lookup =
+            TestCluster.rpc!(node_b, Group, :lookup, [name, "game_key", [cluster: "game"]])
+
+          nil_lookup != nil and game_lookup != nil
+        end,
+        timeout: 10_000
+      )
+    end
+  end
+
+  describe "partition heal re-syncs shared clusters" do
+    @tag timeout: 60_000
+    test "nil and named cluster data syncs after reconnect" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      name = :"dist_heal_cluster_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      # A and C both join "game" cluster
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_c, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        nodes = TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
+        length(nodes) >= 1
+      end)
+
+      # Wait for Erlang-level connectivity so disconnect_nodes actually works
+      TestCluster.assert_eventually(
+        fn ->
+          c_nodes = TestCluster.rpc!(node_c, Node, :list, [])
+          node_a in c_nodes and node_b in c_nodes
+        end,
+        timeout: 5000
+      )
+
+      # Set up nodedown monitors on A before partitioning
+      TestCluster.monitor_nodes_on(node_a, self())
+
+      # Partition C from A and B
+      TestCluster.disconnect_nodes(node_c, node_a)
+      TestCluster.disconnect_nodes(node_c, node_b)
+
+      # Wait for A to confirm it saw C go down
+      assert_receive {:nodedown_on_remote, ^node_c}, 5000
+
+      # Register data during partition
+      # flush_shards ensures nodedown is processed before registering
+      TestCluster.spawn_register(node_a, name, "nil_from_a", %{origin: :a}, flush_shards: 2)
+
+      TestCluster.spawn_register_in_cluster(
+        node_c,
+        name,
+        "game_from_c",
+        %{origin: :c},
+        "game"
+      )
+
+      # Verify isolation during partition
+      TestCluster.assert_eventually(fn ->
+        # Wait for A's registration to replicate to B (the remaining connected peer)
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "nil_from_a"]) != nil
+      end)
+
+      assert TestCluster.rpc!(node_c, Group, :lookup, [name, "nil_from_a"]) == nil
+
+      assert TestCluster.rpc!(node_a, Group, :lookup, [
+               name,
+               "game_from_c",
+               [cluster: "game"]
+             ]) == nil
+
+      # Heal partition
+      TestCluster.reconnect_nodes(node_c, node_a)
+      TestCluster.reconnect_nodes(node_c, node_b)
+
+      # All data should sync for both nil and "game" clusters
+      TestCluster.assert_eventually(
+        fn ->
+          nil_on_c = TestCluster.rpc!(node_c, Group, :lookup, [name, "nil_from_a"])
+
+          game_on_a =
+            TestCluster.rpc!(node_a, Group, :lookup, [name, "game_from_c", [cluster: "game"]])
+
+          nil_on_c != nil and game_on_a != nil
+        end,
+        timeout: 10_000
+      )
+    end
+  end
+
   describe "rolling restart" do
     test "new node syncs data from surviving nodes" do
       peers = TestCluster.start_peers(2)
@@ -746,11 +1011,13 @@ defmodule Group.DistributedTest do
       TestCluster.spawn_register(node_a, name, "from_a", %{origin: :a})
       TestCluster.spawn_register(node_b, name, "from_b", %{origin: :b})
 
-      Process.sleep(200)
+      # Wait for replication before stopping A
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "from_a"]) != nil
+      end)
 
       # Stop node A
       :peer.stop(peer_a_pid)
-      Process.sleep(500)
 
       # B should have cleaned up A's entries
       TestCluster.assert_eventually(fn ->

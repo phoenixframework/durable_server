@@ -42,34 +42,82 @@ defmodule Group.TestCluster do
     end)
   end
 
-  @doc "Spawn a process on a remote node that registers and sleeps forever"
-  def spawn_register(node, name, key, meta) do
+  @doc "Spawn a process on a remote node that registers and sleeps forever.
+
+  Waits for the registration to complete before returning.
+
+  Options:
+    - `flush_shards: num_shards` — after registering, flush the target shard
+      with `:sys.get_state` to ensure any pending nodedown or replicate messages
+      have been processed.
+  "
+  def spawn_register(node, name, key, meta, opts \\ []) do
     :erpc.call(node, fn ->
-      spawn(fn ->
-        :ok = Group.register(name, key, meta)
-        Process.sleep(:infinity)
-      end)
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, key, meta)
+          send(parent, {:registered, self()})
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        {:registered, ^pid} -> :ok
+      after
+        5000 -> raise "spawn_register timed out"
+      end
+
+      if num_shards = opts[:flush_shards] do
+        cluster = opts[:cluster]
+        shard_index = :erlang.phash2({cluster, key}, num_shards)
+        :sys.get_state(:"#{name}_replica_#{shard_index}")
+      end
+
+      pid
     end)
   end
 
-  @doc "Spawn a process on a remote node that joins and sleeps forever"
+  @doc "Spawn a process on a remote node that joins and sleeps forever.
+  Waits for the join to complete before returning."
   def spawn_join(node, name, key, meta, opts \\ []) do
     :erpc.call(node, fn ->
-      spawn(fn ->
-        :ok = Group.join(name, key, meta, opts)
-        Process.sleep(:infinity)
-      end)
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.join(name, key, meta, opts)
+          send(parent, {:joined, self()})
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        {:joined, ^pid} -> pid
+      after
+        5000 -> raise "spawn_join timed out"
+      end
     end)
   end
 
-  @doc "Spawn a process on a remote node that registers, joins, and sleeps forever"
+  @doc "Spawn a process on a remote node that registers, joins, and sleeps forever.
+  Waits for both operations to complete before returning."
   def spawn_register_and_join(node, name, reg_key, reg_meta, join_key, join_meta) do
     :erpc.call(node, fn ->
-      spawn(fn ->
-        :ok = Group.register(name, reg_key, reg_meta)
-        :ok = Group.join(name, join_key, join_meta)
-        Process.sleep(:infinity)
-      end)
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, reg_key, reg_meta)
+          :ok = Group.join(name, join_key, join_meta)
+          send(parent, {:ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        {:ready, ^pid} -> pid
+      after
+        5000 -> raise "spawn_register_and_join timed out"
+      end
     end)
   end
 
@@ -78,6 +126,7 @@ defmodule Group.TestCluster do
     :erpc.call(node, fn ->
       spawn(fn ->
         :ok = Group.monitor(name, pattern)
+        send(target_pid, {:monitor_ready, self()})
         forward_events(target_pid)
       end)
     end)
@@ -146,25 +195,70 @@ defmodule Group.TestCluster do
     {key1, "shard_test/b_#{key2_suffix}"}
   end
 
-  @doc "Spawn a process that registers under one key and joins another, then sleeps"
+  @doc "Spawn a process that registers under one key and joins another, then sleeps.
+  Waits for both operations to complete before returning."
   def spawn_register_and_join_keys(node, name, reg_key, reg_meta, join_key, join_meta) do
     :erpc.call(node, fn ->
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, reg_key, reg_meta)
+          :ok = Group.join(name, join_key, join_meta)
+          send(parent, {:ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        {:ready, ^pid} -> pid
+      after
+        5000 -> raise "spawn_register_and_join_keys timed out"
+      end
+    end)
+  end
+
+  @doc "Spawn a process on a remote node that registers in a named cluster and sleeps.
+  Waits for the registration to complete before returning."
+  def spawn_register_in_cluster(node, name, key, meta, cluster) do
+    :erpc.call(node, fn ->
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, key, meta, cluster: cluster)
+          send(parent, {:registered, self()})
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        {:registered, ^pid} -> pid
+      after
+        5000 -> raise "spawn_register_in_cluster timed out"
+      end
+    end)
+  end
+
+  @doc "Monitor nodedown events from a remote node, forwarding to caller"
+  def monitor_nodes_on(node, target_pid) do
+    :erpc.call(node, fn ->
       spawn(fn ->
-        :ok = Group.register(name, reg_key, reg_meta)
-        :ok = Group.join(name, join_key, join_meta)
-        Process.sleep(:infinity)
+        :net_kernel.monitor_nodes(true)
+        forward_nodedown(target_pid)
       end)
     end)
   end
 
-  @doc "Spawn a process on a remote node that registers in a named cluster and sleeps"
-  def spawn_register_in_cluster(node, name, key, meta, cluster) do
-    :erpc.call(node, fn ->
-      spawn(fn ->
-        :ok = Group.register(name, key, meta, cluster: cluster)
-        Process.sleep(:infinity)
-      end)
-    end)
+  defp forward_nodedown(target_pid) do
+    receive do
+      {:nodedown, node} ->
+        send(target_pid, {:nodedown_on_remote, node})
+        forward_nodedown(target_pid)
+
+      {:nodeup, _node} ->
+        forward_nodedown(target_pid)
+    after
+      30_000 -> :ok
+    end
   end
 
   @doc "Wait for a condition to become true, with retries"

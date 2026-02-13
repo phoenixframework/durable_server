@@ -56,8 +56,9 @@ defmodule Group.Replica.Data do
 
   Shared across all shards. One row per {cluster, node} pair — `:bag` deduplicates
   exact tuples on insert, so concurrent adds of the same node are idempotent with no
-  read-modify-write race. Only used for named clusters; the default cluster (nil) is
-  not stored in ETS — `Group.nodes/1` returns `Node.list()` directly.
+  read-modify-write race. Used for both the default cluster (nil) and named clusters.
+  The nil cluster is maintained by the peer_connect protocol — nodes are added on peer
+  discovery and removed on nodedown/shard death. `Group.nodes/1` reads nil cluster from ETS.
 
   ## Match Spec Patterns
 
@@ -71,7 +72,7 @@ defmodule Group.Replica.Data do
   - `purge_node/3`: Full table scan via `ets.select` filtering by node, then individual
     deletes. O(table size) for the scan, but this only runs on nodedown — rare path.
 
-  - `local_data/3`, `all_local_data/2`: Full table scan filtering by `node() == local_node`.
+  - `local_data/3`: Full table scan filtering by `node() == local_node`.
     Only runs during discovery/sync protocol — initial connection or reconnection.
 
   - `local_registry_count`, `local_pg_count`: Uses `ets.select_count` with a guard.
@@ -275,28 +276,6 @@ defmodule Group.Replica.Data do
     {reg_entries, pg_entries}
   end
 
-  def all_local_data(name, shard) do
-    local_node = node()
-
-    reg_table = reg_by_key_table(name, shard)
-
-    reg_entries =
-      :ets.select(reg_table, [
-        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"}, [{:==, :"$6", local_node}],
-         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
-      ])
-
-    pg_table = pg_by_key_table(name, shard)
-
-    pg_entries =
-      :ets.select(pg_table, [
-        {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6"}, [{:==, :"$6", local_node}],
-         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
-      ])
-
-    {reg_entries, pg_entries}
-  end
-
   def purge_node(name, shard, dead_node) do
     reg_table = reg_by_key_table(name, shard)
     reg_pid_table = reg_by_pid_table(name, shard)
@@ -393,6 +372,18 @@ defmodule Group.Replica.Data do
   def all_clusters(name) do
     table = cluster_nodes_table(name)
     :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}]) |> Enum.uniq()
+  end
+
+  def my_clusters(name) do
+    local_node = node()
+    table = cluster_nodes_table(name)
+    :ets.select(table, [{{:"$1", :"$2"}, [{:==, :"$2", local_node}], [:"$1"]}])
+  end
+
+  def purge_cluster_node(name, node) do
+    table = cluster_nodes_table(name)
+    :ets.match_delete(table, {:_, node})
+    :ok
   end
 
   # =====================================================================

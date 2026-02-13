@@ -3,9 +3,51 @@ defmodule Group.Replica do
 
   use GenServer
 
-  # Sharded GenServer: discovery, replication, monitoring, conflict resolution.
-  # One per shard. Registered as :"#{name}_replica_#{shard_index}".
-  # Each shard has a linked multicast_loop process for FIFO message ordering.
+  _archdoc = ~S"""
+  Sharded GenServer: peer discovery, replication, monitoring, conflict resolution.
+  One per shard. Registered as :"#{name}_replica_#{shard_index}".
+  Each shard has a linked multicast_loop process for FIFO message ordering.
+
+  ## Message Protocol
+
+  | Message                                                    | Direction | Purpose                          |
+  |------------------------------------------------------------|-----------|----------------------------------|
+  | `{:peer_connect, pid, shard, clusters}`                    | A→B       | Establish peer relationship      |
+  | `{:peer_connect_ack, pid, shard, clusters}`                | B→A       | Acknowledge peer                 |
+  | `{:cluster_state, cluster, reg_data, pg_data}`             | both      | Per-cluster data snapshot        |
+  | `{:replicate_register, cluster, key, pid, meta, time, reason}` | broadcast | Propagate registration      |
+  | `{:replicate_unregister, cluster, key, pid, meta, reason}` | broadcast | Propagate unregistration        |
+  | `{:replicate_join, cluster, key, pid, meta, time, reason}` | broadcast | Propagate join                  |
+  | `{:replicate_leave, cluster, key, pid, meta, reason}`      | broadcast | Propagate leave                 |
+  | `{:cluster_connect, cluster, pid}`                         | broadcast | Node joining named cluster       |
+  | `{:cluster_connect_ack, cluster, pid}`                     | directed  | Acknowledge cluster join         |
+  | `{:cluster_disconnect, cluster, pid}`                      | broadcast | Node leaving named cluster       |
+
+  ## Protocol Flows
+
+  ### Peer Discovery (nodeup or init)
+
+  Both sides exchange cluster lists via peer_connect/peer_connect_ack, then send
+  per-cluster cluster_state messages only for shared clusters. The nil cluster is
+  always shared (all Group peers are in it).
+
+  ### Named Cluster Join
+
+  A broadcasts cluster_connect to all peers. Peers already in that cluster respond
+  with cluster_connect_ack + cluster_state. A then sends its own cluster_state.
+
+  ### Steady-State Replication
+
+  Operations broadcast replicate_* messages to cluster members. nil cluster uses
+  remote_shards keys; named clusters use cluster_nodes ETS.
+
+  ## Cluster Membership Tracking
+
+  The nil cluster is tracked in ETS (cluster_nodes table), maintained by the
+  peer_connect protocol. Nodes are added on peer discovery and removed on
+  nodedown/shard death. This allows Group.nodes/1 to return actual Group peers
+  rather than all Erlang nodes.
+  """
 
   require Logger
 
@@ -53,6 +95,9 @@ defmodule Group.Replica do
 
     :net_kernel.monitor_nodes(true)
 
+    # Register self as nil cluster member
+    Data.add_cluster_node(name, nil, node())
+
     state = %__MODULE__{
       name: name,
       shard_index: shard_index,
@@ -67,7 +112,7 @@ defmodule Group.Replica do
     for remote_node <- Node.list() do
       send(
         {shard_registered_name, remote_node},
-        {:discover, self(), shard_index, Data.all_clusters(name)}
+        {:peer_connect, self(), shard_index, Data.my_clusters(name)}
       )
     end
 
@@ -91,7 +136,7 @@ defmodule Group.Replica do
         broadcast_to_cluster(
           state,
           cluster,
-          {:sync_register, cluster, key, pid, meta, time, :register}
+          {:replicate_register, cluster, key, pid, meta, time, :register}
         )
 
         Group.__dispatch__(name, :registered, key, pid, meta, %{
@@ -110,7 +155,7 @@ defmodule Group.Replica do
         broadcast_to_cluster(
           state,
           cluster,
-          {:sync_register, cluster, key, pid, meta, time, :update}
+          {:replicate_register, cluster, key, pid, meta, time, :update}
         )
 
         Group.__dispatch__(name, :registered, key, pid, meta, %{
@@ -136,7 +181,7 @@ defmodule Group.Replica do
         broadcast_to_cluster(
           state,
           cluster,
-          {:sync_unregister, cluster, key, pid, meta, :unregister}
+          {:replicate_unregister, cluster, key, pid, meta, :unregister}
         )
 
         Group.__dispatch__(name, :unregistered, key, pid, meta, %{
@@ -167,7 +212,11 @@ defmodule Group.Replica do
         mref = monitor_pid(state, pid)
         Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-        broadcast_to_cluster(state, cluster, {:sync_join, cluster, key, pid, meta, time, :join})
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_join, cluster, key, pid, meta, time, :join}
+        )
 
         Group.__dispatch__(name, :joined, key, pid, meta, %{
           previous_meta: nil,
@@ -181,7 +230,11 @@ defmodule Group.Replica do
         time = System.system_time()
         Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-        broadcast_to_cluster(state, cluster, {:sync_join, cluster, key, pid, meta, time, :update})
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_join, cluster, key, pid, meta, time, :update}
+        )
 
         Group.__dispatch__(name, :joined, key, pid, meta, %{
           previous_meta: old_meta,
@@ -203,7 +256,11 @@ defmodule Group.Replica do
         Data.pg_delete(name, shard, cluster, key, pid)
         state = maybe_demonitor_pid(state, name, shard, pid)
 
-        broadcast_to_cluster(state, cluster, {:sync_leave, cluster, key, pid, meta, :leave})
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_leave, cluster, key, pid, meta, :leave}
+        )
 
         Group.__dispatch__(name, :left, key, pid, meta, %{
           reason: :leave,
@@ -255,11 +312,11 @@ defmodule Group.Replica do
   end
 
   # =====================================================================
-  # Sync receive (handle_info)
+  # Replication receive (handle_info)
   # =====================================================================
 
   @impl true
-  def handle_info({:sync_register, cluster, key, pid, meta, time, reason}, state) do
+  def handle_info({:replicate_register, cluster, key, pid, meta, time, reason}, state) do
     %{name: name, shard_index: shard} = state
 
     case Data.registry_lookup(name, shard, cluster, key) do
@@ -325,7 +382,7 @@ defmodule Group.Replica do
     end
   end
 
-  def handle_info({:sync_unregister, cluster, key, pid, meta, reason}, state) do
+  def handle_info({:replicate_unregister, cluster, key, pid, meta, reason}, state) do
     %{name: name, shard_index: shard} = state
 
     case Data.registry_lookup(name, shard, cluster, key) do
@@ -345,7 +402,7 @@ defmodule Group.Replica do
     end
   end
 
-  def handle_info({:sync_join, cluster, key, pid, meta, time, reason}, state) do
+  def handle_info({:replicate_join, cluster, key, pid, meta, time, reason}, state) do
     %{name: name, shard_index: shard} = state
 
     case Data.pg_lookup(name, shard, cluster, key, pid) do
@@ -374,7 +431,7 @@ defmodule Group.Replica do
     end
   end
 
-  def handle_info({:sync_leave, cluster, key, pid, meta, reason}, state) do
+  def handle_info({:replicate_leave, cluster, key, pid, meta, reason}, state) do
     %{name: name, shard_index: shard} = state
 
     case Data.pg_lookup(name, shard, cluster, key, pid) do
@@ -395,83 +452,108 @@ defmodule Group.Replica do
   end
 
   # =====================================================================
-  # Discovery protocol
+  # Peer discovery protocol
   # =====================================================================
 
-  def handle_info({:discover, remote_pid, remote_shard_index, _remote_clusters}, state)
-      when remote_shard_index == state.shard_index do
-    %{name: name, shard_index: shard, multicast_pid: multicast_pid} = state
-    remote_node = node(remote_pid)
-
-    if Map.has_key?(state.remote_shards, remote_node) do
-      # Already know about this node, send ack with our data
-      {reg_data, pg_data} = Data.all_local_data(name, shard)
-      clusters = Data.all_clusters(name)
-
-      send(
-        multicast_pid,
-        {:send_one, remote_node, {:ack_sync, self(), shard, clusters, reg_data, pg_data}}
-      )
-
-      {:noreply, state}
-    else
-      # New node, monitor and exchange data
-      Process.monitor(remote_pid)
-
-      {reg_data, pg_data} = Data.all_local_data(name, shard)
-      clusters = Data.all_clusters(name)
-
-      send(
-        multicast_pid,
-        {:send_one, remote_node, {:ack_sync, self(), shard, clusters, reg_data, pg_data}}
-      )
-
-      state = %{state | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid)}
-      {:noreply, state}
-    end
-  end
-
-  def handle_info({:discover, _remote_pid, _other_shard, _clusters}, state) do
-    # Wrong shard index, ignore
-    {:noreply, state}
-  end
-
-  def handle_info(
-        {:ack_sync, remote_pid, remote_shard_index, _remote_clusters, reg_data, pg_data},
-        state
-      )
+  def handle_info({:peer_connect, remote_pid, remote_shard_index, remote_clusters}, state)
       when remote_shard_index == state.shard_index do
     %{name: name, shard_index: shard} = state
     remote_node = node(remote_pid)
 
-    already_known = Map.has_key?(state.remote_shards, remote_node)
+    # Add remote node to nil cluster (all Group peers are in nil)
+    Data.add_cluster_node(name, nil, remote_node)
 
-    # Merge remote data into local ETS
-    state = merge_remote_data(state, reg_data, pg_data, remote_node)
+    # Compute shared clusters
+    my_clusters = Data.my_clusters(name)
+    shared = compute_shared_clusters(my_clusters, remote_clusters)
+
+    # Add remote node to shared named clusters
+    for cluster <- shared, cluster != nil do
+      Data.add_cluster_node(name, cluster, remote_node)
+    end
+
+    already_known = Map.has_key?(state.remote_shards, remote_node)
 
     state =
       if already_known do
         state
       else
-        # New node — monitor and send our data back
         Process.monitor(remote_pid)
-
-        {local_reg, local_pg} = Data.all_local_data(name, shard)
-        clusters = Data.all_clusters(name)
-
-        send(
-          state.multicast_pid,
-          {:send_one, remote_node, {:ack_sync, self(), shard, clusters, local_reg, local_pg}}
-        )
-
         %{state | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid)}
       end
+
+    # Send ack with our cluster list
+    send(
+      state.multicast_pid,
+      {:send_one, remote_node, {:peer_connect_ack, self(), shard, my_clusters}}
+    )
+
+    # Send cluster_state for each shared cluster
+    for cluster <- shared do
+      send_cluster_state(state, cluster, remote_node)
+    end
 
     {:noreply, state}
   end
 
-  def handle_info({:ack_sync, _remote_pid, _other_shard, _clusters, _reg, _pg}, state) do
+  def handle_info({:peer_connect, _remote_pid, _other_shard, _clusters}, state) do
+    # Wrong shard index, ignore
     {:noreply, state}
+  end
+
+  def handle_info({:peer_connect_ack, remote_pid, remote_shard_index, remote_clusters}, state)
+      when remote_shard_index == state.shard_index do
+    %{name: name} = state
+    remote_node = node(remote_pid)
+
+    # Add remote node to nil cluster
+    Data.add_cluster_node(name, nil, remote_node)
+
+    # Compute shared clusters
+    my_clusters = Data.my_clusters(name)
+    shared = compute_shared_clusters(my_clusters, remote_clusters)
+
+    # Add remote node to shared named clusters
+    for cluster <- shared, cluster != nil do
+      Data.add_cluster_node(name, cluster, remote_node)
+    end
+
+    already_known = Map.has_key?(state.remote_shards, remote_node)
+
+    state =
+      if already_known do
+        state
+      else
+        Process.monitor(remote_pid)
+        %{state | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid)}
+      end
+
+    # Send cluster_state for each shared cluster
+    for cluster <- shared do
+      send_cluster_state(state, cluster, remote_node)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:peer_connect_ack, _remote_pid, _other_shard, _clusters}, state) do
+    {:noreply, state}
+  end
+
+  # =====================================================================
+  # Cluster state (unified handler for peer discovery + cluster join)
+  # =====================================================================
+
+  def handle_info({:cluster_state, cluster, reg_data, pg_data}, state) do
+    %{name: name} = state
+
+    # Guard: skip merge for named clusters we're not a member of
+    if cluster_member?(name, cluster) do
+      state = merge_remote_cluster_data(state, cluster, reg_data, pg_data)
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
   end
 
   # =====================================================================
@@ -479,7 +561,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:cluster_connect, cluster, remote_pid}, state) do
-    %{name: name, shard_index: shard} = state
+    %{name: name} = state
     remote_node = node(remote_pid)
 
     if node() in Data.cluster_nodes(name, cluster) do
@@ -493,14 +575,7 @@ defmodule Group.Replica do
       )
 
       # Send our local data for this cluster to the new member
-      {reg_data, pg_data} = Data.local_data(name, shard, cluster)
-
-      if length(reg_data) > 0 or length(pg_data) > 0 do
-        send(
-          state.multicast_pid,
-          {:send_one, remote_node, {:cluster_sync, cluster, reg_data, pg_data}}
-        )
-      end
+      send_cluster_state(state, cluster, remote_node)
     end
 
     {:noreply, state}
@@ -525,11 +600,6 @@ defmodule Group.Replica do
     {:noreply, state}
   end
 
-  def handle_info({:cluster_sync, cluster, reg_data, pg_data}, state) do
-    state = merge_remote_cluster_data(state, cluster, reg_data, pg_data)
-    {:noreply, state}
-  end
-
   # =====================================================================
   # Node up/down
   # =====================================================================
@@ -540,7 +610,7 @@ defmodule Group.Replica do
 
     send(
       {shard_registered_name, remote_node},
-      {:discover, self(), shard, Data.all_clusters(name)}
+      {:peer_connect, self(), shard, Data.my_clusters(name)}
     )
 
     {:noreply, state}
@@ -548,6 +618,9 @@ defmodule Group.Replica do
 
   def handle_info({:nodedown, dead_node}, state) do
     %{name: name, shard_index: shard} = state
+
+    # Remove all cluster memberships for the dead node
+    Data.purge_cluster_node(name, dead_node)
 
     # Purge all data from the dead node
     {purged_reg, purged_pg} = Data.purge_node(name, shard, dead_node)
@@ -581,7 +654,8 @@ defmodule Group.Replica do
     remote_node = node(pid)
 
     if remote_node != node() and Map.get(state.remote_shards, remote_node) == pid do
-      # Remote shard process died — purge its node data
+      # Remote shard process died — purge its cluster memberships and node data
+      Data.purge_cluster_node(name, remote_node)
       {purged_reg, purged_pg} = Data.purge_node(name, shard, remote_node)
 
       for {cluster, key, dead_pid, meta, _time} <- purged_reg do
@@ -623,7 +697,7 @@ defmodule Group.Replica do
             broadcast_to_cluster(
               state,
               cluster,
-              {:sync_unregister, cluster, key, pid, meta, reason}
+              {:replicate_unregister, cluster, key, pid, meta, reason}
             )
 
             Group.__dispatch__(name, :unregistered, key, pid, meta, %{
@@ -634,7 +708,11 @@ defmodule Group.Replica do
           {:pg, cluster, key, ^pid, meta, _time, _entry_node} ->
             Data.pg_delete(name, shard, cluster, key, pid)
 
-            broadcast_to_cluster(state, cluster, {:sync_leave, cluster, key, pid, meta, reason})
+            broadcast_to_cluster(
+              state,
+              cluster,
+              {:replicate_leave, cluster, key, pid, meta, reason}
+            )
 
             Group.__dispatch__(name, :left, key, pid, meta, %{
               reason: reason,
@@ -765,59 +843,6 @@ defmodule Group.Replica do
     %{state | monitors: monitors}
   end
 
-  defp merge_remote_data(state, reg_data, pg_data, remote_node) do
-    %{name: name, shard_index: shard} = state
-
-    state =
-      Enum.reduce(reg_data, state, fn {cluster, key, pid, meta, time}, acc ->
-        if shard_index_for(cluster, key, state.num_shards) == shard and
-             cluster_member?(name, cluster) do
-          case Data.registry_lookup(name, shard, cluster, key) do
-            nil ->
-              mref = monitor_pid(acc, pid)
-              Data.registry_insert(name, shard, cluster, key, pid, meta, time, remote_node)
-              put_monitor(acc, pid, mref)
-
-            {_existing_pid, _meta, existing_time, _node} when time > existing_time ->
-              mref = monitor_pid(acc, pid)
-              Data.registry_insert(name, shard, cluster, key, pid, meta, time, remote_node)
-              put_monitor(acc, pid, mref)
-
-            _ ->
-              acc
-          end
-        else
-          acc
-        end
-      end)
-
-    Enum.reduce(pg_data, state, fn {cluster, key, pid, meta, time}, acc ->
-      if shard_index_for(cluster, key, state.num_shards) == shard and
-           cluster_member?(name, cluster) do
-        case Data.pg_lookup(name, shard, cluster, key, pid) do
-          nil ->
-            mref = monitor_pid(acc, pid)
-            Data.pg_insert(name, shard, cluster, key, pid, meta, time, remote_node)
-            put_monitor(acc, pid, mref)
-
-          {_meta, existing_time, _node} when time > existing_time ->
-            mref = monitor_pid(acc, pid)
-            Data.pg_insert(name, shard, cluster, key, pid, meta, time, remote_node)
-            put_monitor(acc, pid, mref)
-
-          _ ->
-            acc
-        end
-      else
-        acc
-      end
-    end)
-  end
-
-  # Check if the local node is a member of a cluster.
-  # Default cluster (nil) includes all nodes.
-  defp cluster_member?(_name, nil), do: true
-
   defp cluster_member?(name, cluster) do
     node() in Data.cluster_nodes(name, cluster)
   end
@@ -834,6 +859,11 @@ defmodule Group.Replica do
               Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
               put_monitor(acc, pid, mref)
 
+            {_existing_pid, _meta, existing_time, _node} when time > existing_time ->
+              mref = monitor_pid(acc, pid)
+              Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+              put_monitor(acc, pid, mref)
+
             _ ->
               acc
           end
@@ -846,6 +876,11 @@ defmodule Group.Replica do
       if shard_index_for(cluster, key, state.num_shards) == shard do
         case Data.pg_lookup(name, shard, cluster, key, pid) do
           nil ->
+            mref = monitor_pid(acc, pid)
+            Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+            put_monitor(acc, pid, mref)
+
+          {_meta, existing_time, _node} when time > existing_time ->
             mref = monitor_pid(acc, pid)
             Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
             put_monitor(acc, pid, mref)
@@ -929,7 +964,7 @@ defmodule Group.Replica do
         broadcast_to_cluster(
           state,
           cluster,
-          {:sync_register, cluster, key, local_pid, local_meta, time, :resolve_conflict}
+          {:replicate_register, cluster, key, local_pid, local_meta, time, :resolve_conflict}
         )
 
         state
@@ -942,7 +977,7 @@ defmodule Group.Replica do
         broadcast_to_cluster(
           state,
           cluster,
-          {:sync_unregister, cluster, key, local_pid, local_meta, :resolve_conflict}
+          {:replicate_unregister, cluster, key, local_pid, local_meta, :resolve_conflict}
         )
 
         Group.__dispatch__(name, :unregistered, key, local_pid, local_meta, %{
@@ -967,19 +1002,29 @@ defmodule Group.Replica do
     winner_pid
   end
 
-  defp send_cluster_data_to_nodes(state, cluster, target_nodes) do
+  defp send_cluster_state(state, cluster, target_node) do
     %{name: name, shard_index: shard, multicast_pid: multicast_pid} = state
 
     {reg_data, pg_data} = Data.local_data(name, shard, cluster)
 
-    if length(reg_data) > 0 or length(pg_data) > 0 do
-      for target_node <- target_nodes, target_node != node() do
-        send(
-          multicast_pid,
-          {:send_one, target_node, {:cluster_sync, cluster, reg_data, pg_data}}
-        )
-      end
+    if reg_data != [] or pg_data != [] do
+      send(
+        multicast_pid,
+        {:send_one, target_node, {:cluster_state, cluster, reg_data, pg_data}}
+      )
     end
+  end
+
+  defp send_cluster_data_to_nodes(state, cluster, target_nodes) do
+    for target_node <- target_nodes, target_node != node() do
+      send_cluster_state(state, cluster, target_node)
+    end
+  end
+
+  defp compute_shared_clusters(my_clusters, remote_clusters) do
+    my_set = MapSet.new(my_clusters)
+    remote_set = MapSet.new(remote_clusters)
+    MapSet.intersection(my_set, remote_set) |> MapSet.to_list()
   end
 
   defp purge_cluster_entries(name, shard, cluster, target_node) do
