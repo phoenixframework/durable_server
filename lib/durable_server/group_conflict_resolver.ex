@@ -2,7 +2,7 @@ defmodule DurableServer.GroupConflictResolver do
   @moduledoc false
 
   _ = """
-  DurableServer-specific conflict resolution for syn registry conflicts.
+  DurableServer-specific conflict resolution for group registry conflicts.
 
   When a network partition heals or race conditions occur, multiple processes may
   have claimed the same key. This resolver handles conflicts by:

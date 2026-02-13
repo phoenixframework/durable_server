@@ -45,7 +45,7 @@ defmodule DurableServer.LifecycleManager do
   ### Discovery Process
   1. Write node heartbeat and refresh heartbeat cache
   2. List all DurableServer objects from ObjectStore (paginated with continuation tokens)
-  3. Check health using check_server_health/2 (uses syn + heartbeat cache)
+  3. Check health using check_server_health/2 (uses group + heartbeat cache)
   4. Apply consistent hashing to determine which servers this node should handle
   5. Detect orphaned servers (any node can claim these regardless of hash assignment)
   6. Attempt atomic restart claiming via DurableServer.claim_restart_attempt/2
@@ -81,7 +81,7 @@ defmodule DurableServer.LifecycleManager do
   ### Network Partitions
   - Multiple nodes may attempt restart during partitions
   - Atomic ObjectStore operations ensure only one succeeds
-  - :syn registry eventual consistency provides healing after partition resolution
+  - Group registry eventual consistency provides healing after partition resolution
 
   ### Orphaned Servers
   Any server is considered orphaned and claimable by any node if:
@@ -1235,8 +1235,8 @@ defmodule DurableServer.LifecycleManager do
       true ->
         # before taking slow path of checking locks via rpc, first see if server is alive in syn
         case Group.lookup(supervisor_name, meta.key, extract_meta: & &1) do
-          {pid, syn_meta} when is_pid(pid) ->
-            case syn_meta do
+          {pid, registry_meta} when is_pid(pid) ->
+            case registry_meta do
               %{node_ref: node_ref} ->
                 if to_string(node(pid)) == meta.node_str and node_ref == meta.node_ref do
                   :healthy
@@ -1291,7 +1291,7 @@ defmodule DurableServer.LifecycleManager do
   `{:error, {:limit_reached, reason, details}}`
   if any limit is exceeded.
 
-  This function is pure ETS/syn reads with no blocking operations.
+  This function is pure ETS/Group reads with no blocking operations.
 
   ## Options
 

@@ -213,7 +213,7 @@ defmodule DurableServer.Supervisor do
   def lookup(sup_name, key) when is_atom(sup_name) and is_binary(key) do
     case Group.lookup(sup_name, key, extract_meta: & &1) do
       {pid, meta} when is_pid(pid) ->
-        # handle case where node-local DOWN from a caller races syn cleanup
+        # handle case where node-local DOWN from a caller races group cleanup
         if node(pid) == Node.self() && !Process.alive?(pid) do
           nil
         else
@@ -622,7 +622,7 @@ defmodule DurableServer.Supervisor do
                 "start_child expects a map with :key field, got: #{inspect(init_arg)}"
       end
 
-    # Check syn first to avoid spawning a process that will just fail at registration
+    # Check group first to avoid spawning a process that will just fail at registration
     case lookup(supervisor, key) do
       {pid, meta} when node(pid) == node() ->
         # Local pid - verify it's actually alive before returning already_started
@@ -678,7 +678,7 @@ defmodule DurableServer.Supervisor do
             # wait up to 100ms * max retries (2.5s) for metadata to be synced before giving up on retries
             if retries > 0, do: Process.sleep(250)
             # we raced a start, retry start child to grab raced pid's metadata
-            # node-local syn meta will be immediately there, but remote node meta could still be in flight (or pid is already DOWN)
+            # node-local group meta will be immediately there, but remote node meta could still be in flight (or pid is already DOWN)
             # if we find there is nothing in the registry, we RPC out to get remote node's meta.
             # if we find nothing there, we retry the start + lookup combo which will either get
             # the already started pid and its now synced metadata, or we end up starting ourselves up to @max_start_child_tries tries
@@ -690,8 +690,8 @@ defmodule DurableServer.Supervisor do
               nil ->
                 remote_node = node(pid)
 
-                # If we raced syn registration, immediately try to rpc out to the owning node for its node-local
-                # syn metadata - as long as the node appears healthy.
+                # If we raced group registration, immediately try to rpc out to the owning node for its node-local
+                # group metadata - as long as the node appears healthy.
                 #
                 # If the node does not appear healthy, we retry the start
                 case LifecycleManager.lookup_node_health(%{

@@ -538,7 +538,7 @@ defmodule DurableServerTest do
     end
 
     @tag :durable_server
-    test "callbacks can update syn registry metadata via :meta option", %{
+    test "callbacks can update group registry metadata via :meta option", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
     } do
@@ -552,14 +552,14 @@ defmodule DurableServerTest do
           {TestServer, %{key: key, meta: initial_meta}}
         )
 
-      # Verify initial metadata is set in syn registry
+      # Verify initial metadata is set in group registry
       assert {^pid, ^initial_meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
 
       # Update metadata via handle_call with meta option
       updated_meta = %{user_count: 5, status: "processing"}
       assert :ok = GenServer.call(pid, {:update_meta_test, updated_meta})
 
-      # Verify metadata was updated in syn registry
+      # Verify metadata was updated in group registry
       assert {^pid, ^updated_meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
 
       # Test with handle_cast and meta option

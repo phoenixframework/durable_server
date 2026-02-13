@@ -233,7 +233,7 @@ defmodule DurableServer.LifecycleTest do
     end
   end
 
-  describe "syn registration" do
+  describe "group registration" do
     test "server registers and unregisters from syn", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
@@ -500,13 +500,11 @@ defmodule DurableServer.LifecycleTest do
       # Start two managers that will compete for restart (use spawn to avoid name conflicts)
       {:ok, manager1} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule,
           node_module: DurableServer.LifecycleTest.MockNodeModule
         )
 
       {:ok, manager2} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule,
           node_module: DurableServer.LifecycleTest.MockNodeModule
         )
 
@@ -554,7 +552,6 @@ defmodule DurableServer.LifecycleTest do
 
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule,
           node_module: DurableServer.LifecycleTest.MockNodeModule
         )
 
@@ -620,9 +617,7 @@ defmodule DurableServer.LifecycleTest do
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Trigger multiple discovery rounds to simulate repeated failures
       for _ <- 1..3 do
@@ -671,9 +666,7 @@ defmodule DurableServer.LifecycleTest do
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Should handle corrupted metadata gracefully
       send(manager_pid, :discover_and_restart)
@@ -755,9 +748,7 @@ defmodule DurableServer.LifecycleTest do
       end
 
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Should handle mixed object states gracefully
       send(manager_pid, :discover_and_restart)
@@ -1007,7 +998,7 @@ defmodule DurableServer.LifecycleTest do
       GenServer.stop(manager_pid)
     end
 
-    test "syn registry empty bypass works correctly", %{
+    test "group registry empty bypass works correctly", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
       config: config,
@@ -1017,11 +1008,9 @@ defmodule DurableServer.LifecycleTest do
       full_config = Map.merge(config, %{prefix: "test/"})
 
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, full_config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, full_config)
 
-      # Create a test object that should be skipped due to empty syn registry
+      # Create a test object that should be skipped due to empty group registry
       key = "empty-syn-test-#{DurableServer.UUID.uuid4()}"
 
       meta_attrs = %{
@@ -1052,8 +1041,7 @@ defmodule DurableServer.LifecycleTest do
     } do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          node_module: DurableServer.LifecycleTest.MockNodeModule,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
+          node_module: DurableServer.LifecycleTest.MockNodeModule
         )
 
       # Create test object with unreachable node
@@ -1086,9 +1074,7 @@ defmodule DurableServer.LifecycleTest do
       circuit_breaker: _circuit_breaker
     } do
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Create test object with crashed status
       key = "crashed-status-test-#{DurableServer.UUID.uuid4()}"
@@ -1120,9 +1106,7 @@ defmodule DurableServer.LifecycleTest do
       circuit_breaker: _circuit_breaker
     } do
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Create test object with very old heartbeat
       key = "old-heartbeat-test-#{DurableServer.UUID.uuid4()}"
@@ -1156,9 +1140,7 @@ defmodule DurableServer.LifecycleTest do
       circuit_breaker: _circuit_breaker
     } do
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Create test object with stopped_permanent status
       key = "stopped-permanent-test-#{DurableServer.UUID.uuid4()}"
@@ -1191,9 +1173,7 @@ defmodule DurableServer.LifecycleTest do
       circuit_breaker: _circuit_breaker
     } do
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Create test object with expired restart attempt
       key = "expired-ttl-test-#{DurableServer.UUID.uuid4()}"
@@ -1221,7 +1201,7 @@ defmodule DurableServer.LifecycleTest do
       GenServer.stop(manager_pid)
     end
 
-    test "syn registry stale entries vs metadata mismatch", %{
+    test "group registry stale entries vs metadata mismatch", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
       config: config,
@@ -1229,13 +1209,12 @@ defmodule DurableServer.LifecycleTest do
     } do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockStaleSynModule,
           node_module: DurableServer.LifecycleTest.MockNodeModule
         )
 
       key = "stale-syn-test-#{DurableServer.UUID.uuid4()}"
 
-      # Create object with metadata that doesn't match syn registry
+      # Create object with metadata that doesn't match group registry
       meta_attrs = %{
         status: :running,
         node_str: to_string(Node.self()),
@@ -1287,7 +1266,6 @@ defmodule DurableServer.LifecycleTest do
 
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule,
           node_module: DurableServer.LifecycleTest.MockNodeModule
         )
 
@@ -1319,7 +1297,6 @@ defmodule DurableServer.LifecycleTest do
     } do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule,
           # Always returns :pong
           node_module: DurableServer.LifecycleTest.MockNodeModule
         )
@@ -1372,9 +1349,7 @@ defmodule DurableServer.LifecycleTest do
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       send(manager_pid, :discover_and_restart)
 
@@ -1399,9 +1374,7 @@ defmodule DurableServer.LifecycleTest do
       circuit_breaker: _circuit_breaker
     } do
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockChangingSynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       key = "changing-state-test-#{DurableServer.UUID.uuid4()}"
 
@@ -1441,9 +1414,7 @@ defmodule DurableServer.LifecycleTest do
       circuit_breaker: _circuit_breaker
     } do
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Trigger discovery and wait for completion
       send(manager_pid, :discover_and_restart)
@@ -1526,9 +1497,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Start LifecycleManager to trigger heartbeat refresh and cleanup
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, test_config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, test_config)
 
       # Trigger heartbeat cycle which should clean up dead nodes
       send(manager_pid, :heartbeat)
@@ -1574,9 +1543,7 @@ defmodule DurableServer.LifecycleTest do
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Trigger discovery
       send(manager_pid, :discover_and_restart)
@@ -1616,9 +1583,7 @@ defmodule DurableServer.LifecycleTest do
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
       {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          syn_module: DurableServer.LifecycleTest.MockEmptySynModule
-        )
+        start_standalone_lifecycle_manager(supervisor_name, config)
 
       # Trigger discovery
       send(manager_pid, :discover_and_restart)
@@ -1631,42 +1596,6 @@ defmodule DurableServer.LifecycleTest do
       assert data.meta.status == :permanently_crashed
 
       GenServer.stop(manager_pid)
-    end
-  end
-end
-
-# Mock modules for testing - defined outside the test module for proper scoping
-defmodule DurableServer.LifecycleTest.MockNodeModule do
-  def self(), do: :test_node@test
-  def ping(:unreachable@test), do: :pang
-  def ping(_), do: :pong
-end
-
-defmodule DurableServer.LifecycleTest.MockEmptySynModule do
-  # Pretend syn registry is populated
-  def registry_count(_), do: 1
-  # But no entries found
-  def lookup(_, _), do: :undefined
-end
-
-defmodule DurableServer.LifecycleTest.MockStaleSynModule do
-  def registry_count(_), do: 1
-
-  def lookup(_, _key) do
-    # Return stale entry with different node_ref than metadata
-    {self(), [{:node, Node.self()}, {:node_ref, "stale-node-ref"}]}
-  end
-end
-
-defmodule DurableServer.LifecycleTest.MockChangingSynModule do
-  def registry_count(_), do: 1
-
-  def lookup(_, _key) do
-    # Simulate registry that sometimes has entries, sometimes doesn't
-    if :rand.uniform(2) == 1 do
-      {self(), [{:node, Node.self()}, {:node_ref, "changing-ref"}]}
-    else
-      :undefined
     end
   end
 end
