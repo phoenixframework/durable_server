@@ -124,10 +124,10 @@ defmodule Group.TestCluster do
   end
 
   @doc "Spawn a process on a remote node that monitors a pattern and forwards events"
-  def spawn_monitor_forwarder(node, name, pattern, target_pid) do
+  def spawn_monitor_forwarder(node, name, pattern, target_pid, opts \\ []) do
     :erpc.call(node, fn ->
       spawn(fn ->
-        :ok = Group.monitor(name, pattern)
+        :ok = Group.monitor(name, pattern, opts)
         send(target_pid, {:monitor_ready, self()})
         forward_events(target_pid)
       end)

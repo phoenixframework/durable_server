@@ -654,48 +654,319 @@ defmodule Group.DistributedTest do
     end
   end
 
-  describe "cluster disconnect with active members" do
-    test "remote nodes purge entries when node disconnects from cluster" do
+  describe "cluster disconnect" do
+    test "purges both registry and pg entries on remote node" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
       [{_, node_a}, {_, node_b}] = peers
-      name = :"dist_cluster_disc_#{System.unique_integer([:positive])}"
+      name = :"disc_reg_pg_#{System.unique_integer([:positive])}"
       opts = [name: name, shards: 2]
 
       start_group_on_peers(peers, opts)
 
-      # Connect A and B to "game" cluster
       TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
       TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
 
-      # Wait for cluster connectivity to be established (ack exchange)
       TestCluster.assert_eventually(fn ->
-        nodes_a = TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
-        nodes_b = TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
-        length(nodes_a) >= 1 and length(nodes_b) >= 1
+        length(TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])) >= 2
       end)
 
-      # Join "room/1" on A in "game" cluster
-      TestCluster.spawn_join(node_a, name, "room/1", %{player: :a}, cluster: "game")
+      # Register AND join on A in "game"
+      TestCluster.spawn_register_in_cluster(node_a, name, "player/1", %{r: true}, "game")
+      TestCluster.spawn_join(node_a, name, "room/1", %{j: true}, cluster: "game")
 
-      # Verify B sees the member
+      # B sees both
+      TestCluster.assert_eventually(fn ->
+        lookup = TestCluster.rpc!(node_b, Group, :lookup, [name, "player/1", [cluster: "game"]])
+        members = TestCluster.rpc!(node_b, Group, :members, [name, "room/1", [cluster: "game"]])
+        lookup != nil and length(members) == 1
+      end)
+
+      # A disconnects
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+
+      # B should see neither
       TestCluster.assert_eventually(
         fn ->
+          lookup = TestCluster.rpc!(node_b, Group, :lookup, [name, "player/1", [cluster: "game"]])
           members = TestCluster.rpc!(node_b, Group, :members, [name, "room/1", [cluster: "game"]])
-          length(members) == 1
+          lookup == nil and members == []
+        end,
+        timeout: 5000
+      )
+    end
+
+    test "removes disconnecting node from remote cluster_nodes" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"disc_nodes_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        nodes_b = TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+        node_a in nodes_b
+      end)
+
+      # A disconnects
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+
+      # B should no longer list A in "game" cluster
+      TestCluster.assert_eventually(
+        fn ->
+          nodes_b = TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+          node_a not in nodes_b
         end,
         timeout: 5000
       )
 
-      # A disconnects from "game" cluster
+      # A should report not connected
+      refute TestCluster.rpc!(node_a, Group, :connected?, [name, "game"])
+    end
+
+    test "replication stops after disconnect" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"disc_no_repl_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        length(TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])) >= 2
+      end)
+
+      # A disconnects from "game"
       TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
 
-      # B should purge A's entries for "game" cluster
+      # Wait for disconnect to propagate
       TestCluster.assert_eventually(
         fn ->
-          members = TestCluster.rpc!(node_b, Group, :members, [name, "room/1", [cluster: "game"]])
-          members == []
+          nodes_b = TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+          node_a not in nodes_b
+        end,
+        timeout: 5000
+      )
+
+      # B registers in "game" — A should NOT receive it
+      TestCluster.spawn_register_in_cluster(node_b, name, "new_key", %{from: :b}, "game")
+
+      # Verify B sees its own registration
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "new_key", [cluster: "game"]]) != nil
+      end)
+
+      # Give any stray replication time to arrive
+      Process.sleep(300)
+
+      # A should NOT see B's entry (not in cluster anymore)
+      assert TestCluster.rpc!(node_a, Group, :lookup, [name, "new_key", [cluster: "game"]]) == nil
+    end
+
+    test "fires events with reason :cluster_disconnect" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"disc_events_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        length(TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])) >= 2
+      end)
+
+      # Monitor on B for "game" cluster events
+      TestCluster.spawn_monitor_forwarder(node_b, name, :all, self(), cluster: "game")
+      assert_receive {:monitor_ready, _}, 5000
+
+      # A joins in "game"
+      TestCluster.spawn_join(node_a, name, "room/1", %{player: :a}, cluster: "game")
+      assert_receive {:got_event, %Group.Event{type: :joined, key: "room/1"}}, 5000
+
+      # A disconnects
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+
+      # B should receive :left event with reason :cluster_disconnect
+      assert_receive {:got_event,
+                      %Group.Event{type: :left, key: "room/1", reason: :cluster_disconnect}},
+                     5000
+    end
+
+    test "disconnect then re-connect works cleanly" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"disc_reconnect_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        length(TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])) >= 2
+      end)
+
+      # A registers in "game"
+      TestCluster.spawn_register_in_cluster(node_a, name, "key/1", %{v: 1}, "game")
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "key/1", [cluster: "game"]]) != nil
+      end)
+
+      # A disconnects
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_b, Group, :lookup, [name, "key/1", [cluster: "game"]]) == nil
+        end,
+        timeout: 5000
+      )
+
+      # A re-connects
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(
+        fn ->
+          nodes_b = TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+          node_a in nodes_b
+        end,
+        timeout: 5000
+      )
+
+      # A registers new key
+      TestCluster.spawn_register_in_cluster(node_a, name, "key/2", %{v: 2}, "game")
+
+      # B should see the new key
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_b, Group, :lookup, [name, "key/2", [cluster: "game"]]) != nil
+        end,
+        timeout: 5000
+      )
+    end
+
+    test "disconnect is idempotent for non-member cluster" do
+      peers = TestCluster.start_peers(1)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}] = peers
+      name = :"disc_idempotent_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      TestCluster.start_group(node_a, opts)
+
+      # Disconnect from a cluster we never joined — should not crash
+      assert TestCluster.rpc!(node_a, Group, :disconnect, [name, "nonexistent"]) == :ok
+      # Do it again
+      assert TestCluster.rpc!(node_a, Group, :disconnect, [name, "nonexistent"]) == :ok
+    end
+
+    test "nodedown after disconnect cleans up all data" do
+      peers = TestCluster.start_peers(2)
+
+      [{_, node_a}, {peer_b_pid, node_b}] = peers
+      name = :"disc_then_down_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        length(TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])) >= 2
+      end)
+
+      # B registers in both nil and "game" clusters
+      TestCluster.spawn_register(node_b, name, "nil_key", %{cluster: nil})
+      TestCluster.spawn_register_in_cluster(node_b, name, "game_key", %{cluster: :game}, "game")
+
+      # A sees both
+      TestCluster.assert_eventually(fn ->
+        nil_lookup = TestCluster.rpc!(node_a, Group, :lookup, [name, "nil_key"])
+
+        game_lookup =
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "game_key", [cluster: "game"]])
+
+        nil_lookup != nil and game_lookup != nil
+      end)
+
+      # B disconnects from "game"
+      TestCluster.rpc!(node_b, Group, :disconnect, [name, "game"])
+
+      # A should see game_key gone but nil_key still there
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "game_key", [cluster: "game"]]) == nil
+        end,
+        timeout: 5000
+      )
+
+      assert TestCluster.rpc!(node_a, Group, :lookup, [name, "nil_key"]) != nil
+
+      # Now B crashes
+      :peer.stop(peer_b_pid)
+
+      # A should clean up nil_key too
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "nil_key"]) == nil
+        end,
+        timeout: 5000
+      )
+
+      [{peer_a_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_a end)
+      on_exit(fn -> :peer.stop(peer_a_pid) end)
+    end
+
+    test "empty cluster removed on last disconnect" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"disc_empty_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        length(TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])) >= 2
+      end)
+
+      # Both disconnect
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :disconnect, [name, "game"])
+
+      # "game" should not appear in all_clusters on either node
+      TestCluster.assert_eventually(
+        fn ->
+          clusters_a = TestCluster.rpc!(node_a, Group.Replica.Data, :all_clusters, [name])
+          clusters_b = TestCluster.rpc!(node_b, Group.Replica.Data, :all_clusters, [name])
+          "game" not in clusters_a and "game" not in clusters_b
         end,
         timeout: 5000
       )

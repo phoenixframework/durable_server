@@ -171,9 +171,8 @@ defmodule Group.Replica do
 
         {:reply, :ok, put_monitor(state, pid, mref)}
 
-      {existing_pid, _existing_meta, _time, _node} when existing_pid == pid ->
+      {^pid, old_meta, _time, _node} ->
         # Same pid re-registering — update metadata
-        {_, old_meta, _, _} = Data.registry_lookup(name, shard, cluster, key)
         time = System.system_time()
         Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
@@ -335,7 +334,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   @impl true
-  def handle_info({:replicate_register, cluster, key, pid, meta, time, reason}, state) do
+  def handle_info({:replicate_register, cluster, key, pid, meta, time, _reason}, state) do
     %{name: name, shard_index: shard} = state
 
     log_verbose(state, fn ->
@@ -344,26 +343,17 @@ defmodule Group.Replica do
 
     case Data.registry_lookup(name, shard, cluster, key) do
       nil ->
-        mref = monitor_pid(state, pid)
         Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-        previous_meta =
-          if reason == :update do
-            nil
-          else
-            nil
-          end
-
         Group.__dispatch__(name, :registered, key, pid, meta, %{
-          previous_meta: previous_meta,
+          previous_meta: nil,
           cluster: cluster
         })
 
-        {:noreply, put_monitor(state, pid, mref)}
+        {:noreply, state}
 
-      {^pid, _old_meta, _old_time, _node} ->
-        # Same pid updating — keep mref
-        {_, old_meta, _, _} = Data.registry_lookup(name, shard, cluster, key)
+      {^pid, old_meta, _old_time, _node} ->
+        # Same pid updating
         Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
         Group.__dispatch__(name, :registered, key, pid, meta, %{
@@ -390,7 +380,6 @@ defmodule Group.Replica do
       {_existing_pid, _existing_meta, existing_time, _existing_node} ->
         # Both remote — keep the more recent one
         if time > existing_time do
-          mref = monitor_pid(state, pid)
           Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
           Group.__dispatch__(name, :registered, key, pid, meta, %{
@@ -398,7 +387,7 @@ defmodule Group.Replica do
             cluster: cluster
           })
 
-          {:noreply, put_monitor(state, pid, mref)}
+          {:noreply, state}
         else
           {:noreply, state}
         end
@@ -415,7 +404,6 @@ defmodule Group.Replica do
     case Data.registry_lookup(name, shard, cluster, key) do
       {^pid, _meta, _time, _node} ->
         Data.registry_delete(name, shard, cluster, key)
-        state = maybe_demonitor_pid(state, name, shard, pid)
 
         Group.__dispatch__(name, :unregistered, key, pid, meta, %{
           reason: reason,
@@ -438,7 +426,6 @@ defmodule Group.Replica do
 
     case Data.pg_lookup(name, shard, cluster, key, pid) do
       nil ->
-        mref = monitor_pid(state, pid)
         Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
         Group.__dispatch__(name, :joined, key, pid, meta, %{
@@ -446,7 +433,7 @@ defmodule Group.Replica do
           cluster: cluster
         })
 
-        {:noreply, put_monitor(state, pid, mref)}
+        {:noreply, state}
 
       {old_meta, _old_time, _node} ->
         Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
@@ -475,7 +462,6 @@ defmodule Group.Replica do
 
       {_meta, _time, _node} ->
         Data.pg_delete(name, shard, cluster, key, pid)
-        state = maybe_demonitor_pid(state, name, shard, pid)
 
         Group.__dispatch__(name, :left, key, pid, meta, %{
           reason: reason,
@@ -662,6 +648,9 @@ defmodule Group.Replica do
       "#{log_prefix(state)} #{remote_node} cluster_disconnect #{inspect(cluster)}"
     end)
 
+    # Remove the disconnecting node from cluster membership (shared table, once)
+    if shard == 0, do: Data.remove_cluster_node(name, cluster, remote_node)
+
     # Purge the disconnecting node's entries for this cluster
     {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, remote_node)
     state = dispatch_purged(state, cluster, purged_reg, purged_pg, :cluster_disconnect)
@@ -687,8 +676,8 @@ defmodule Group.Replica do
   def handle_info({:nodedown, dead_node}, state) do
     %{name: name, shard_index: shard} = state
 
-    # Remove all cluster memberships for the dead node
-    Data.purge_cluster_node(name, dead_node)
+    # Remove cluster memberships once (shared table, same work on every shard)
+    if shard == 0, do: Data.purge_cluster_node(name, dead_node)
 
     # Purge all data from the dead node
     {purged_reg, purged_pg} = Data.purge_node(name, shard, dead_node)
@@ -727,7 +716,7 @@ defmodule Group.Replica do
 
     if remote_node != node() and Map.get(state.remote_shards, remote_node) == pid do
       # Remote shard process died — purge its cluster memberships and node data
-      Data.purge_cluster_node(name, remote_node)
+      if shard == 0, do: Data.purge_cluster_node(name, remote_node)
       {purged_reg, purged_pg} = Data.purge_node(name, shard, remote_node)
 
       log_verbose(state, fn ->
@@ -867,19 +856,22 @@ defmodule Group.Replica do
 
   defp rebuild_monitors(state) do
     %{name: name, shard_index: shard} = state
+    local = node()
 
     # Scan all entries in this shard's tables and re-establish monitors
+    # Only monitor local pids — remote pids are cleaned up by their owning
+    # node's DOWN handler (broadcast) or by nodedown.
     reg_table = Data.reg_by_pid_table(name, shard)
 
     monitors =
       try do
         :ets.foldl(
-          fn {pid, _cluster, _key, _meta, _time, _entry_node}, acc ->
-            if Map.has_key?(acc, pid) do
-              acc
-            else
+          fn {pid, _cluster, _key, _meta, _time, entry_node}, acc ->
+            if entry_node == local and not Map.has_key?(acc, pid) do
               mref = Process.monitor(pid)
               Map.put(acc, pid, mref)
+            else
+              acc
             end
           end,
           %{},
@@ -894,12 +886,12 @@ defmodule Group.Replica do
     monitors =
       try do
         :ets.foldl(
-          fn {{pid, _cluster, _key}, _meta, _time, _entry_node}, acc ->
-            if Map.has_key?(acc, pid) do
-              acc
-            else
+          fn {{pid, _cluster, _key}, _meta, _time, entry_node}, acc ->
+            if entry_node == local and not Map.has_key?(acc, pid) do
               mref = Process.monitor(pid)
               Map.put(acc, pid, mref)
+            else
+              acc
             end
           end,
           monitors,
@@ -917,50 +909,37 @@ defmodule Group.Replica do
   end
 
   defp merge_remote_cluster_data(state, cluster, reg_data, pg_data) do
-    %{name: name, shard_index: shard} = state
+    %{name: name, shard_index: shard, num_shards: num_shards} = state
 
-    state =
-      Enum.reduce(reg_data, state, fn {key, pid, meta, time}, acc ->
-        if shard_index_for(cluster, key, state.num_shards) == shard do
-          case Data.registry_lookup(name, shard, cluster, key) do
-            nil ->
-              mref = monitor_pid(acc, pid)
-              Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              put_monitor(acc, pid, mref)
+    for {key, pid, meta, time} <- reg_data,
+        shard_index_for(cluster, key, num_shards) == shard do
+      case Data.registry_lookup(name, shard, cluster, key) do
+        nil ->
+          Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-            {_existing_pid, _meta, existing_time, _node} when time > existing_time ->
-              mref = monitor_pid(acc, pid)
-              Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              put_monitor(acc, pid, mref)
+        {_existing_pid, _meta, existing_time, _node} when time > existing_time ->
+          Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-            _ ->
-              acc
-          end
-        else
-          acc
-        end
-      end)
-
-    Enum.reduce(pg_data, state, fn {key, pid, meta, time}, acc ->
-      if shard_index_for(cluster, key, state.num_shards) == shard do
-        case Data.pg_lookup(name, shard, cluster, key, pid) do
-          nil ->
-            mref = monitor_pid(acc, pid)
-            Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-            put_monitor(acc, pid, mref)
-
-          {_meta, existing_time, _node} when time > existing_time ->
-            mref = monitor_pid(acc, pid)
-            Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-            put_monitor(acc, pid, mref)
-
-          _ ->
-            acc
-        end
-      else
-        acc
+        _ ->
+          :ok
       end
-    end)
+    end
+
+    for {key, pid, meta, time} <- pg_data,
+        shard_index_for(cluster, key, num_shards) == shard do
+      case Data.pg_lookup(name, shard, cluster, key, pid) do
+        nil ->
+          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        {_meta, existing_time, _node} when time > existing_time ->
+          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        _ ->
+          :ok
+      end
+    end
+
+    state
   end
 
   defp resolve_conflict(
@@ -999,7 +978,7 @@ defmodule Group.Replica do
       winner_pid == remote_pid ->
         # Remote wins — replace local entry
         Data.registry_delete(name, shard, cluster, key)
-        mref = monitor_pid(state, remote_pid)
+        state = maybe_demonitor_pid(state, name, shard, local_pid)
         time = System.system_time()
 
         Data.registry_insert(
@@ -1013,7 +992,7 @@ defmodule Group.Replica do
           node(remote_pid)
         )
 
-        put_monitor(state, remote_pid, mref)
+        state
 
       winner_pid == local_pid ->
         # Local wins — re-broadcast to override remote

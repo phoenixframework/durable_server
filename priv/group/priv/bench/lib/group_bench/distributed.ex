@@ -24,6 +24,9 @@ defmodule GroupBench.Distributed do
     bench_bulk_sync(@replicas)
     bench_concurrent_cross_node(@replicas)
     bench_named_cluster_replication(@replicas)
+    bench_death_cleanup(@replicas)
+    bench_churn(@replicas)
+    bench_join_death_cleanup(@replicas)
 
     IO.puts("\n  Done.\n")
   end
@@ -253,6 +256,136 @@ defmodule GroupBench.Distributed do
       |> Enum.sort()
 
     report_latency("register on r1 → visible on r2 (cluster: \"game\")", samples)
+
+    stop_groups(replicas)
+  end
+
+  # ── 5. Process death cleanup ─────────────────────────────────────
+
+  defp bench_death_cleanup([r1, r2] = replicas) do
+    header("5. Process Death Cleanup Replication")
+
+    for n <- [1_000, 5_000] do
+      subheader("#{format_number(n)} processes")
+
+      start_group_on(r1)
+      start_group_on(r2)
+      wait_for_peer_discovery(replicas)
+
+      # Register N on r1
+      pids = :erpc.call(r1, GroupBench.Replica, :bulk_register, [@name, n, "death-"], 60_000)
+
+      # Wait for replication to r2
+      poll_until(
+        fn ->
+          :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) >= n
+        end,
+        30_000
+      )
+
+      # Kill all registered processes, measure cleanup convergence
+      {cleanup_us, _} =
+        :timer.tc(fn ->
+          :erpc.call(r1, GroupBench.Replica, :kill_processes, [pids])
+
+          poll_until(
+            fn ->
+              :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) == 0
+            end,
+            30_000
+          )
+        end)
+
+      rate = if cleanup_us > 0, do: round(n * 1_000_000 / cleanup_us), else: 0
+
+      IO.puts("  cleanup:    #{format_number(div(cleanup_us, 1000))} ms")
+      IO.puts("  deaths/sec: #{format_number(rate)}")
+
+      stop_groups(replicas)
+    end
+  end
+
+  # ── 6. Register/die churn ────────────────────────────────────────
+
+  defp bench_churn([r1, r2] = replicas) do
+    header("6. Register/Die Churn Throughput")
+
+    waves = 10
+    per_wave = 500
+    total = waves * per_wave
+
+    start_group_on(r1)
+    start_group_on(r2)
+    wait_for_peer_discovery(replicas)
+
+    {wall_us, _} =
+      :timer.tc(fn ->
+        for w <- 1..waves do
+          pids =
+            :erpc.call(
+              r1,
+              GroupBench.Replica,
+              :bulk_register,
+              [@name, per_wave, "churn-w#{w}-"],
+              60_000
+            )
+
+          :erpc.call(r1, GroupBench.Replica, :kill_processes, [pids])
+        end
+
+        # Wait for r2 to converge to 0
+        poll_until(
+          fn ->
+            :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) == 0
+          end,
+          30_000
+        )
+      end)
+
+    report_throughput("register+die waves (#{waves}x#{per_wave})", total, wall_us)
+
+    stop_groups(replicas)
+  end
+
+  # ── 7. Join/die cleanup ──────────────────────────────────────────
+
+  defp bench_join_death_cleanup([r1, r2] = replicas) do
+    header("7. Join/Die Cleanup Replication")
+
+    n = 1_000
+
+    start_group_on(r1)
+    start_group_on(r2)
+    wait_for_peer_discovery(replicas)
+
+    # Spawn N processes on r1, each joins the same group
+    pids = :erpc.call(r1, GroupBench.Replica, :bulk_join, [@name, n, "room"], 60_000)
+
+    # Wait for replication to r2
+    poll_until(
+      fn ->
+        :erpc.call(r2, GroupBench.Replica, :total_pg_count, [@name]) >= n
+      end,
+      30_000
+    )
+
+    # Kill all joined processes, measure cleanup convergence
+    {cleanup_us, _} =
+      :timer.tc(fn ->
+        :erpc.call(r1, GroupBench.Replica, :kill_processes, [pids])
+
+        poll_until(
+          fn ->
+            :erpc.call(r2, GroupBench.Replica, :total_pg_count, [@name]) == 0
+          end,
+          30_000
+        )
+      end)
+
+    rate = if cleanup_us > 0, do: round(n * 1_000_000 / cleanup_us), else: 0
+
+    IO.puts("  cleanup:    #{format_number(div(cleanup_us, 1000))} ms")
+    IO.puts("  deaths/sec: #{format_number(rate)}")
 
     stop_groups(replicas)
   end

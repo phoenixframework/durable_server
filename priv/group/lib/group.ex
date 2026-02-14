@@ -725,26 +725,29 @@ defmodule Group do
   @doc false
   def __dispatch__(name, event_type, key, pid, meta, extra \\ %{}) do
     cluster = Map.get(extra, :cluster)
-    extract_meta_fn = resolve_extract_meta(name, [])
     subscribers = get_subscribers_for_key(name, cluster, key)
 
-    event = %Group.Event{
-      type: event_type,
-      supervisor: name,
-      cluster: cluster,
-      key: key,
-      pid: pid,
-      meta: extract_meta_fn.(meta),
-      previous_meta:
-        case Map.get(extra, :previous_meta) do
-          nil -> nil
-          prev -> extract_meta_fn.(prev)
-        end,
-      reason: Map.get(extra, :reason)
-    }
+    if subscribers != [] do
+      extract_meta_fn = resolve_extract_meta(name, [])
 
-    for subscriber_pid <- subscribers do
-      send(subscriber_pid, event)
+      event = %Group.Event{
+        type: event_type,
+        supervisor: name,
+        cluster: cluster,
+        key: key,
+        pid: pid,
+        meta: extract_meta_fn.(meta),
+        previous_meta:
+          case Map.get(extra, :previous_meta) do
+            nil -> nil
+            prev -> extract_meta_fn.(prev)
+          end,
+        reason: Map.get(extra, :reason)
+      }
+
+      for subscriber_pid <- subscribers do
+        send(subscriber_pid, event)
+      end
     end
 
     :ok

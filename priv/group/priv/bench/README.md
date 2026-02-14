@@ -111,6 +111,31 @@ Same as scenario 1 (replication latency) but within a named cluster
 Useful for verifying that the named cluster replication path has no overhead
 compared to the default nil cluster.
 
+### 5. Process death cleanup replication
+
+The critical distributed cleanup path. Registers 1K and 5K processes on
+replica1, kills them all, then measures how long until replica2 sees zero
+entries. Exercises: local DOWN handler → `replicate_unregister` broadcast →
+remote ETS cleanup.
+
+This scenario catches O(N²) message amplification bugs where remote nodes
+redundantly monitor pids and re-broadcast cleanup messages.
+
+### 6. Register/die churn throughput
+
+Sustained churn: 10 waves of 500 register+kill cycles on replica1, measuring
+total wall time including convergence on replica2. Simulates steady-state
+deploy churn where processes are constantly starting and stopping.
+
+### 7. Join/die cleanup replication
+
+Same as scenario 5 but for process groups. Spawns 1K processes on replica1,
+all joining the same group key, then kills them all. Measures cleanup
+convergence on replica2 via the `replicate_leave` path.
+
+All members hash to the same shard (single key), making this the worst case
+for shard contention during bulk cleanup.
+
 ## Architecture
 
 ```
@@ -122,7 +147,7 @@ priv/group/priv/bench/
 │   ├── group_bench.ex               # CLI entry — dispatches local/distributed
 │   ├── group_bench/
 │   │   ├── local.ex                 # 6 local benchmarks
-│   │   ├── distributed.ex           # coordinator: connects + drives benchmarks
+│   │   ├── distributed.ex           # coordinator: connects + drives 7 benchmarks
 │   │   ├── replica.ex               # helpers called by coordinator via :erpc
 │   │   └── helpers.ex               # timing, formatting, percentile math
 ```

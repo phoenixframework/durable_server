@@ -91,4 +91,50 @@ defmodule GroupBench.Replica do
       5_000 -> raise "spawn_register timed out"
     end
   end
+
+  @doc """
+  Spawns N processes, each joining the same group key. Returns list of pids.
+  """
+  def bulk_join(name, n, key, opts \\ []) do
+    parent = self()
+
+    pids =
+      Enum.map(1..n, fn _i ->
+        spawn(fn ->
+          :ok = Group.join(name, key, %{}, opts)
+          send(parent, {:done, self()})
+          Process.sleep(:infinity)
+        end)
+      end)
+
+    Enum.each(pids, fn pid ->
+      receive do
+        {:done, ^pid} -> :ok
+      after
+        30_000 -> raise "Timed out waiting for bulk_join"
+      end
+    end)
+
+    pids
+  end
+
+  @doc """
+  Kills a list of processes.
+  """
+  def kill_processes(pids) do
+    Enum.each(pids, &Process.exit(&1, :kill))
+    :ok
+  end
+
+  @doc """
+  Counts total pg entries across all shards.
+  """
+  def total_pg_count(name) do
+    num_shards = Group.get_config(name).num_shards
+
+    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
+      table = Group.Replica.Data.pg_by_key_table(name, shard)
+      acc + :ets.info(table, :size)
+    end)
+  end
 end
