@@ -129,6 +129,8 @@ defmodule Group.Replica do
     # Rebuild monitors from any surviving ETS data (after shard crash/restart)
     state = rebuild_monitors(state)
 
+    log_once(state, fn -> "#{log_prefix(state)} started (shards=#{num_shards})" end)
+
     # Discover peers on all known nodes
     registered_name = shard_name(name, shard_index)
 
@@ -301,6 +303,8 @@ defmodule Group.Replica do
   def handle_call({:cluster_connect, cluster}, _from, state) do
     %{name: name} = state
 
+    log_once(state, fn -> "#{log_prefix(state)} cluster_connect #{inspect(cluster)}" end)
+
     # Broadcast to remote peers to inform them about our cluster membership
     broadcast_to_peers(state, {:cluster_connect, cluster, self()})
 
@@ -312,6 +316,8 @@ defmodule Group.Replica do
 
   def handle_call({:cluster_disconnect, cluster}, _from, state) do
     %{name: name, shard_index: shard} = state
+
+    log_once(state, fn -> "#{log_prefix(state)} cluster_disconnect #{inspect(cluster)}" end)
 
     # Remove our entries for this cluster
     {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
@@ -331,6 +337,10 @@ defmodule Group.Replica do
   @impl true
   def handle_info({:replicate_register, cluster, key, pid, meta, time, reason}, state) do
     %{name: name, shard_index: shard} = state
+
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} replicate_register key=#{inspect(key)} from #{node(pid)}"
+    end)
 
     case Data.registry_lookup(name, shard, cluster, key) do
       nil ->
@@ -398,6 +408,10 @@ defmodule Group.Replica do
   def handle_info({:replicate_unregister, cluster, key, pid, meta, reason}, state) do
     %{name: name, shard_index: shard} = state
 
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} replicate_unregister key=#{inspect(key)}"
+    end)
+
     case Data.registry_lookup(name, shard, cluster, key) do
       {^pid, _meta, _time, _node} ->
         Data.registry_delete(name, shard, cluster, key)
@@ -417,6 +431,10 @@ defmodule Group.Replica do
 
   def handle_info({:replicate_join, cluster, key, pid, meta, time, reason}, state) do
     %{name: name, shard_index: shard} = state
+
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} replicate_join key=#{inspect(key)} pid=#{inspect(pid)} from #{node(pid)}"
+    end)
 
     case Data.pg_lookup(name, shard, cluster, key, pid) do
       nil ->
@@ -446,6 +464,10 @@ defmodule Group.Replica do
 
   def handle_info({:replicate_leave, cluster, key, pid, meta, reason}, state) do
     %{name: name, shard_index: shard} = state
+
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} replicate_leave key=#{inspect(key)}"
+    end)
 
     case Data.pg_lookup(name, shard, cluster, key, pid) do
       nil ->
@@ -509,6 +531,10 @@ defmodule Group.Replica do
       {:peer_connect_ack, self(), shard, state.num_shards, my_clusters}
     )
 
+    log_once(state, fn ->
+      "#{log_prefix(state)} peer_connect from #{remote_node} (#{length(shared)} shared clusters)"
+    end)
+
     # Send cluster_state for all shared clusters in one pass (single table scan
     # instead of one scan per cluster — O(N) vs O(C×N))
     send_cluster_states(state, shared, remote_node)
@@ -555,6 +581,10 @@ defmodule Group.Replica do
         %{state | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid)}
       end
 
+    log_once(state, fn ->
+      "#{log_prefix(state)} peer_connect_ack from #{remote_node} (#{length(shared)} shared clusters)"
+    end)
+
     # Send cluster_state for all shared clusters in one pass
     send_cluster_states(state, shared, remote_node)
 
@@ -574,6 +604,14 @@ defmodule Group.Replica do
 
     # Guard: skip merge for named clusters we're not a member of
     if cluster_member?(name, cluster) do
+      log_once(state, fn ->
+        "#{log_prefix(state)} cluster_state cluster=#{inspect(cluster)} (#{length(reg_data)} reg, #{length(pg_data)} pg entries)"
+      end)
+
+      log_verbose(state, fn ->
+        "#{log_prefix_shard(state)} merging cluster=#{inspect(cluster)} (#{length(reg_data)} reg, #{length(pg_data)} pg entries)"
+      end)
+
       state = merge_remote_cluster_data(state, cluster, reg_data, pg_data)
       {:noreply, state}
     else
@@ -588,6 +626,10 @@ defmodule Group.Replica do
   def handle_info({:cluster_connect, cluster, remote_pid}, state) do
     %{name: name} = state
     remote_node = node(remote_pid)
+
+    log_once(state, fn ->
+      "#{log_prefix(state)} #{remote_node} cluster_connect #{inspect(cluster)}"
+    end)
 
     if node() in Data.cluster_nodes(name, cluster) do
       # We're also in this cluster — add the remote node and exchange data
@@ -615,6 +657,10 @@ defmodule Group.Replica do
   def handle_info({:cluster_disconnect, cluster, remote_pid}, state) do
     %{name: name, shard_index: shard} = state
     remote_node = node(remote_pid)
+
+    log_once(state, fn ->
+      "#{log_prefix(state)} #{remote_node} cluster_disconnect #{inspect(cluster)}"
+    end)
 
     # Purge the disconnecting node's entries for this cluster
     {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, remote_node)
@@ -646,6 +692,10 @@ defmodule Group.Replica do
 
     # Purge all data from the dead node
     {purged_reg, purged_pg} = Data.purge_node(name, shard, dead_node)
+
+    log_once(state, fn ->
+      "#{log_prefix(state)} nodedown #{dead_node} (purged #{length(purged_reg)} reg, #{length(purged_pg)} pg entries)"
+    end)
 
     # Fire events for purged entries
     for {cluster, key, pid, meta, _time} <- purged_reg do
@@ -680,6 +730,10 @@ defmodule Group.Replica do
       Data.purge_cluster_node(name, remote_node)
       {purged_reg, purged_pg} = Data.purge_node(name, shard, remote_node)
 
+      log_verbose(state, fn ->
+        "#{log_prefix_shard(state)} remote_shard_down #{remote_node} (purged #{length(purged_reg)} reg, #{length(purged_pg)} pg)"
+      end)
+
       for {cluster, key, dead_pid, meta, _time} <- purged_reg do
         Group.__dispatch__(name, :unregistered, key, dead_pid, meta, %{
           reason: {:nodedown, remote_node},
@@ -701,7 +755,7 @@ defmodule Group.Replica do
       # Regular process died — clean up its entries in this shard
       entries = Data.entries_by_pid(name, shard, pid)
 
-      # Filter to entries that belong to this shard
+      # Filter to entries that belong to this shard (count before filter for logging)
       my_entries =
         Enum.filter(entries, fn
           {:registry, cluster, key, _pid, _meta, _time, _node} ->
@@ -710,6 +764,10 @@ defmodule Group.Replica do
           {:pg, cluster, key, _pid, _meta, _time, _node} ->
             shard_index_for(cluster, key, num_shards) == shard
         end)
+
+      log_verbose(state, fn ->
+        "#{log_prefix_shard(state)} process_down pid=#{inspect(pid)} reason=#{inspect(reason)} (#{length(my_entries)} entries cleaned)"
+      end)
 
       for entry <- my_entries do
         case entry do
@@ -1035,6 +1093,10 @@ defmodule Group.Replica do
     %{name: name, shard_index: shard} = state
     {reg_by_cluster, pg_by_cluster} = Data.local_data_by_cluster(name, shard, clusters)
 
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} sending cluster_states to #{target_node} (#{length(clusters)} clusters)"
+    end)
+
     for cluster <- clusters do
       reg_data = Map.get(reg_by_cluster, cluster, [])
       pg_data = Map.get(pg_by_cluster, cluster, [])
@@ -1104,5 +1166,35 @@ defmodule Group.Replica do
     end
 
     state
+  end
+
+  # =====================================================================
+  # Logging helpers
+  # =====================================================================
+
+  defp log(state, message_fn) when is_function(message_fn, 0) do
+    case Group.get_config(state.name) do
+      %{log: false} -> :ok
+      _ -> Logger.info(message_fn)
+    end
+  end
+
+  defp log_verbose(state, message_fn) when is_function(message_fn, 0) do
+    case Group.get_config(state.name) do
+      %{log: :verbose} -> Logger.info(message_fn)
+      _ -> :ok
+    end
+  end
+
+  defp log_once(state, message_fn) do
+    if state.shard_index == 0, do: log(state, message_fn)
+  end
+
+  defp log_prefix(state) do
+    "[Group #{inspect(state.name)}]"
+  end
+
+  defp log_prefix_shard(state) do
+    "[Group #{inspect(state.name)}/#{state.shard_index}]"
   end
 end

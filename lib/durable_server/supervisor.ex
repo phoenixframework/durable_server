@@ -97,6 +97,8 @@ defmodule DurableServer.Supervisor do
     Use this to provide shared configuration, API clients, or other dependencies to all servers
     managed by this supervisor. The map is merged with built-in keys (`:supervisor`,
     `:task_supervisor`, `:dynamic_supervisor`). Example: `init_info: %{api_client: MyApp.API}`
+  - `:group` - Options to pass to `Group`
+    - `:shards` - The number of group shards. Defaults `System.schedulers_online()`
 
   ## Examples
 
@@ -1513,6 +1515,7 @@ defmodule DurableServer.Supervisor do
       Keyword.validate!(opts, [
         :name,
         :prefix,
+        :group,
         :object_store,
         :finch,
         :task_supervisor,
@@ -1651,11 +1654,15 @@ defmodule DurableServer.Supervisor do
 
     shutdown_timeout = config.supervisor_shutdown_timeout_ms
 
+    group_opts =
+      Keyword.merge(Keyword.take(opts, [:group]),
+        name: name,
+        extract_meta: {DurableServer, :extract_user_meta, []},
+        resolve_registry_conflict: {DurableServer.GroupConflictResolver, :resolve, []}
+      )
+
     children = [
-      {Group,
-       name: name,
-       extract_meta: {DurableServer, :extract_user_meta, []},
-       resolve_registry_conflict: {DurableServer.GroupConflictResolver, :resolve, []}},
+      {Group, group_opts},
       {Task.Supervisor, name: task_sup_name},
       {DynamicSupervisor,
        name: dynamic_sup_name,

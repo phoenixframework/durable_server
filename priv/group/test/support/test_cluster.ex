@@ -35,6 +35,8 @@ defmodule Group.TestCluster do
 
   @doc "Start Group on a remote node"
   def start_group(node, opts) do
+    opts = Keyword.put_new(opts, :log, false)
+
     :erpc.call(node, fn ->
       {:ok, pid} = Group.start_link(opts)
       Process.unlink(pid)

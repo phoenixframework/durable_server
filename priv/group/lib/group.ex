@@ -165,6 +165,19 @@ defmodule Group do
   # Startup
   # ===========================================================================
 
+  @doc """
+  Returns a child spec for starting Group under a supervisor.
+
+  ## Options
+
+  - `:name` (required) — atom identifying this Group instance
+  - `:shards` — number of GenServer shards (default: `System.schedulers_online()`)
+  - `:log` — logging level. `:info` (default) logs peer discovery, node events,
+    and cluster membership changes. `:verbose` additionally logs per-shard
+    replication messages. `false` disables all Group log output.
+  - `:resolve_registry_conflict` — `{module, function, extra_args}` for partition conflicts
+  - `:extract_meta` — `{module, function, args}` to transform metadata on reads
+  """
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
     %{id: {__MODULE__, name}, start: {Group.Supervisor, :start_link, [opts]}, type: :supervisor}

@@ -14,9 +14,10 @@ defmodule Group.Supervisor do
     callbacks = Keyword.get(opts, :callbacks, %{})
     extract_meta = Keyword.get(opts, :extract_meta)
     resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)
+    log = Keyword.get(opts, :log, :info)
 
     # persistent_term config — must be set before children start (Replica reads it)
-    config = %{callbacks: callbacks, num_shards: num_shards}
+    config = %{callbacks: callbacks, num_shards: num_shards, log: log}
     config = if extract_meta, do: Map.put(config, :extract_meta, extract_meta), else: config
 
     config =

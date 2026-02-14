@@ -5,7 +5,7 @@ defmodule GroupTest do
 
   setup do
     name = :"test_group_#{System.unique_integer([:positive])}"
-    start_supervised!({Group, name: name, shards: 4})
+    start_supervised!({Group, name: name, shards: 4, log: false})
     {:ok, name: name}
   end
 

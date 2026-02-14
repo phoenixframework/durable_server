@@ -169,6 +169,7 @@ All operations are **eventually consistent**:
 {Group,
   name: :my_app,
   shards: System.schedulers_online(),          # number of write shards (default)
+  log: :info,                                  # :info | :verbose | false
   resolve_registry_conflict: &MyResolver.resolve/4,  # partition conflict resolver
   extract_meta: {MyApp, :extract_meta, []}     # transform meta on read
 }
@@ -180,6 +181,10 @@ All operations are **eventually consistent**:
   first argument to all API functions.
 - **`shards`** — number of GenServer shards for write operations. Defaults to
   `System.schedulers_online()`. Must match across all nodes.
+- **`log`** — logging level. `:info` (default) logs peer discovery, node
+  connects/disconnects, and cluster membership changes. `:verbose` additionally
+  logs per-shard replication messages (register, join, leave, process deaths).
+  `false` disables all Group log output. All log output uses `Logger.info`.
 - **`resolve_registry_conflict`** — `fun(name, key, {pid1, meta1, time1}, {pid2, meta2, time2})` called when partition healing finds the same key
   registered on two nodes. Must return the winning pid.
 - **`extract_meta`** — `{module, function, args}` or `fun(meta)` applied to
