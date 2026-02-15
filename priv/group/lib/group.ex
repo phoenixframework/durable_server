@@ -204,42 +204,37 @@ defmodule Group do
 
   - `:ok` on success
   """
-  def connect(name, cluster_name)
-      when is_atom(name) and is_binary(cluster_name) do
-    # Update shared cluster_nodes table synchronously
-    Data.add_cluster_node(name, cluster_name, node())
+  def connect(name, cluster_or_clusters)
+      when is_atom(name) do
+    clusters = List.wrap(cluster_or_clusters)
 
-    # Broadcast to all shards to inform remote nodes
-    num_shards = get_config(name).num_shards
-
-    for i <- 0..(num_shards - 1) do
-      GenServer.call(Replica.shard_name(name, i), {:cluster_connect, cluster_name})
+    for cluster <- clusters do
+      Data.add_cluster_node(name, cluster, node())
     end
+
+    notify_shard = :rand.uniform(get_config(name).num_shards) - 1
+    GenServer.call(Replica.shard_name(name, notify_shard), {:cluster_connect, clusters}, 60_000)
 
     :ok
   end
 
   @doc """
-  Disconnect the local node from a named cluster.
+  Disconnect the local node from one or more named clusters.
 
-  ## Parameters
-
-  - `name` - The Group name
-  - `cluster_name` - The name of the cluster to disconnect from (binary string)
-
-  ## Returns
-
-  - `:ok` always
+  Accepts a single cluster name (binary) or a list of cluster names.
   """
-  def disconnect(name, cluster_name)
-      when is_atom(name) and is_binary(cluster_name) do
-    Data.remove_cluster_node(name, cluster_name, node())
+  def disconnect(name, cluster_or_clusters)
+      when is_atom(name) do
+    clusters = List.wrap(cluster_or_clusters)
 
-    # Broadcast disconnect to all shards
+    for cluster <- clusters do
+      Data.remove_cluster_node(name, cluster, node())
+    end
+
     num_shards = get_config(name).num_shards
 
     for i <- 0..(num_shards - 1) do
-      GenServer.call(Replica.shard_name(name, i), {:cluster_disconnect, cluster_name})
+      GenServer.call(Replica.shard_name(name, i), {:cluster_disconnect, clusters}, 60_000)
     end
 
     :ok

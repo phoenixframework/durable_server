@@ -974,6 +974,44 @@ defmodule Group.DistributedTest do
   end
 
   describe "named cluster late joiner" do
+    test "late joiner receives data spread across shards" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_cluster_late_shards_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 8]
+
+      start_group_on_peers(peers, opts)
+
+      # A connects to "game" and registers/joins multiple keys (to hit different shards)
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.spawn_register_in_cluster(node_a, name, "player/1", %{id: 1}, "game")
+      TestCluster.spawn_register_in_cluster(node_a, name, "player/2", %{id: 2}, "game")
+      TestCluster.spawn_join(node_a, name, "room/1", %{player: :a1}, cluster: "game")
+      TestCluster.spawn_join(node_a, name, "room/2", %{player: :a2}, cluster: "game")
+
+      # Wait for A's local data to settle
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "player/2", [cluster: "game"]]) != nil
+      end)
+
+      # B connects to "game" (late joiner)
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      # B should see ALL of A's data (registry + pg, across shards)
+      TestCluster.assert_eventually(
+        fn ->
+          p1 = TestCluster.rpc!(node_b, Group, :lookup, [name, "player/1", [cluster: "game"]])
+          p2 = TestCluster.rpc!(node_b, Group, :lookup, [name, "player/2", [cluster: "game"]])
+          r1 = TestCluster.rpc!(node_b, Group, :members, [name, "room/1", [cluster: "game"]])
+          r2 = TestCluster.rpc!(node_b, Group, :members, [name, "room/2", [cluster: "game"]])
+          p1 != nil and p2 != nil and length(r1) == 1 and length(r2) == 1
+        end,
+        timeout: 10_000
+      )
+    end
+
     test "new member receives existing cluster data" do
       peers = TestCluster.start_peers(3)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

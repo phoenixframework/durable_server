@@ -137,4 +137,80 @@ defmodule GroupBench.Replica do
       acc + :ets.info(table, :size)
     end)
   end
+
+  @doc """
+  Connects N named clusters concurrently (one per caller, like real usage).
+  """
+  def bulk_connect(name, n, prefix) do
+    parent = self()
+
+    Enum.map(1..n, fn i ->
+      spawn(fn ->
+        :ok = Group.connect(name, "#{prefix}#{i}")
+        send(parent, {:done, self()})
+      end)
+    end)
+    |> Enum.each(fn pid ->
+      receive do
+        {:done, ^pid} -> :ok
+      after
+        120_000 -> raise "Timed out waiting for bulk_connect"
+      end
+    end)
+  end
+
+  @doc """
+  Disconnects N named clusters concurrently (one per caller, like real usage).
+  """
+  def bulk_disconnect(name, n, prefix) do
+    parent = self()
+
+    Enum.map(1..n, fn i ->
+      spawn(fn ->
+        :ok = Group.disconnect(name, "#{prefix}#{i}")
+        send(parent, {:done, self()})
+      end)
+    end)
+    |> Enum.each(fn pid ->
+      receive do
+        {:done, ^pid} -> :ok
+      after
+        120_000 -> raise "Timed out waiting for bulk_disconnect"
+      end
+    end)
+  end
+
+  @doc """
+  Spawns N processes, each registering key "key" in a distinct cluster.
+  Returns list of pids.
+  """
+  def bulk_register_per_cluster(name, n, prefix) do
+    parent = self()
+
+    pids =
+      Enum.map(1..n, fn i ->
+        spawn(fn ->
+          :ok = Group.register(name, "key", %{}, cluster: "#{prefix}#{i}")
+          send(parent, {:done, self()})
+          Process.sleep(:infinity)
+        end)
+      end)
+
+    Enum.each(pids, fn pid ->
+      receive do
+        {:done, ^pid} -> :ok
+      after
+        60_000 -> raise "Timed out waiting for bulk_register_per_cluster"
+      end
+    end)
+
+    pids
+  end
+
+  @doc """
+  Returns the number of clusters this node is a member of (via reverse index).
+  """
+  def my_cluster_count(name) do
+    length(Group.Replica.Data.my_clusters(name))
+  end
 end

@@ -27,6 +27,7 @@ defmodule GroupBench.Distributed do
     bench_death_cleanup(@replicas)
     bench_churn(@replicas)
     bench_join_death_cleanup(@replicas)
+    bench_many_clusters(@replicas)
 
     IO.puts("\n  Done.\n")
   end
@@ -59,7 +60,7 @@ defmodule GroupBench.Distributed do
   # ── Group lifecycle helpers (all MFA) ─────────────────────────────────
 
   defp start_group_on(node, opts \\ []) do
-    opts = Keyword.merge([name: @name, shards: @shards], opts)
+    opts = Keyword.merge([name: @name, shards: @shards, log: false], opts)
     :erpc.call(node, GroupBench.Replica, :start_group, [opts])
   end
 
@@ -387,6 +388,128 @@ defmodule GroupBench.Distributed do
     IO.puts("  cleanup:    #{format_number(div(cleanup_us, 1000))} ms")
     IO.puts("  deaths/sec: #{format_number(rate)}")
 
+    stop_groups(replicas)
+  end
+
+  # ── 8. Many clusters ───────────────────────────────────────────
+
+  defp bench_many_clusters([r1, r2] = replicas) do
+    header("8. Many Clusters (10,000 clusters)")
+
+    num_clusters = 10_000
+    prefix = "c-"
+
+    # -- 8a. Cluster connect throughput --
+
+    subheader("connect #{format_number(num_clusters)} clusters")
+
+    start_group_on(r1)
+    start_group_on(r2)
+    wait_for_peer_discovery(replicas)
+
+    {connect_us, _} =
+      :timer.tc(fn ->
+        t1 =
+          Task.async(fn ->
+            :erpc.call(r1, GroupBench.Replica, :bulk_connect, [@name, num_clusters, prefix], 120_000)
+          end)
+
+        t2 =
+          Task.async(fn ->
+            :erpc.call(r2, GroupBench.Replica, :bulk_connect, [@name, num_clusters, prefix], 120_000)
+          end)
+
+        Task.await_many([t1, t2], 120_000)
+
+        # Wait for convergence — both nodes see each other in the last cluster
+        poll_until(
+          fn ->
+            n1 = :erpc.call(r1, Group, :nodes, [@name, "#{prefix}#{num_clusters}"])
+            n2 = :erpc.call(r2, Group, :nodes, [@name, "#{prefix}#{num_clusters}"])
+            length(n1) >= 1 and length(n2) >= 1
+          end,
+          60_000
+        )
+      end)
+
+    IO.puts("  connect:       #{format_number(div(connect_us, 1000))} ms")
+    IO.puts("  clusters/sec:  #{format_number(round(num_clusters * 1_000_000 / connect_us))}")
+
+    # -- 8b. Register 1 key per cluster --
+
+    subheader("register across #{format_number(num_clusters)} clusters")
+
+    {reg_us, pids} =
+      :timer.tc(fn ->
+        pids =
+          :erpc.call(
+            r1,
+            GroupBench.Replica,
+            :bulk_register_per_cluster,
+            [@name, num_clusters, prefix],
+            120_000
+          )
+
+        poll_until(
+          fn ->
+            :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) >= num_clusters
+          end,
+          60_000
+        )
+
+        pids
+      end)
+
+    IO.puts("  register+converge: #{format_number(div(reg_us, 1000))} ms")
+    IO.puts("  ops/sec:           #{format_number(round(num_clusters * 1_000_000 / reg_us))}")
+
+    # -- 8c. Peer re-discovery with many clusters --
+
+    subheader("peer re-discovery with #{format_number(num_clusters)} clusters")
+
+    # Stop Group on r2 (simulates crash), restart it, reconnect all clusters
+    stop_group_on(r2)
+    Process.sleep(500)
+
+    {rediscovery_us, _} =
+      :timer.tc(fn ->
+        start_group_on(r2)
+        wait_for_peer_discovery(replicas)
+
+        :erpc.call(r2, GroupBench.Replica, :bulk_connect, [@name, num_clusters, prefix], 120_000)
+
+        poll_until(
+          fn ->
+            :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) >= num_clusters
+          end,
+          120_000
+        )
+      end)
+
+    IO.puts("  re-discovery:  #{format_number(div(rediscovery_us, 1000))} ms")
+
+    # -- 8d. Disconnect cleanup --
+
+    subheader("disconnect #{format_number(num_clusters)} clusters")
+
+    {disconnect_us, _} =
+      :timer.tc(fn ->
+        :erpc.call(r1, GroupBench.Replica, :bulk_disconnect, [@name, num_clusters, prefix], 120_000)
+
+        # Wait for r2 to see r1's entries cleaned from all clusters
+        poll_until(
+          fn ->
+            :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) == 0
+          end,
+          60_000
+        )
+      end)
+
+    IO.puts("  disconnect+cleanup: #{format_number(div(disconnect_us, 1000))} ms")
+    IO.puts("  clusters/sec:       #{format_number(round(num_clusters * 1_000_000 / disconnect_us))}")
+
+    # Kill leftover processes
+    :erpc.call(r1, GroupBench.Replica, :kill_processes, [pids])
     stop_groups(replicas)
   end
 end

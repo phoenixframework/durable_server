@@ -10,18 +10,19 @@ defmodule Group.Replica do
 
   ## Message Protocol
 
-  | Message                                                    | Direction | Purpose                          |
-  |------------------------------------------------------------|-----------|----------------------------------|
-  | `{:peer_connect, pid, shard, num_shards, clusters}`        | A→B       | Establish peer relationship      |
-  | `{:peer_connect_ack, pid, shard, num_shards, clusters}`    | B→A       | Acknowledge peer                 |
-  | `{:cluster_state, cluster, reg_data, pg_data}`             | both      | Per-cluster data snapshot        |
-  | `{:replicate_register, cluster, key, pid, meta, time, reason}` | broadcast | Propagate registration      |
-  | `{:replicate_unregister, cluster, key, pid, meta, reason}` | broadcast | Propagate unregistration        |
-  | `{:replicate_join, cluster, key, pid, meta, time, reason}` | broadcast | Propagate join                  |
-  | `{:replicate_leave, cluster, key, pid, meta, reason}`      | broadcast | Propagate leave                 |
-  | `{:cluster_connect, cluster, pid}`                         | broadcast | Node joining named cluster       |
-  | `{:cluster_connect_ack, cluster, pid}`                     | directed  | Acknowledge cluster join         |
-  | `{:cluster_disconnect, cluster, pid}`                      | broadcast | Node leaving named cluster       |
+  | Message                                                    | Direction      | Purpose                          |
+  |------------------------------------------------------------|----------------|----------------------------------|
+  | `{:peer_connect, pid, shard, num_shards, clusters}`        | A→B (per-shard)| Establish peer relationship      |
+  | `{:peer_connect_ack, pid, shard, num_shards, clusters}`    | B→A (per-shard)| Acknowledge peer                 |
+  | `{:cluster_state, cluster, reg_data, pg_data}`             | both           | Per-cluster data snapshot        |
+  | `{:replicate_register, cluster, key, pid, meta, time, reason}` | broadcast  | Propagate registration           |
+  | `{:replicate_unregister, cluster, key, pid, meta, reason}` | broadcast      | Propagate unregistration         |
+  | `{:replicate_join, cluster, key, pid, meta, time, reason}` | broadcast      | Propagate join                   |
+  | `{:replicate_leave, cluster, key, pid, meta, reason}`      | broadcast      | Propagate leave                  |
+  | `{:cluster_connect, clusters, pid}`                        | S→remote S     | Node joining named clusters      |
+  | `{:cluster_connect_ack, clusters, pid}`                    | S→remote S     | Acknowledge cluster join + data  |
+  | `{:cluster_disconnect, clusters, pid}`                     | shard 0→remote | Node leaving named clusters      |
+  | `{:send_cluster_data, clusters, target_node}`              | local fan-out  | Notify siblings: send shard data |
 
   ## Protocol Flows
 
@@ -29,12 +30,52 @@ defmodule Group.Replica do
 
   Both sides exchange cluster lists via peer_connect/peer_connect_ack, then send
   per-cluster cluster_state messages only for shared clusters. The nil cluster is
-  always shared (all Group peers are in it).
+  always shared (all Group peers are in it). Peer discovery is per-shard — each
+  shard independently discovers its remote counterpart.
 
-  ### Named Cluster Join
+  When `peer_connect_ack` discovers named shared clusters (i.e. both sides are
+  already in the same named cluster), it sends a `cluster_connect` message to
+  the remote to trigger the full fan-out data exchange. This handles the race
+  where `connect/2` ran between peer_connect send and ack processing — see
+  "Peer Discovery + Connect Race" below.
 
-  A broadcasts cluster_connect to all peers. Peers already in that cluster respond
-  with cluster_connect_ack + cluster_state. A then sends its own cluster_state.
+  ### Named Cluster Join (single shard notification + fan-out)
+
+  1. Caller calls `Group.connect/2` which picks a random shard S and sends a
+     single GenServer.call to shard S.
+  2. Shard S broadcasts `cluster_connect` to remote shard S on all peers.
+  3. Remote shard S adds membership to ETS, sends `cluster_connect_ack` + its
+     shard S `cluster_state`, and fans out `{:send_cluster_data, clusters, node}`
+     to all local sibling shards.
+  4. Each sibling shard sends its own `cluster_state` to the matching remote shard.
+  5. On receiving `cluster_connect_ack`, the initiator's shard S adds membership
+     to ETS, sends its shard S `cluster_state`, and fans out to siblings.
+
+  Randomizing the notification shard load-balances across shards when many
+  concurrent `connect` calls happen (e.g., 10,000 clusters). This reduces
+  cross-node messages from N² to 2N (one cluster_state per shard per direction)
+  and eliminates redundant ETS membership inserts.
+
+  ### Named Cluster Disconnect (shard 0 + fan-out)
+
+  1. Caller calls `Group.disconnect/2` which calls all N local shards to purge
+     their own entries, but only shard 0 broadcasts `cluster_disconnect` to remote
+     shard 0s. (Disconnect still uses all shards since each must purge its own
+     ETS entries.)
+  2. Remote shard 0 removes membership from ETS and fans out to siblings.
+  3. Each shard (0 and siblings) purges entries for the disconnected cluster+node.
+
+  ### Peer Discovery + Connect Race
+
+  `connect/2` picks a random shard S for its GenServer.call. If shard S hasn't
+  processed its `peer_connect_ack` yet (remote_shards is empty),
+  `broadcast_to_peers` silently sends to nobody and the cluster_connect is lost.
+
+  The `peer_connect_ack` handler compensates: when it discovers named shared
+  clusters (both sides already connected), it sends `cluster_connect` to the
+  remote, triggering the standard ack + data + fan-out flow. This only fires
+  in the race case — normally the ack is processed before `connect/2` is called,
+  so `my_clusters` contains only nil and no compensation is needed.
 
   ### Steady-State Replication
 
@@ -199,7 +240,7 @@ defmodule Group.Replica do
 
     case Data.registry_lookup(name, shard, cluster, key) do
       {pid, meta, _time, entry_node} when entry_node == node() ->
-        Data.registry_delete(name, shard, cluster, key)
+        Data.registry_delete(name, shard, cluster, key, pid)
         state = maybe_demonitor_pid(state, name, shard, pid)
 
         broadcast_to_cluster(
@@ -299,32 +340,31 @@ defmodule Group.Replica do
   # Cluster connect/disconnect (broadcast to all shards, rare operation)
   # =====================================================================
 
-  def handle_call({:cluster_connect, cluster}, _from, state) do
-    %{name: name} = state
+  def handle_call({:cluster_connect, clusters}, _from, state) do
+    log_once(state, fn ->
+      "#{log_prefix(state)} cluster_connect (#{length(clusters)} clusters)"
+    end)
 
-    log_once(state, fn -> "#{log_prefix(state)} cluster_connect #{inspect(cluster)}" end)
-
-    # Broadcast to remote peers to inform them about our cluster membership
-    broadcast_to_peers(state, {:cluster_connect, cluster, self()})
-
-    # Send cluster data for this shard to existing cluster members
-    send_cluster_data_to_nodes(state, cluster, Data.cluster_nodes(name, cluster))
+    broadcast_to_peers(state, {:cluster_connect, clusters, self()})
 
     {:reply, :ok, state}
   end
 
-  def handle_call({:cluster_disconnect, cluster}, _from, state) do
+  def handle_call({:cluster_disconnect, clusters}, _from, state) do
     %{name: name, shard_index: shard} = state
 
-    log_once(state, fn -> "#{log_prefix(state)} cluster_disconnect #{inspect(cluster)}" end)
+    log_once(state, fn ->
+      "#{log_prefix(state)} cluster_disconnect (#{length(clusters)} clusters)"
+    end)
 
-    # Remove our entries for this cluster
-    {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
+    for cluster <- clusters do
+      {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
+      dispatch_purged(state, cluster, purged_reg, purged_pg, :cluster_disconnect)
+    end
 
-    # Fire events for purged entries
-    dispatch_purged(state, cluster, purged_reg, purged_pg, :cluster_disconnect)
-
-    broadcast_to_peers(state, {:cluster_disconnect, cluster, self()})
+    if shard == 0 do
+      broadcast_to_peers(state, {:cluster_disconnect, clusters, self()})
+    end
 
     {:reply, :ok, state}
   end
@@ -403,7 +443,7 @@ defmodule Group.Replica do
 
     case Data.registry_lookup(name, shard, cluster, key) do
       {^pid, _meta, _time, _node} ->
-        Data.registry_delete(name, shard, cluster, key)
+        Data.registry_delete(name, shard, cluster, key, pid)
 
         Group.__dispatch__(name, :unregistered, key, pid, meta, %{
           reason: reason,
@@ -574,6 +614,16 @@ defmodule Group.Replica do
     # Send cluster_state for all shared clusters in one pass
     send_cluster_states(state, shared, remote_node)
 
+    # If named clusters are shared, trigger the full cluster_connect protocol
+    # on the remote so it does ack + data + fan-out. This compensates for the
+    # case where our connect/2 broadcast was lost (remote_shards was empty at
+    # the time because this ack hadn't been processed yet).
+    named_shared = Enum.filter(shared, &(&1 != nil))
+
+    if named_shared != [] do
+      send_to_peer(state, remote_node, {:cluster_connect, named_shared, self()})
+    end
+
     {:noreply, state}
   end
 
@@ -609,51 +659,67 @@ defmodule Group.Replica do
   # Cluster connect/disconnect from remote
   # =====================================================================
 
-  def handle_info({:cluster_connect, cluster, remote_pid}, state) do
+  def handle_info({:cluster_connect, clusters, remote_pid}, state) do
     %{name: name} = state
     remote_node = node(remote_pid)
 
+    shared =
+      Enum.filter(clusters, fn c ->
+        node() in Data.cluster_nodes(name, c)
+      end)
+
     log_once(state, fn ->
-      "#{log_prefix(state)} #{remote_node} cluster_connect #{inspect(cluster)}"
+      "#{log_prefix(state)} #{remote_node} cluster_connect (#{length(shared)}/#{length(clusters)} shared)"
     end)
 
-    if node() in Data.cluster_nodes(name, cluster) do
-      # We're also in this cluster — add the remote node and exchange data
+    for cluster <- shared do
       Data.add_cluster_node(name, cluster, remote_node)
+    end
 
-      # Send ack so remote node knows we're in the cluster too
-      send_to_peer(state, remote_node, {:cluster_connect_ack, cluster, self()})
-
-      # Send our local data for this cluster to the new member
-      send_cluster_state(state, cluster, remote_node)
+    if shared != [] do
+      send_to_peer(state, remote_node, {:cluster_connect_ack, shared, self()})
+      send_cluster_states(state, shared, remote_node)
+      fan_out_to_siblings(state, {:send_cluster_data, shared, remote_node})
     end
 
     {:noreply, state}
   end
 
-  def handle_info({:cluster_connect_ack, cluster, remote_pid}, state) do
+  def handle_info({:cluster_connect_ack, clusters, remote_pid}, state) do
     %{name: name} = state
     remote_node = node(remote_pid)
 
-    # The remote node confirmed it's in this cluster — add it to our cluster_nodes
-    Data.add_cluster_node(name, cluster, remote_node)
+    for cluster <- clusters do
+      Data.add_cluster_node(name, cluster, remote_node)
+    end
+
+    send_cluster_states(state, clusters, remote_node)
+    fan_out_to_siblings(state, {:send_cluster_data, clusters, remote_node})
+
     {:noreply, state}
   end
 
-  def handle_info({:cluster_disconnect, cluster, remote_pid}, state) do
+  def handle_info({:cluster_disconnect, clusters, remote_pid}, state) do
     %{name: name, shard_index: shard} = state
     remote_node = node(remote_pid)
 
     log_once(state, fn ->
-      "#{log_prefix(state)} #{remote_node} cluster_disconnect #{inspect(cluster)}"
+      "#{log_prefix(state)} #{remote_node} cluster_disconnect (#{length(clusters)} clusters)"
     end)
 
-    # Remove the disconnecting node from cluster membership (shared table, once)
-    if shard == 0, do: Data.remove_cluster_node(name, cluster, remote_node)
+    if shard == 0 do
+      for cluster <- clusters do
+        Data.remove_cluster_node(name, cluster, remote_node)
+      end
 
-    # Purge the disconnecting node's entries for this cluster
-    {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, remote_node)
-    state = dispatch_purged(state, cluster, purged_reg, purged_pg, :cluster_disconnect)
+      fan_out_to_siblings(state, {:cluster_disconnect, clusters, remote_pid})
+    end
+
+    for cluster <- clusters do
+      {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, remote_node)
+      dispatch_purged(state, cluster, purged_reg, purged_pg, :cluster_disconnect)
+    end
+
     {:noreply, state}
   end
 
@@ -761,7 +827,7 @@ defmodule Group.Replica do
       for entry <- my_entries do
         case entry do
           {:registry, cluster, key, ^pid, meta, _time, _entry_node} ->
-            Data.registry_delete(name, shard, cluster, key)
+            Data.registry_delete(name, shard, cluster, key, pid)
 
             broadcast_to_cluster(
               state,
@@ -795,6 +861,18 @@ defmodule Group.Replica do
     end
   end
 
+  def handle_info({:send_cluster_data, clusters, target_node}, state) do
+    %{name: name} = state
+
+    active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
+
+    if active != [] do
+      send_cluster_states(state, active, target_node)
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -826,6 +904,14 @@ defmodule Group.Replica do
 
     for target_node <- Data.cluster_nodes(name, cluster), target_node != node() do
       send({shard_name, target_node}, message)
+    end
+  end
+
+  defp fan_out_to_siblings(state, message) do
+    %{name: name, shard_index: shard_index, num_shards: num_shards} = state
+
+    for i <- 0..(num_shards - 1), i != shard_index do
+      send(shard_name(name, i), message)
     end
   end
 
@@ -866,7 +952,7 @@ defmodule Group.Replica do
     monitors =
       try do
         :ets.foldl(
-          fn {pid, _cluster, _key, _meta, _time, entry_node}, acc ->
+          fn {{pid, _cluster, _key}, _meta, _time, entry_node}, acc ->
             if entry_node == local and not Map.has_key?(acc, pid) do
               mref = Process.monitor(pid)
               Map.put(acc, pid, mref)
@@ -977,7 +1063,7 @@ defmodule Group.Replica do
     cond do
       winner_pid == remote_pid ->
         # Remote wins — replace local entry
-        Data.registry_delete(name, shard, cluster, key)
+        Data.registry_delete(name, shard, cluster, key, local_pid)
         state = maybe_demonitor_pid(state, name, shard, local_pid)
         time = System.system_time()
 
@@ -1019,7 +1105,7 @@ defmodule Group.Replica do
 
       true ->
         # Neither wins — remove both
-        Data.registry_delete(name, shard, cluster, key)
+        Data.registry_delete(name, shard, cluster, key, local_pid)
         state = maybe_demonitor_pid(state, name, shard, local_pid)
 
         broadcast_to_cluster(
@@ -1048,22 +1134,6 @@ defmodule Group.Replica do
 
     Process.exit(loser_pid, {:group_registry_conflict, key, meta2})
     winner_pid
-  end
-
-  defp send_cluster_state(state, cluster, target_node) do
-    %{name: name, shard_index: shard} = state
-
-    {reg_data, pg_data} = Data.local_data(name, shard, cluster)
-
-    if reg_data != [] or pg_data != [] do
-      send_to_peer(state, target_node, {:cluster_state, cluster, reg_data, pg_data})
-    end
-  end
-
-  defp send_cluster_data_to_nodes(state, cluster, target_nodes) do
-    for target_node <- target_nodes, target_node != node() do
-      send_cluster_state(state, cluster, target_node)
-    end
   end
 
   # Gather local data for all shared clusters in ONE table scan (instead of C scans)
@@ -1104,9 +1174,9 @@ defmodule Group.Replica do
       ])
       |> Enum.map(fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
 
-    for {^cluster, key, _pid, _meta, _time} <- purged_reg do
+    for {^cluster, key, pid, _meta, _time} <- purged_reg do
       :ets.delete(reg_table, {cluster, key})
-      :ets.match_delete(reg_pid_table, {:_, cluster, key, :_, :_, target_node})
+      :ets.delete(reg_pid_table, {pid, cluster, key})
     end
 
     pg_table = Data.pg_by_key_table(name, shard)

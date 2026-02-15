@@ -10,7 +10,7 @@ defmodule Group.Replica.Data do
 
   ## ETS Table Layout
 
-  Each shard owns 4 tables. There is also 1 shared cluster_nodes table per Group instance.
+  Each shard owns 4 tables. There are also 2 shared cluster membership tables per Group instance.
 
   ### reg_by_key — `:set`, keyed by `{cluster, key}`
 
@@ -20,16 +20,18 @@ defmodule Group.Replica.Data do
   `registry_lookup/4` does a direct `ets.lookup` on `{cluster, key}` — O(1) constant time.
   `registry_delete/4` does a direct `ets.delete` — O(1).
 
-  ### reg_by_pid — `:bag`, keyed by `pid`
+  ### reg_by_pid — `:ordered_set`, keyed by `{pid, cluster, key}`
 
-      {pid, cluster, key, meta, time, node}
+      {{pid, cluster, key}, meta, time, node}
 
-  Reverse index for process death cleanup. `:bag` because a single pid could be registered
-  under different keys in different clusters (though unusual). `ets.lookup(table, pid)` returns
-  all entries for that pid — O(number of entries for that pid), typically 1.
+  Reverse index for process death cleanup. `:ordered_set` keyed by `{pid, ...}` so that
+  `entries_by_pid` can select all entries for a pid as a contiguous range scan. Also used
+  by `maybe_demonitor` to check if a pid has any remaining entries (select with limit 1).
 
-  `registry_delete` uses `ets.match_delete` with `{:_, cluster, key, :_, :_, :_}` to
-  remove the specific entry from the bag. This scans entries for the pid's bucket — O(small).
+  Re-registration (metadata update) overwrites the existing entry in place — no stale
+  accumulation. Direct deletes use `ets.delete(table, {pid, cluster, key})` — O(log N).
+
+  Mirrors the `pg_by_pid` design.
 
   ### pg_by_key — `:ordered_set`, keyed by `{cluster, key, pid}`
 
@@ -54,11 +56,23 @@ defmodule Group.Replica.Data do
 
       {cluster, node}
 
-  Shared across all shards. One row per {cluster, node} pair — `:bag` deduplicates
+  Forward index: cluster → nodes. One row per {cluster, node} pair — `:bag` deduplicates
   exact tuples on insert, so concurrent adds of the same node are idempotent with no
-  read-modify-write race. Used for both the default cluster (nil) and named clusters.
-  The nil cluster is maintained by the peer_connect protocol — nodes are added on peer
-  discovery and removed on nodedown/shard death. `Group.nodes/1` reads nil cluster from ETS.
+  read-modify-write race. `cluster_nodes/2` does a direct bucket lookup — O(nodes in cluster).
+
+  ### node_clusters — `:bag`, keyed by node
+
+      {node, cluster}
+
+  Reverse index: node → clusters. Mirrors cluster_nodes for efficient node-centric lookups.
+  `my_clusters/1` does a bucket lookup — O(clusters for this node) instead of a full table
+  scan. `purge_cluster_node/2` uses this to find all clusters for a dead node, then does
+  targeted deletes from both tables — O(clusters for node) instead of O(total entries).
+
+  Both tables are shared across all shards. Used for the default cluster (nil) and named
+  clusters. The nil cluster is maintained by the peer_connect protocol — nodes are added on
+  peer discovery and removed on nodedown/shard death. `Group.nodes/1` reads nil cluster
+  from cluster_nodes.
 
   ## Match Spec Patterns
 
@@ -72,13 +86,13 @@ defmodule Group.Replica.Data do
   - `purge_node/3`: Full table scan via `ets.select` filtering by node, then individual
     deletes. O(table size) for the scan, but this only runs on nodedown — rare path.
 
-  - `local_data/3`: Full table scan filtering by `node() == local_node`.
-    Only runs during discovery/sync protocol — initial connection or reconnection.
+  - `local_data_by_cluster/3`: Full table scan filtering by `node() == local_node`,
+    grouped by cluster. Only runs during discovery/sync protocol.
 
   - `local_registry_count`, `local_pg_count`: Uses `ets.select_count` with a guard.
     Full scan but returns only the count without materializing results.
 
-  - `entries_by_pid/3`: Direct key lookup on the by_pid tables. O(entries for that pid).
+  - `entries_by_pid/3`: Range scan on the by_pid ordered_set tables. O(entries for that pid).
 
   ## Process Monitors
 
@@ -126,16 +140,15 @@ defmodule Group.Replica.Data do
     table = reg_by_key_table(name, shard)
     :ets.insert(table, {{cluster, key}, pid, meta, time, node})
     table_pid = reg_by_pid_table(name, shard)
-    :ets.insert(table_pid, {pid, cluster, key, meta, time, node})
+    :ets.insert(table_pid, {{pid, cluster, key}, meta, time, node})
     :ok
   end
 
-  def registry_delete(name, shard, cluster, key) do
+  def registry_delete(name, shard, cluster, key, pid) do
     table = reg_by_key_table(name, shard)
     :ets.delete(table, {cluster, key})
     table_pid = reg_by_pid_table(name, shard)
-    # Delete matching entries from by_pid table
-    :ets.match_delete(table_pid, {:_, cluster, key, :_, :_, :_})
+    :ets.delete(table_pid, {pid, cluster, key})
     :ok
   end
 
@@ -154,10 +167,9 @@ defmodule Group.Replica.Data do
   def registry_lookup_by_pid(name, shard, pid) do
     table = reg_by_pid_table(name, shard)
 
-    :ets.lookup(table, pid)
-    |> Enum.map(fn {^pid, cluster, key, meta, time, node} ->
-      {cluster, key, meta, time, node}
-    end)
+    :ets.select(table, [
+      {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [], [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+    ])
   end
 
   # =====================================================================
@@ -207,27 +219,28 @@ defmodule Group.Replica.Data do
   # =====================================================================
 
   def maybe_demonitor(name, shard, pid) do
-    # Count remaining entries for this pid across both tables in this shard
-    reg_count = length(:ets.lookup(reg_by_pid_table(name, shard), pid))
+    # Check remaining entries for this pid across both tables in this shard
+    table_reg = reg_by_pid_table(name, shard)
 
-    pg_count =
-      if reg_count > 0 do
-        # Still has entries, don't demonitor
-        1
+    has_reg =
+      case :ets.select(table_reg, [{{{pid, :_, :_}, :_, :_, :_}, [], [true]}], 1) do
+        {[true], _} -> true
+        :"$end_of_table" -> false
+      end
+
+    has_pg =
+      if has_reg do
+        true
       else
         table_pg = pg_by_pid_table(name, shard)
 
         case :ets.select(table_pg, [{{{pid, :_, :_}, :_, :_, :_}, [], [true]}], 1) do
-          {[true], _} -> 1
-          :"$end_of_table" -> 0
+          {[true], _} -> true
+          :"$end_of_table" -> false
         end
       end
 
-    if reg_count == 0 and pg_count == 0 do
-      :ok
-    else
-      :still_monitored
-    end
+    if has_reg or has_pg, do: :still_monitored, else: :ok
   end
 
   # =====================================================================
@@ -235,9 +248,13 @@ defmodule Group.Replica.Data do
   # =====================================================================
 
   def entries_by_pid(name, shard, pid) do
+    reg_table = reg_by_pid_table(name, shard)
+
     reg_entries =
-      :ets.lookup(reg_by_pid_table(name, shard), pid)
-      |> Enum.map(fn {^pid, cluster, key, meta, time, node} ->
+      :ets.select(reg_table, [
+        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [], [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+      ])
+      |> Enum.map(fn {cluster, key, meta, time, node} ->
         {:registry, cluster, key, pid, meta, time, node}
       end)
 
@@ -252,28 +269,6 @@ defmodule Group.Replica.Data do
       end)
 
     reg_entries ++ pg_entries
-  end
-
-  def local_data(name, shard, cluster) do
-    local_node = node()
-
-    reg_table = reg_by_key_table(name, shard)
-
-    reg_entries =
-      :ets.select(reg_table, [
-        {{{cluster, :"$1"}, :"$2", :"$3", :"$4", :"$5"}, [{:==, :"$5", local_node}],
-         [{{:"$1", :"$2", :"$3", :"$4"}}]}
-      ])
-
-    pg_table = pg_by_key_table(name, shard)
-
-    pg_entries =
-      :ets.select(pg_table, [
-        {{{cluster, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [{:==, :"$5", local_node}],
-         [{{:"$1", :"$2", :"$3", :"$4"}}]}
-      ])
-
-    {reg_entries, pg_entries}
   end
 
   def local_data_by_cluster(name, shard, clusters) do
@@ -313,9 +308,9 @@ defmodule Group.Replica.Data do
          [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
       ])
 
-    for {cluster, key, _pid, _meta, _time} <- purged_reg do
+    for {cluster, key, pid, _meta, _time} <- purged_reg do
       :ets.delete(reg_table, {cluster, key})
-      :ets.match_delete(reg_pid_table, {:_, cluster, key, :_, :_, dead_node})
+      :ets.delete(reg_pid_table, {pid, cluster, key})
     end
 
     pg_table = pg_by_key_table(name, shard)
@@ -370,7 +365,7 @@ defmodule Group.Replica.Data do
   end
 
   # =====================================================================
-  # Cluster membership (shared table — :bag, one row per {cluster, node})
+  # Cluster membership (dual-index: cluster_nodes + node_clusters)
   # =====================================================================
 
   def cluster_nodes(name, cluster) do
@@ -379,20 +374,14 @@ defmodule Group.Replica.Data do
   end
 
   def add_cluster_node(name, cluster, node) do
-    table = cluster_nodes_table(name)
-    :ets.insert(table, {cluster, node})
+    :ets.insert(cluster_nodes_table(name), {cluster, node})
+    :ets.insert(node_clusters_table(name), {node, cluster})
     :ok
   end
 
   def remove_cluster_node(name, cluster, node) do
-    table = cluster_nodes_table(name)
-    :ets.delete_object(table, {cluster, node})
-    :ok
-  end
-
-  def delete_cluster_nodes(name, cluster) do
-    table = cluster_nodes_table(name)
-    :ets.delete(table, cluster)
+    :ets.delete_object(cluster_nodes_table(name), {cluster, node})
+    :ets.delete_object(node_clusters_table(name), {node, cluster})
     :ok
   end
 
@@ -402,14 +391,19 @@ defmodule Group.Replica.Data do
   end
 
   def my_clusters(name) do
-    local_node = node()
-    table = cluster_nodes_table(name)
-    :ets.select(table, [{{:"$1", :"$2"}, [{:==, :"$2", local_node}], [:"$1"]}])
+    table = node_clusters_table(name)
+    :ets.lookup(table, node()) |> Enum.map(&elem(&1, 1))
   end
 
-  def purge_cluster_node(name, node) do
-    table = cluster_nodes_table(name)
-    :ets.match_delete(table, {:_, node})
+  def purge_cluster_node(name, dead_node) do
+    reverse = node_clusters_table(name)
+    forward = cluster_nodes_table(name)
+
+    for {^dead_node, cluster} <- :ets.lookup(reverse, dead_node) do
+      :ets.delete_object(forward, {cluster, dead_node})
+    end
+
+    :ets.delete(reverse, dead_node)
     :ok
   end
 
@@ -422,6 +416,7 @@ defmodule Group.Replica.Data do
   def pg_by_key_table(name, shard), do: :"#{name}_s#{shard}_pg_by_key"
   def pg_by_pid_table(name, shard), do: :"#{name}_s#{shard}_pg_by_pid"
   def cluster_nodes_table(name), do: :"#{name}_cluster_nodes"
+  def node_clusters_table(name), do: :"#{name}_node_clusters"
 
   # =====================================================================
   # GenServer callbacks
@@ -438,7 +433,7 @@ defmodule Group.Replica.Data do
       ])
 
       :ets.new(reg_by_pid_table(name, shard), [
-        :bag,
+        :ordered_set,
         :public,
         :named_table,
         read_concurrency: true
@@ -460,6 +455,13 @@ defmodule Group.Replica.Data do
     end
 
     :ets.new(cluster_nodes_table(name), [
+      :bag,
+      :public,
+      :named_table,
+      read_concurrency: true
+    ])
+
+    :ets.new(node_clusters_table(name), [
       :bag,
       :public,
       :named_table,
