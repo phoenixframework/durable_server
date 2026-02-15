@@ -71,11 +71,28 @@ defmodule Group.Replica do
   processed its `peer_connect_ack` yet (remote_shards is empty),
   `broadcast_to_peers` silently sends to nobody and the cluster_connect is lost.
 
-  The `peer_connect_ack` handler compensates: when it discovers named shared
-  clusters (both sides already connected), it sends `cluster_connect` to the
-  remote, triggering the standard ack + data + fan-out flow. This only fires
-  in the race case — normally the ack is processed before `connect/2` is called,
-  so `my_clusters` contains only nil and no compensation is needed.
+  The `peer_connect_ack` handler compensates: when shard 0 discovers named
+  shared clusters (both sides already connected), it sends `cluster_connect`
+  to the remote, triggering the standard ack + data + fan-out flow. Only shard
+  0 sends compensation — one is sufficient since the remote fans out to all
+  siblings. This avoids O(N²) redundant messages from all N shards firing
+  independently. This only fires in the race case — normally the ack is
+  processed before `connect/2` is called, so `my_clusters` contains only nil
+  and no compensation is needed.
+
+  ### Cluster Connect Ack Guards
+
+  The `cluster_connect_ack` handler guards against two stale-state races:
+
+  1. **Disconnect race**: If `connect/2` and `disconnect/2` overlap on the same
+     cluster, a delayed ack could re-add the remote node to cluster_nodes for a
+     cluster we already left. Guard: only process clusters where `node()` is
+     still a member of `cluster_nodes`.
+
+  2. **Nodedown race**: If the remote node dies and `nodedown` purges it from
+     cluster_nodes, a delayed ack (already in mailbox) could re-add the dead
+     node as a ghost. Guard: only process acks from nodes still in
+     `remote_shards` (cleared on nodedown/DOWN).
 
   ### Steady-State Replication
 
@@ -618,10 +635,17 @@ defmodule Group.Replica do
     # on the remote so it does ack + data + fan-out. This compensates for the
     # case where our connect/2 broadcast was lost (remote_shards was empty at
     # the time because this ack hadn't been processed yet).
-    named_shared = Enum.filter(shared, &(&1 != nil))
+    # Compensate for the connect/2 + peer_connect race: if named clusters are
+    # shared, trigger the full cluster_connect protocol on the remote (ack +
+    # data + fan-out). Only shard 0 sends this — one compensation is sufficient
+    # since the remote fans out to all its siblings. Without this gate, all N
+    # shards would independently fire compensation, causing O(N²) messages.
+    if state.shard_index == 0 do
+      named_shared = Enum.filter(shared, &(&1 != nil))
 
-    if named_shared != [] do
-      send_to_peer(state, remote_node, {:cluster_connect, named_shared, self()})
+      if named_shared != [] do
+        send_to_peer(state, remote_node, {:cluster_connect, named_shared, self()})
+      end
     end
 
     {:noreply, state}
@@ -689,12 +713,21 @@ defmodule Group.Replica do
     %{name: name} = state
     remote_node = node(remote_pid)
 
-    for cluster <- clusters do
-      Data.add_cluster_node(name, cluster, remote_node)
-    end
+    # Guard: skip if remote node went down (nodedown race) or if we left the
+    # cluster (connect+disconnect race). Without these, a delayed ack would
+    # re-add a dead/irrelevant node to cluster_nodes permanently.
+    if Map.has_key?(state.remote_shards, remote_node) do
+      active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
 
-    send_cluster_states(state, clusters, remote_node)
-    fan_out_to_siblings(state, {:send_cluster_data, clusters, remote_node})
+      for cluster <- active do
+        Data.add_cluster_node(name, cluster, remote_node)
+      end
+
+      if active != [] do
+        send_cluster_states(state, active, remote_node)
+        fan_out_to_siblings(state, {:send_cluster_data, active, remote_node})
+      end
+    end
 
     {:noreply, state}
   end
