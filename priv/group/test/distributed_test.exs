@@ -1066,6 +1066,41 @@ defmodule Group.DistributedTest do
         timeout: 10_000
       )
     end
+
+    test "connect before peer discovery delivers data" do
+      # Reproduces the connect/2 + peer_connect race:
+      # 1. Start Group on both A and B, let peer discovery complete (nil only)
+      # 2. A connects to "game" and registers data
+      # 3. B connects to "game" — B's connect/2 must reach A even though
+      #    the random shard's remote_shards may not include A yet
+      #    (only shard S that processed peer_connect_ack has it)
+      #
+      # The fix: handle_call(:cluster_connect) reads peers from shared ETS
+      # (cluster_nodes for nil cluster) instead of per-shard remote_shards.
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_connect_race_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # A connects to "game" and registers
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.spawn_register_in_cluster(node_a, name, "player/1", %{id: 1}, "game")
+
+      # B connects to "game"
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      # B should see A's data
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_b, Group, :lookup, [name, "player/1", [cluster: "game"]]) != nil
+        end,
+        timeout: 5_000
+      )
+    end
   end
 
   describe "Group.nodes tracks actual peers" do
@@ -1351,6 +1386,327 @@ defmodule Group.DistributedTest do
         [{peer_b_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_b end)
         :peer.stop(peer_b_pid)
       end)
+    end
+  end
+
+  describe "chatty convergence" do
+    @tag timeout: 60_000
+    test "many clusters, registrations, groups, churn, and dispatch all converge" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      nodes = [node_a, node_b, node_c]
+      name = :"dist_chatty_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # --- Phase 1: connect clusters across nodes ---
+      # 10 "org" clusters, each node joins a subset
+      cluster_count = 10
+
+      clusters =
+        for i <- 1..cluster_count do
+          "org/#{i}"
+        end
+
+      # Every node connects to every cluster
+      for node <- nodes, cluster <- clusters do
+        TestCluster.rpc!(node, Group, :connect, [name, cluster])
+      end
+
+      # --- Phase 2: registrations spread across clusters and nodes ---
+      # 5 registrations per cluster per node = 150 total
+      reg_pids =
+        for {node, ni} <- Enum.with_index(nodes),
+            cluster <- clusters,
+            ri <- 1..5 do
+          key = "user/#{ni}_#{ri}"
+          TestCluster.spawn_register_in_cluster(node, name, key, %{node: ni, i: ri}, cluster)
+          {node, cluster, key}
+        end
+
+      # --- Phase 3: process group joins across clusters ---
+      # 3 groups per cluster, 2 members per group from different nodes = 60 joins
+      group_pids =
+        for {cluster, ci} <- Enum.with_index(clusters),
+            gi <- 1..3 do
+          group_key = "room/#{ci}_#{gi}"
+          node1 = Enum.at(nodes, rem(ci + gi, 3))
+          node2 = Enum.at(nodes, rem(ci + gi + 1, 3))
+
+          pid1 =
+            TestCluster.spawn_join(node1, name, group_key, %{seat: 1}, cluster: cluster)
+
+          pid2 =
+            TestCluster.spawn_join(node2, name, group_key, %{seat: 2}, cluster: cluster)
+
+          {cluster, group_key, [pid1, pid2]}
+        end
+
+      # --- Phase 4: verify all data converged on all nodes ---
+      # Check registrations: every node should see every registration
+      for {_reg_node, cluster, key} <- reg_pids do
+        TestCluster.assert_eventually(
+          fn ->
+            Enum.all?(nodes, fn check_node ->
+              TestCluster.rpc!(check_node, Group, :lookup, [name, key, [cluster: cluster]]) != nil
+            end)
+          end,
+          timeout: 10_000
+        )
+      end
+
+      # Check groups: every node should see 2 members per group
+      for {cluster, group_key, _pids} <- group_pids do
+        TestCluster.assert_eventually(
+          fn ->
+            Enum.all?(nodes, fn check_node ->
+              members =
+                TestCluster.rpc!(check_node, Group, :members, [
+                  name,
+                  group_key,
+                  [cluster: cluster]
+                ])
+
+              length(members) == 2
+            end)
+          end,
+          timeout: 10_000
+        )
+      end
+
+      # --- Phase 5: churn — kill some processes and verify cleanup ---
+      # Kill 2 registrations per cluster (20 total) by killing the remote pid
+      killed_keys =
+        for cluster <- Enum.take(clusters, 5),
+            ni <- 0..1 do
+          key = "user/#{ni}_1"
+
+          {pid, _meta} =
+            TestCluster.rpc!(Enum.at(nodes, ni), Group, :lookup, [name, key, [cluster: cluster]])
+
+          Process.exit(pid, :kill)
+          {cluster, key}
+        end
+
+      # Verify killed registrations are cleaned up on all nodes
+      for {cluster, key} <- killed_keys do
+        TestCluster.assert_eventually(
+          fn ->
+            Enum.all?(nodes, fn check_node ->
+              TestCluster.rpc!(check_node, Group, :lookup, [name, key, [cluster: cluster]]) == nil
+            end)
+          end,
+          timeout: 10_000
+        )
+      end
+
+      # --- Phase 6: disconnect and verify cleanup ---
+
+      # 6a: Node A disconnects from "org/10" — A's registrations and groups
+      # should be purged from B and C, but B and C keep their own data
+      dropped_cluster = "org/10"
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, dropped_cluster])
+
+      # A's registrations in org/10 should be gone everywhere
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(nodes, fn check_node ->
+            TestCluster.rpc!(check_node, Group, :lookup, [
+              name,
+              "user/0_1",
+              [cluster: dropped_cluster]
+            ]) == nil
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      # B and C still see each other's org/10 data
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [
+          name,
+          "user/1_2",
+          [cluster: dropped_cluster]
+        ]) != nil and
+          TestCluster.rpc!(node_c, Group, :lookup, [
+            name,
+            "user/2_2",
+            [cluster: dropped_cluster]
+          ]) != nil
+      end)
+
+      # 6b: B and C also disconnect — full cluster teardown
+      TestCluster.rpc!(node_b, Group, :disconnect, [name, dropped_cluster])
+      TestCluster.rpc!(node_c, Group, :disconnect, [name, dropped_cluster])
+
+      # All org/10 data should be gone everywhere
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(nodes, fn check_node ->
+            TestCluster.rpc!(check_node, Group, :lookup, [
+              name,
+              "user/1_2",
+              [cluster: dropped_cluster]
+            ]) == nil
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      # Surviving registrations in other clusters should still be there
+      surviving_key = "user/2_2"
+      surviving_cluster = "org/6"
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(nodes, fn check_node ->
+            TestCluster.rpc!(check_node, Group, :lookup, [
+              name,
+              surviving_key,
+              [cluster: surviving_cluster]
+            ]) != nil
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      # --- Phase 7: dispatch works across remaining clusters ---
+      # Join a group, dispatch to it from another node, verify delivery
+      dispatch_cluster = "org/3"
+      dispatch_group = "dispatch_room"
+
+      receiver =
+        TestCluster.spawn_join_forwarder(node_a, name, dispatch_group, self(),
+          cluster: dispatch_cluster
+        )
+
+      # Wait for join to replicate
+      TestCluster.assert_eventually(fn ->
+        members =
+          TestCluster.rpc!(node_c, Group, :members, [
+            name,
+            dispatch_group,
+            [cluster: dispatch_cluster]
+          ])
+
+        Enum.any?(members, fn {pid, _} -> pid == receiver end)
+      end)
+
+      # Dispatch from node_c
+      TestCluster.rpc!(node_c, Group, :dispatch, [
+        name,
+        dispatch_group,
+        {:ping, 42},
+        [cluster: dispatch_cluster]
+      ])
+
+      assert_receive {:forwarded, {:ping, 42}}, 5_000
+
+      # --- Phase 8: late cluster connect with late joiner ---
+      # A and B connect to a new cluster and populate it with data.
+      # C joins later and must receive all existing data.
+      late_cluster = "late/lobby"
+
+      # A and B connect and register data
+      TestCluster.rpc!(node_a, Group, :connect, [name, late_cluster])
+      TestCluster.rpc!(node_b, Group, :connect, [name, late_cluster])
+
+      TestCluster.spawn_register_in_cluster(
+        node_a,
+        name,
+        "late_user/0",
+        %{late: true},
+        late_cluster
+      )
+
+      TestCluster.spawn_register_in_cluster(
+        node_b,
+        name,
+        "late_user/1",
+        %{late: true},
+        late_cluster
+      )
+
+      TestCluster.spawn_join(node_a, name, "late_room", %{seat: 0}, cluster: late_cluster)
+      TestCluster.spawn_join(node_b, name, "late_room", %{seat: 1}, cluster: late_cluster)
+
+      # Wait for A and B to converge between themselves
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "late_user/1", [cluster: late_cluster]]) !=
+          nil and
+          TestCluster.rpc!(node_b, Group, :lookup, [name, "late_user/0", [cluster: late_cluster]]) !=
+            nil
+      end)
+
+      # C joins late — should receive all existing data from A and B
+      TestCluster.rpc!(node_c, Group, :connect, [name, late_cluster])
+
+      # C adds its own data
+      TestCluster.spawn_register_in_cluster(
+        node_c,
+        name,
+        "late_user/2",
+        %{late: true},
+        late_cluster
+      )
+
+      TestCluster.spawn_join(node_c, name, "late_room", %{seat: 2}, cluster: late_cluster)
+
+      # All nodes should see all 3 registrations and 3 group members
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(nodes, fn check_node ->
+            r0 =
+              TestCluster.rpc!(check_node, Group, :lookup, [
+                name,
+                "late_user/0",
+                [cluster: late_cluster]
+              ])
+
+            r1 =
+              TestCluster.rpc!(check_node, Group, :lookup, [
+                name,
+                "late_user/1",
+                [cluster: late_cluster]
+              ])
+
+            r2 =
+              TestCluster.rpc!(check_node, Group, :lookup, [
+                name,
+                "late_user/2",
+                [cluster: late_cluster]
+              ])
+
+            members =
+              TestCluster.rpc!(check_node, Group, :members, [
+                name,
+                "late_room",
+                [cluster: late_cluster]
+              ])
+
+            r0 != nil and r1 != nil and r2 != nil and length(members) == 3
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      # --- Phase 9: final consistency check ---
+      # All nodes should agree on sample keys across surviving clusters
+      for cluster <- Enum.take(clusters, 9) do
+        sample_key = "user/2_3"
+
+        results =
+          Enum.map(nodes, fn node ->
+            TestCluster.rpc!(node, Group, :lookup, [name, sample_key, [cluster: cluster]])
+          end)
+
+        # All nodes should agree (all non-nil or all nil)
+        assert length(Enum.uniq_by(results, &is_nil/1)) == 1,
+               "Nodes disagree on #{sample_key} in #{cluster}: #{inspect(results)}"
+      end
     end
   end
 end

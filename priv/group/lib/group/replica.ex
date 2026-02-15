@@ -20,7 +20,7 @@ defmodule Group.Replica do
   | `{:replicate_join, cluster, key, pid, meta, time, reason}` | broadcast      | Propagate join                   |
   | `{:replicate_leave, cluster, key, pid, meta, reason}`      | broadcast      | Propagate leave                  |
   | `{:cluster_connect, clusters, pid}`                        | S→remote S     | Node joining named clusters      |
-  | `{:cluster_connect_ack, clusters, pid}`                    | S→remote S     | Acknowledge cluster join + data  |
+  | `{:cluster_connect_ack, clusters, pid, cluster_data}`      | S→remote S     | Ack + bundled shard data         |
   | `{:cluster_disconnect, clusters, pid}`                     | shard 0→remote | Node leaving named clusters      |
   | `{:send_cluster_data, clusters, target_node}`              | local fan-out  | Notify siblings: send shard data |
 
@@ -34,27 +34,36 @@ defmodule Group.Replica do
   shard independently discovers its remote counterpart.
 
   When `peer_connect_ack` discovers named shared clusters (i.e. both sides are
-  already in the same named cluster), it sends a `cluster_connect` message to
-  the remote to trigger the full fan-out data exchange. This handles the race
-  where `connect/2` ran between peer_connect send and ack processing — see
-  "Peer Discovery + Connect Race" below.
+  already in the same named cluster), it exchanges `cluster_state` data for
+  those clusters. This naturally handles the case where `connect/2` ran between
+  peer_connect send and ack processing — by the time the ack is processed, the
+  local node's cluster list includes the newly connected cluster, so the
+  intersection picks it up.
 
   ### Named Cluster Join (single shard notification + fan-out)
 
   1. Caller calls `Group.connect/2` which picks a random shard S and sends a
      single GenServer.call to shard S.
-  2. Shard S broadcasts `cluster_connect` to remote shard S on all peers.
-  3. Remote shard S adds membership to ETS, sends `cluster_connect_ack` + its
-     shard S `cluster_state`, and fans out `{:send_cluster_data, clusters, node}`
-     to all local sibling shards.
+  2. Shard S reads peers from shared ETS (`cluster_nodes` for nil cluster) and
+     sends `cluster_connect` to remote shard S on each peer.
+  3. Remote shard S adds membership to ETS, bundles its shard data into
+     `cluster_connect_ack`, and fans out `{:send_cluster_data, clusters, node}`
+     to local sibling shards.
   4. Each sibling shard sends its own `cluster_state` to the matching remote shard.
-  5. On receiving `cluster_connect_ack`, the initiator's shard S adds membership
-     to ETS, sends its shard S `cluster_state`, and fans out to siblings.
+  5. On receiving `cluster_connect_ack`, the initiator's shard S merges the
+     bundled data, adds membership to ETS, sends its shard S `cluster_state`,
+     and fans out to siblings.
+
+  Using shared ETS for peer lookup (instead of per-shard `remote_shards`) avoids
+  the race where `connect/2` runs before the random shard's `peer_connect_ack`
+  has populated `remote_shards`. The nil cluster ETS is populated by ANY shard
+  processing an incoming `peer_connect`, so it's available much earlier.
+
+  Bundling shard S's data into the ack eliminates K separate `cluster_state`
+  messages (one per shared cluster) in each direction per connect.
 
   Randomizing the notification shard load-balances across shards when many
-  concurrent `connect` calls happen (e.g., 10,000 clusters). This reduces
-  cross-node messages from N² to 2N (one cluster_state per shard per direction)
-  and eliminates redundant ETS membership inserts.
+  concurrent `connect` calls happen (e.g., 10,000 clusters).
 
   ### Named Cluster Disconnect (shard 0 + fan-out)
 
@@ -64,21 +73,6 @@ defmodule Group.Replica do
      ETS entries.)
   2. Remote shard 0 removes membership from ETS and fans out to siblings.
   3. Each shard (0 and siblings) purges entries for the disconnected cluster+node.
-
-  ### Peer Discovery + Connect Race
-
-  `connect/2` picks a random shard S for its GenServer.call. If shard S hasn't
-  processed its `peer_connect_ack` yet (remote_shards is empty),
-  `broadcast_to_peers` silently sends to nobody and the cluster_connect is lost.
-
-  The `peer_connect_ack` handler compensates: when shard 0 discovers named
-  shared clusters (both sides already connected), it sends `cluster_connect`
-  to the remote, triggering the standard ack + data + fan-out flow. Only shard
-  0 sends compensation — one is sufficient since the remote fans out to all
-  siblings. This avoids O(N²) redundant messages from all N shards firing
-  independently. This only fires in the race case — normally the ack is
-  processed before `connect/2` is called, so `my_clusters` contains only nil
-  and no compensation is needed.
 
   ### Cluster Connect Ack Guards
 
@@ -358,11 +352,23 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_call({:cluster_connect, clusters}, _from, state) do
+    %{name: name} = state
+
     log_once(state, fn ->
       "#{log_prefix(state)} cluster_connect (#{length(clusters)} clusters)"
     end)
 
-    broadcast_to_peers(state, {:cluster_connect, clusters, self()})
+    # Use shared ETS (cluster_nodes for nil cluster) instead of per-shard
+    # remote_shards. The nil cluster ETS is populated by any shard processing
+    # peer_connect (incoming), so it's available before this shard's
+    # peer_connect_ack populates remote_shards. This eliminates the race where
+    # connect/2 runs before peer discovery completes on the random shard.
+    shard_name = shard_name(name, state.shard_index)
+    peers = Data.cluster_nodes(name, nil) -- [node()]
+
+    for target_node <- peers do
+      send({shard_name, target_node}, {:cluster_connect, clusters, self()})
+    end
 
     {:reply, :ok, state}
   end
@@ -631,23 +637,6 @@ defmodule Group.Replica do
     # Send cluster_state for all shared clusters in one pass
     send_cluster_states(state, shared, remote_node)
 
-    # If named clusters are shared, trigger the full cluster_connect protocol
-    # on the remote so it does ack + data + fan-out. This compensates for the
-    # case where our connect/2 broadcast was lost (remote_shards was empty at
-    # the time because this ack hadn't been processed yet).
-    # Compensate for the connect/2 + peer_connect race: if named clusters are
-    # shared, trigger the full cluster_connect protocol on the remote (ack +
-    # data + fan-out). Only shard 0 sends this — one compensation is sufficient
-    # since the remote fans out to all its siblings. Without this gate, all N
-    # shards would independently fire compensation, causing O(N²) messages.
-    if state.shard_index == 0 do
-      named_shared = Enum.filter(shared, &(&1 != nil))
-
-      if named_shared != [] do
-        send_to_peer(state, remote_node, {:cluster_connect, named_shared, self()})
-      end
-    end
-
     {:noreply, state}
   end
 
@@ -701,15 +690,26 @@ defmodule Group.Replica do
     end
 
     if shared != [] do
-      send_to_peer(state, remote_node, {:cluster_connect_ack, shared, self()})
-      send_cluster_states(state, shared, remote_node)
+      # Bundle this shard's cluster data directly into the ack (one cross-node
+      # message instead of ack + N separate cluster_state messages)
+      {reg_by_cluster, pg_by_cluster} =
+        Data.local_data_by_cluster(name, state.shard_index, shared)
+
+      cluster_data =
+        for cluster <- shared do
+          reg_data = Map.get(reg_by_cluster, cluster, [])
+          pg_data = Map.get(pg_by_cluster, cluster, [])
+          {cluster, reg_data, pg_data}
+        end
+
+      send_to_peer(state, remote_node, {:cluster_connect_ack, shared, self(), cluster_data})
       fan_out_to_siblings(state, {:send_cluster_data, shared, remote_node})
     end
 
     {:noreply, state}
   end
 
-  def handle_info({:cluster_connect_ack, clusters, remote_pid}, state) do
+  def handle_info({:cluster_connect_ack, clusters, remote_pid, cluster_data}, state) do
     %{name: name} = state
     remote_node = node(remote_pid)
 
@@ -724,6 +724,16 @@ defmodule Group.Replica do
       end
 
       if active != [] do
+        # Merge the data bundled in the ack
+        state =
+          Enum.reduce(cluster_data, state, fn {cluster, reg_data, pg_data}, acc ->
+            if cluster in active and (reg_data != [] or pg_data != []) do
+              merge_remote_cluster_data(acc, cluster, reg_data, pg_data)
+            else
+              acc
+            end
+          end)
+
         send_cluster_states(state, active, remote_node)
         fan_out_to_siblings(state, {:send_cluster_data, active, remote_node})
       end

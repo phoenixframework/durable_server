@@ -207,13 +207,22 @@ defmodule Group do
   def connect(name, cluster_or_clusters)
       when is_atom(name) do
     clusters = List.wrap(cluster_or_clusters)
+    local = node()
+    new_clusters = Enum.reject(clusters, fn c -> local in Data.cluster_nodes(name, c) end)
 
-    for cluster <- clusters do
-      Data.add_cluster_node(name, cluster, node())
+    if new_clusters != [] do
+      for cluster <- new_clusters do
+        Data.add_cluster_node(name, cluster, local)
+      end
+
+      notify_shard = :rand.uniform(get_config(name).num_shards) - 1
+
+      GenServer.call(
+        Replica.shard_name(name, notify_shard),
+        {:cluster_connect, new_clusters},
+        60_000
+      )
     end
-
-    notify_shard = :rand.uniform(get_config(name).num_shards) - 1
-    GenServer.call(Replica.shard_name(name, notify_shard), {:cluster_connect, clusters}, 60_000)
 
     :ok
   end

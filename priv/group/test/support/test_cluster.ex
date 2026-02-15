@@ -44,6 +44,23 @@ defmodule Group.TestCluster do
     end)
   end
 
+  @doc "Start Group on a remote node and immediately connect to a cluster,
+  all within a single call. This ensures Group.connect runs before peer
+  discovery can complete (no round-trip gap between start and connect)."
+  def start_group_and_connect(node, opts, cluster) do
+    :erpc.call(node, __MODULE__, :do_start_group_and_connect, [opts, cluster])
+  end
+
+  @doc false
+  def do_start_group_and_connect(opts, cluster) do
+    opts = Keyword.put_new(opts, :log, false)
+    {:ok, pid} = Group.start_link(opts)
+    Process.unlink(pid)
+    name = Keyword.fetch!(opts, :name)
+    Group.connect(name, cluster)
+    {:ok, pid}
+  end
+
   @doc "Spawn a process on a remote node that registers and sleeps forever.
 
   Waits for the registration to complete before returning.
@@ -258,6 +275,39 @@ defmodule Group.TestCluster do
 
       {:nodeup, _node} ->
         forward_nodedown(target_pid)
+    after
+      30_000 -> :ok
+    end
+  end
+
+  @doc "Spawn a process on a remote node that joins a group and forwards messages to target"
+  def spawn_join_forwarder(node, name, key, target_pid, opts) do
+    :erpc.call(node, __MODULE__, :do_spawn_join_forwarder, [name, key, target_pid, opts])
+  end
+
+  @doc false
+  def do_spawn_join_forwarder(name, key, target_pid, opts) do
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        :ok = Group.join(name, key, %{}, opts)
+        send(parent, {:joined, self()})
+        forward_messages(target_pid)
+      end)
+
+    receive do
+      {:joined, ^pid} -> pid
+    after
+      5000 -> raise "spawn_join_forwarder timed out"
+    end
+  end
+
+  defp forward_messages(target_pid) do
+    receive do
+      msg ->
+        send(target_pid, {:forwarded, msg})
+        forward_messages(target_pid)
     after
       30_000 -> :ok
     end
