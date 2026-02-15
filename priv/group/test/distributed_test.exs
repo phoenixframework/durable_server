@@ -1709,4 +1709,159 @@ defmodule Group.DistributedTest do
       end
     end
   end
+
+  describe "ETS table consistency" do
+    @tag timeout: 60_000
+    test "no orphaned reg_by_pid entries after partition heal with conflicting keys" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_ets_orphan_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # Verify connectivity
+      pid_init = TestCluster.spawn_register(node_a, name, "init", %{})
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) == nil
+      end)
+
+      # Set up nodedown monitors
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+
+      # Partition
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Register same key on both sides during partition.
+      # B registers later (higher timestamp) — B will win the merge.
+      _pid_a = TestCluster.spawn_register(node_a, name, "conflict/1", %{side: :a})
+      Process.sleep(50)
+      _pid_b = TestCluster.spawn_register(node_b, name, "conflict/1", %{side: :b})
+
+      # Heal partition
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # Wait for convergence — one winner on both sides
+      TestCluster.assert_eventually(
+        fn ->
+          lookup_a = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/1"])
+          lookup_b = TestCluster.rpc!(node_b, Group, :lookup, [name, "conflict/1"])
+
+          case {lookup_a, lookup_b} do
+            {{pid_a, _}, {pid_b, _}} when is_pid(pid_a) and is_pid(pid_b) ->
+              pid_a == pid_b
+
+            _ ->
+              false
+          end
+        end,
+        timeout: 10_000
+      )
+
+      # Allow any async cleanup to settle
+      Process.sleep(200)
+
+      # ETS dual-index tables should be consistent (no orphaned by_pid entries)
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "orphaned by_pid entry does not corrupt winner on loser process death" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_ets_corrupt_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # Verify connectivity
+      pid_init = TestCluster.spawn_register(node_a, name, "init", %{})
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) == nil
+      end)
+
+      # Set up nodedown monitors
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+
+      # Partition
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # A registers first (lower timestamp), B registers later (higher timestamp).
+      # After heal, B's entry wins via merge_remote_cluster_data on A.
+      pid_a = TestCluster.spawn_register(node_a, name, "conflict/2", %{side: :a})
+      Process.sleep(50)
+      _pid_b = TestCluster.spawn_register(node_b, name, "conflict/2", %{side: :b})
+
+      # Heal partition
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # Wait for convergence
+      TestCluster.assert_eventually(
+        fn ->
+          lookup_a = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/2"])
+          lookup_b = TestCluster.rpc!(node_b, Group, :lookup, [name, "conflict/2"])
+
+          case {lookup_a, lookup_b} do
+            {{pid, _}, {pid, _}} when is_pid(pid) -> true
+            _ -> false
+          end
+        end,
+        timeout: 10_000
+      )
+
+      # Capture the winner
+      {winner_pid, _} = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/2"])
+
+      # Now kill the loser process (pid_a on node_a).
+      # If there's an orphaned by_pid entry for pid_a, the DOWN handler will
+      # incorrectly delete the winner's reg_by_key entry for "conflict/2".
+      TestCluster.rpc!(node_a, Process, :exit, [pid_a, :kill])
+      Process.sleep(200)
+
+      # The winner's entry should still be visible on both nodes
+      lookup_a = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/2"])
+      lookup_b = TestCluster.rpc!(node_b, Group, :lookup, [name, "conflict/2"])
+
+      assert {^winner_pid, _} = lookup_a,
+             "Winner's entry was deleted on node_a after loser died (orphaned by_pid corruption)"
+
+      assert {^winner_pid, _} = lookup_b,
+             "Winner's entry was deleted on node_b after loser died"
+
+      # Tables should also be fully consistent
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+  end
 end

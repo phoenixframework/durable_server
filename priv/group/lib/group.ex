@@ -345,6 +345,7 @@ defmodule Group do
   def register(name, key, meta, opts)
       when is_atom(name) and is_binary(key) and is_map(meta) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
+    validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
     GenServer.call(shard, {:register, cluster, key, self(), meta})
@@ -376,6 +377,7 @@ defmodule Group do
   def unregister(name, key, opts)
       when is_atom(name) and is_binary(key) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
+    validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
     GenServer.call(shard, {:unregister, cluster, key})
@@ -525,6 +527,7 @@ defmodule Group do
       when is_atom(name) and is_binary(group) and is_map(meta) and
              is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
+    validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
     GenServer.call(shard, {:join, cluster, group, self(), meta})
@@ -553,6 +556,7 @@ defmodule Group do
   def leave(name, group, opts)
       when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
+    validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
     GenServer.call(shard, {:leave, cluster, group, self()})
@@ -725,6 +729,15 @@ defmodule Group do
   # ===========================================================================
   # Internal
   # ===========================================================================
+
+  defp validate_cluster_connected!(_name, nil), do: :ok
+
+  defp validate_cluster_connected!(name, cluster) do
+    unless node() in Data.cluster_nodes(name, cluster) do
+      raise ArgumentError,
+            "not connected to cluster #{inspect(cluster)}. Call Group.connect(#{inspect(name)}, #{inspect(cluster)}) first"
+    end
+  end
 
   @doc false
   def __dispatch__(name, event_type, key, pid, meta, extra \\ %{}) do

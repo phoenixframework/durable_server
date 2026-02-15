@@ -213,4 +213,105 @@ defmodule GroupBench.Replica do
   def my_cluster_count(name) do
     length(Group.Replica.Data.my_clusters(name))
   end
+
+  @doc """
+  Simulates a busy app worker: registers, joins groups, does lookups and
+  dispatches, then some processes die and re-register. Returns final pids.
+
+  Each worker operates in its own cluster (like an org scope), performing
+  a mix of operations that mirrors real app usage patterns.
+  """
+  def run_busy_worker(name, cluster, worker_id, opts) do
+    num_users = Keyword.get(opts, :users, 20)
+    num_rooms = Keyword.get(opts, :rooms, 5)
+    churn_rounds = Keyword.get(opts, :churn_rounds, 3)
+    lookups_per_round = Keyword.get(opts, :lookups_per_round, 50)
+    dispatches_per_round = Keyword.get(opts, :dispatches_per_round, 10)
+    parent = self()
+
+    # Phase 1: Register users
+    user_pids =
+      Enum.map(1..num_users, fn i ->
+        spawn(fn ->
+          key = "w#{worker_id}/user/#{i}"
+          :ok = Group.register(name, key, %{worker: worker_id, i: i}, cluster: cluster)
+          send(parent, {:reg_done, self()})
+          Process.sleep(:infinity)
+        end)
+      end)
+
+    Enum.each(user_pids, fn pid ->
+      receive do
+        {:reg_done, ^pid} -> :ok
+      after
+        30_000 -> raise "busy_worker register timed out"
+      end
+    end)
+
+    # Phase 2: Join rooms
+    room_pids =
+      Enum.map(1..num_rooms, fn room_i ->
+        Enum.map(1..div(num_users, num_rooms), fn member_i ->
+          spawn(fn ->
+            key = "w#{worker_id}/room/#{room_i}"
+            :ok = Group.join(name, key, %{seat: member_i}, cluster: cluster)
+            send(parent, {:join_done, self()})
+            Process.sleep(:infinity)
+          end)
+        end)
+      end)
+      |> List.flatten()
+
+    Enum.each(room_pids, fn pid ->
+      receive do
+        {:join_done, ^pid} -> :ok
+      after
+        30_000 -> raise "busy_worker join timed out"
+      end
+    end)
+
+    # Phase 3: Churn — interleave lookups, dispatches, kills, re-registers
+    final_user_pids =
+      Enum.reduce(1..churn_rounds, user_pids, fn round, current_pids ->
+        # Lookups (read pressure)
+        for i <- 1..lookups_per_round do
+          key = "w#{worker_id}/user/#{rem(i, num_users) + 1}"
+          Group.lookup(name, key, cluster: cluster)
+        end
+
+        # Dispatches (fan-out pressure)
+        for i <- 1..dispatches_per_round do
+          key = "w#{worker_id}/room/#{rem(i, num_rooms) + 1}"
+          Group.dispatch(name, key, {:ping, round, i}, cluster: cluster)
+        end
+
+        # Kill ~25% of user pids
+        kill_count = div(length(current_pids), 4)
+        {to_kill, to_keep} = Enum.split(current_pids, kill_count)
+        Enum.each(to_kill, &Process.exit(&1, :kill))
+
+        # Re-register replacements
+        new_pids =
+          Enum.map(1..kill_count, fn i ->
+            spawn(fn ->
+              key = "w#{worker_id}/user/r#{round}_#{i}"
+              :ok = Group.register(name, key, %{round: round}, cluster: cluster)
+              send(parent, {:rereg_done, self()})
+              Process.sleep(:infinity)
+            end)
+          end)
+
+        Enum.each(new_pids, fn pid ->
+          receive do
+            {:rereg_done, ^pid} -> :ok
+          after
+            30_000 -> raise "busy_worker re-register timed out"
+          end
+        end)
+
+        to_keep ++ new_pids
+      end)
+
+    final_user_pids ++ room_pids
+  end
 end

@@ -214,6 +214,48 @@ defmodule Group.Replica.Data do
     :ets.select(table, match_spec)
   end
 
+  @doc """
+  Delete all entries for a pid from this shard. Used on process DOWN.
+  Deletes from by_key tables individually (need the key), but batch-deletes
+  from by_pid tables with match_delete (all entries for this pid are contiguous).
+  Returns {reg_entries, pg_entries} for dispatch.
+  """
+  def delete_all_for_pid(name, shard, pid) do
+    reg_table = reg_by_key_table(name, shard)
+    reg_pid_table = reg_by_pid_table(name, shard)
+
+    reg_entries =
+      :ets.select(reg_pid_table, [
+        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [],
+         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+      ])
+
+    for {cluster, key, _meta, _time, _node} <- reg_entries do
+      :ets.delete(reg_table, {cluster, key})
+    end
+
+    # Batch-delete all reg_by_pid entries for this pid
+    :ets.match_delete(reg_pid_table, {{pid, :_, :_}, :_, :_, :_})
+
+    pg_table = pg_by_key_table(name, shard)
+    pg_pid_table = pg_by_pid_table(name, shard)
+
+    pg_entries =
+      :ets.select(pg_pid_table, [
+        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [],
+         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+      ])
+
+    for {cluster, key, _meta, _time, _node} <- pg_entries do
+      :ets.delete(pg_table, {cluster, key, pid})
+    end
+
+    # Batch-delete all pg_by_pid entries for this pid
+    :ets.match_delete(pg_pid_table, {{pid, :_, :_}, :_, :_, :_})
+
+    {reg_entries, pg_entries}
+  end
+
   # =====================================================================
   # Monitor helpers (per-shard, no cross-shard coordination)
   # =====================================================================
@@ -424,49 +466,36 @@ defmodule Group.Replica.Data do
 
   @impl true
   def init({name, num_shards}) do
+    # ETS performance options:
+    # - read_concurrency: splits table into read-optimized segments (less lock contention)
+    # - decentralized_counters: reduces contention on table size counter (OTP 23+)
+    # Note: write_concurrency is intentionally omitted — the sharded GenServer already
+    # serializes writes per shard, so ETS write locking is never contended. Adding
+    # write_concurrency adds overhead (~30-40% on serial benchmarks) without benefit.
+    set_opts = [
+      :set, :public, :named_table,
+      read_concurrency: true, decentralized_counters: true
+    ]
+
+    ordered_set_opts = [
+      :ordered_set, :public, :named_table,
+      read_concurrency: true, decentralized_counters: true
+    ]
+
+    bag_opts = [
+      :bag, :public, :named_table,
+      read_concurrency: true, decentralized_counters: true
+    ]
+
     for shard <- 0..(num_shards - 1) do
-      :ets.new(reg_by_key_table(name, shard), [
-        :set,
-        :public,
-        :named_table,
-        read_concurrency: true
-      ])
-
-      :ets.new(reg_by_pid_table(name, shard), [
-        :ordered_set,
-        :public,
-        :named_table,
-        read_concurrency: true
-      ])
-
-      :ets.new(pg_by_key_table(name, shard), [
-        :ordered_set,
-        :public,
-        :named_table,
-        read_concurrency: true
-      ])
-
-      :ets.new(pg_by_pid_table(name, shard), [
-        :ordered_set,
-        :public,
-        :named_table,
-        read_concurrency: true
-      ])
+      :ets.new(reg_by_key_table(name, shard), set_opts)
+      :ets.new(reg_by_pid_table(name, shard), ordered_set_opts)
+      :ets.new(pg_by_key_table(name, shard), ordered_set_opts)
+      :ets.new(pg_by_pid_table(name, shard), ordered_set_opts)
     end
 
-    :ets.new(cluster_nodes_table(name), [
-      :bag,
-      :public,
-      :named_table,
-      read_concurrency: true
-    ])
-
-    :ets.new(node_clusters_table(name), [
-      :bag,
-      :public,
-      :named_table,
-      read_concurrency: true
-    ])
+    :ets.new(cluster_nodes_table(name), bag_opts)
+    :ets.new(node_clusters_table(name), bag_opts)
 
     {:ok, %{name: name, num_shards: num_shards}}
   end

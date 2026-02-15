@@ -223,6 +223,10 @@ defmodule Group.Replica do
 
         {:reply, :ok, put_monitor(state, pid, mref)}
 
+      {^pid, old_meta, _time, _node} when old_meta == meta ->
+        # Same pid, same metadata — noop
+        {:reply, :ok, state}
+
       {^pid, old_meta, _time, _node} ->
         # Same pid re-registering — update metadata
         time = System.system_time()
@@ -300,6 +304,10 @@ defmodule Group.Replica do
         })
 
         {:reply, :ok, put_monitor(state, pid, mref)}
+
+      {old_meta, _time, _node} when old_meta == meta ->
+        # Same metadata — noop
+        {:reply, :ok, state}
 
       {old_meta, _time, _node} ->
         # Re-join with updated metadata
@@ -440,9 +448,14 @@ defmodule Group.Replica do
 
         {:noreply, state}
 
-      {_existing_pid, _existing_meta, existing_time, _existing_node} ->
+      {existing_pid, _existing_meta, existing_time, _existing_node} ->
         # Both remote — keep the more recent one
         if time > existing_time do
+          # Clean up old pid's by_pid entry before overwriting by_key
+          if existing_pid != pid do
+            Data.registry_delete(name, shard, cluster, key, existing_pid)
+          end
+
           Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
           Group.__dispatch__(name, :registered, key, pid, meta, %{
@@ -819,7 +832,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:DOWN, _mref, :process, pid, reason}, state) do
-    %{name: name, shard_index: shard, num_shards: num_shards} = state
+    %{name: name, shard_index: shard} = state
 
     remote_node = node(pid)
 
@@ -851,52 +864,38 @@ defmodule Group.Replica do
       {:noreply, state}
     else
       # Regular process died — clean up its entries in this shard
-      entries = Data.entries_by_pid(name, shard, pid)
-
-      # Filter to entries that belong to this shard (count before filter for logging)
-      my_entries =
-        Enum.filter(entries, fn
-          {:registry, cluster, key, _pid, _meta, _time, _node} ->
-            shard_index_for(cluster, key, num_shards) == shard
-
-          {:pg, cluster, key, _pid, _meta, _time, _node} ->
-            shard_index_for(cluster, key, num_shards) == shard
-        end)
+      # Batch-delete from by_pid tables (one match_delete per table type)
+      # and individual deletes from by_key tables
+      {purged_reg, purged_pg} = Data.delete_all_for_pid(name, shard, pid)
 
       log_verbose(state, fn ->
-        "#{log_prefix_shard(state)} process_down pid=#{inspect(pid)} reason=#{inspect(reason)} (#{length(my_entries)} entries cleaned)"
+        "#{log_prefix_shard(state)} process_down pid=#{inspect(pid)} reason=#{inspect(reason)} (#{length(purged_reg) + length(purged_pg)} entries cleaned)"
       end)
 
-      for entry <- my_entries do
-        case entry do
-          {:registry, cluster, key, ^pid, meta, _time, _entry_node} ->
-            Data.registry_delete(name, shard, cluster, key, pid)
+      for {cluster, key, meta, _time, _node} <- purged_reg do
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_unregister, cluster, key, pid, meta, reason}
+        )
 
-            broadcast_to_cluster(
-              state,
-              cluster,
-              {:replicate_unregister, cluster, key, pid, meta, reason}
-            )
+        Group.__dispatch__(name, :unregistered, key, pid, meta, %{
+          reason: reason,
+          cluster: cluster
+        })
+      end
 
-            Group.__dispatch__(name, :unregistered, key, pid, meta, %{
-              reason: reason,
-              cluster: cluster
-            })
+      for {cluster, key, meta, _time, _node} <- purged_pg do
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_leave, cluster, key, pid, meta, reason}
+        )
 
-          {:pg, cluster, key, ^pid, meta, _time, _entry_node} ->
-            Data.pg_delete(name, shard, cluster, key, pid)
-
-            broadcast_to_cluster(
-              state,
-              cluster,
-              {:replicate_leave, cluster, key, pid, meta, reason}
-            )
-
-            Group.__dispatch__(name, :left, key, pid, meta, %{
-              reason: reason,
-              cluster: cluster
-            })
-        end
+        Group.__dispatch__(name, :left, key, pid, meta, %{
+          reason: reason,
+          cluster: cluster
+        })
       end
 
       state = %{state | monitors: Map.delete(state.monitors, pid)}
@@ -1046,7 +1045,12 @@ defmodule Group.Replica do
         nil ->
           Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-        {_existing_pid, _meta, existing_time, _node} when time > existing_time ->
+        {existing_pid, _meta, existing_time, _node} when time > existing_time ->
+          # Clean up old pid's by_pid entry before overwriting by_key
+          if existing_pid != pid do
+            Data.registry_delete(name, shard, cluster, key, existing_pid)
+          end
+
           Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
         _ ->

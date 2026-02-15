@@ -599,6 +599,146 @@ defmodule GroupTest do
     end
   end
 
+  describe "ETS table consistency" do
+    test "tables are consistent after register + unregister", %{name: name} do
+      :ok = Group.register(name, "ets/reg1", %{v: 1})
+      :ok = Group.register(name, "ets/reg2", %{v: 2})
+      :ok = Group.unregister(name, "ets/reg1")
+
+      assert Group.TestCluster.assert_ets_consistent(name) == :ok
+    end
+
+    test "tables are consistent after join + leave", %{name: name} do
+      :ok = Group.join(name, "ets/grp1", %{v: 1})
+      :ok = Group.join(name, "ets/grp2", %{v: 2})
+      :ok = Group.leave(name, "ets/grp1")
+
+      assert Group.TestCluster.assert_ets_consistent(name) == :ok
+    end
+
+    test "tables are consistent after process death cleans up", %{name: name} do
+      test_pid = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, "ets/death_reg", %{})
+          :ok = Group.join(name, "ets/death_grp", %{})
+          send(test_pid, :ready)
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        :ready -> :ok
+      after
+        1000 -> flunk("timeout")
+      end
+
+      # Verify entries exist
+      assert Group.lookup(name, "ets/death_reg") != nil
+      assert length(Group.members(name, "ets/death_grp")) == 1
+
+      # Kill and wait for cleanup
+      Process.exit(pid, :kill)
+      Process.sleep(100)
+
+      assert Group.lookup(name, "ets/death_reg") == nil
+      assert Group.members(name, "ets/death_grp") == []
+
+      assert Group.TestCluster.assert_ets_consistent(name) == :ok
+    end
+
+    test "tables are empty after all processes die", %{name: name} do
+      test_pid = self()
+
+      pids =
+        for i <- 1..10 do
+          spawn(fn ->
+            :ok = Group.register(name, "ets/clean_reg_#{i}", %{i: i})
+            :ok = Group.join(name, "ets/clean_grp", %{i: i})
+            send(test_pid, {:ready, self()})
+            Process.sleep(:infinity)
+          end)
+        end
+
+      for pid <- pids do
+        receive do
+          {:ready, ^pid} -> :ok
+        after
+          1000 -> flunk("timeout")
+        end
+      end
+
+      # Kill all
+      Enum.each(pids, &Process.exit(&1, :kill))
+      Process.sleep(200)
+
+      # Tables should be consistent and empty
+      assert Group.TestCluster.assert_ets_consistent(name) == :ok
+
+      num_shards = Group.get_config(name).num_shards
+
+      total_reg =
+        Enum.sum(
+          for s <- 0..(num_shards - 1) do
+            :ets.info(Group.Replica.Data.reg_by_key_table(name, s), :size)
+          end
+        )
+
+      total_reg_pid =
+        Enum.sum(
+          for s <- 0..(num_shards - 1) do
+            :ets.info(Group.Replica.Data.reg_by_pid_table(name, s), :size)
+          end
+        )
+
+      total_pg =
+        Enum.sum(
+          for s <- 0..(num_shards - 1) do
+            :ets.info(Group.Replica.Data.pg_by_key_table(name, s), :size)
+          end
+        )
+
+      total_pg_pid =
+        Enum.sum(
+          for s <- 0..(num_shards - 1) do
+            :ets.info(Group.Replica.Data.pg_by_pid_table(name, s), :size)
+          end
+        )
+
+      assert total_reg == 0, "reg_by_key has #{total_reg} orphaned entries"
+      assert total_reg_pid == 0, "reg_by_pid has #{total_reg_pid} orphaned entries"
+      assert total_pg == 0, "pg_by_key has #{total_pg} orphaned entries"
+      assert total_pg_pid == 0, "pg_by_pid has #{total_pg_pid} orphaned entries"
+    end
+
+    test "tables are consistent after cluster disconnect", %{name: name} do
+      cluster = "ets_cleanup_cluster"
+      :ok = Group.connect(name, cluster)
+
+      test_pid = self()
+
+      spawn(fn ->
+        :ok = Group.register(name, "ets/cluster_reg", %{}, cluster: cluster)
+        :ok = Group.join(name, "ets/cluster_grp", %{}, cluster: cluster)
+        send(test_pid, :ready)
+        Process.sleep(:infinity)
+      end)
+
+      receive do
+        :ready -> :ok
+      after
+        1000 -> flunk("timeout")
+      end
+
+      assert Group.lookup(name, "ets/cluster_reg", cluster: cluster) != nil
+
+      :ok = Group.disconnect(name, cluster)
+
+      # Cluster entries should be purged, tables consistent
+      assert Group.TestCluster.assert_ets_consistent(name) == :ok
+    end
+  end
+
   describe "local_registry_count/1" do
     test "counts registered processes", %{name: name} do
       assert Group.local_registry_count(name) == 0

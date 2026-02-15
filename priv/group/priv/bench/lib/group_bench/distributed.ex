@@ -28,6 +28,7 @@ defmodule GroupBench.Distributed do
     bench_churn(@replicas)
     bench_join_death_cleanup(@replicas)
     bench_many_clusters(@replicas)
+    bench_busy_app(@replicas)
 
     IO.puts("\n  Done.\n")
   end
@@ -510,6 +511,130 @@ defmodule GroupBench.Distributed do
 
     # Kill leftover processes
     :erpc.call(r1, GroupBench.Replica, :kill_processes, [pids])
+    stop_groups(replicas)
+  end
+
+  # ── 9. Busy app simulation ──────────────────────────────────────────
+
+  defp bench_busy_app([r1, r2] = replicas) do
+    header("9. Busy App Simulation")
+
+    num_clusters = 50
+    workers_per_node = 10
+    users_per_worker = 20
+    rooms_per_worker = 5
+    churn_rounds = 3
+    lookups_per_round = 50
+    dispatches_per_round = 10
+
+    total_users = num_clusters * workers_per_node * 2 * users_per_worker
+    total_rooms = num_clusters * workers_per_node * 2 * rooms_per_worker * div(users_per_worker, rooms_per_worker)
+
+    IO.puts("  clusters:      #{num_clusters}")
+    IO.puts("  workers/node:  #{workers_per_node}")
+    IO.puts("  users/worker:  #{users_per_worker}")
+    IO.puts("  rooms/worker:  #{rooms_per_worker}")
+    IO.puts("  churn rounds:  #{churn_rounds}")
+    IO.puts("  initial pids:  #{format_number(total_users + total_rooms)} (#{format_number(total_users)} reg + #{format_number(total_rooms)} pg)")
+    IO.puts("")
+
+    start_group_on(r1)
+    start_group_on(r2)
+    wait_for_peer_discovery(replicas)
+
+    # Connect all clusters on both nodes
+    clusters = for i <- 1..num_clusters, do: "org/#{i}"
+
+    for node <- replicas, cluster <- clusters do
+      :erpc.call(node, Group, :connect, [@name, cluster])
+    end
+
+    # Wait for cluster membership to converge
+    poll_until(fn ->
+      Enum.all?(replicas, fn node ->
+        n = :erpc.call(node, Group, :nodes, [@name, List.last(clusters)])
+        length(n) >= 1
+      end)
+    end)
+
+    worker_opts = [
+      users: users_per_worker,
+      rooms: rooms_per_worker,
+      churn_rounds: churn_rounds,
+      lookups_per_round: lookups_per_round,
+      dispatches_per_round: dispatches_per_round
+    ]
+
+    # Run all workers concurrently across both nodes
+    {wall_us, all_pids} =
+      :timer.tc(fn ->
+        tasks =
+          for {node, ni} <- Enum.with_index(replicas),
+              {cluster, ci} <- Enum.with_index(clusters),
+              wi <- 1..workers_per_node do
+            worker_id = "n#{ni}_c#{ci}_w#{wi}"
+
+            Task.async(fn ->
+              :erpc.call(
+                node,
+                GroupBench.Replica,
+                :run_busy_worker,
+                [@name, cluster, worker_id, worker_opts],
+                120_000
+              )
+            end)
+          end
+
+        results = Task.await_many(tasks, 120_000)
+        List.flatten(results)
+      end)
+
+    total_ops =
+      num_clusters * workers_per_node * 2 *
+        (users_per_worker + div(users_per_worker, rooms_per_worker) * rooms_per_worker +
+           churn_rounds * (lookups_per_round + dispatches_per_round + div(users_per_worker, 4) * 2))
+
+    wall_ms = div(wall_us, 1000)
+    ops_sec = if wall_us > 0, do: round(total_ops * 1_000_000 / wall_us), else: 0
+
+    IO.puts("  --- results ---")
+    IO.puts("  wall time:     #{format_number(wall_ms)} ms")
+    IO.puts("  total ops:     ~#{format_number(total_ops)}")
+    IO.puts("  ops/sec:       ~#{format_number(ops_sec)}")
+
+    # Convergence check: wait for both nodes to agree on registry count
+    subheader("convergence")
+
+    {converge_us, _} =
+      :timer.tc(fn ->
+        poll_until(
+          fn ->
+            c1 = :erpc.call(r1, GroupBench.Replica, :total_registry_count, [@name])
+            c2 = :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name])
+            c1 == c2 and c1 > 0
+          end,
+          30_000
+        )
+      end)
+
+    final_r1 = :erpc.call(r1, GroupBench.Replica, :total_registry_count, [@name])
+    final_r2 = :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name])
+    pg_r1 = :erpc.call(r1, GroupBench.Replica, :total_pg_count, [@name])
+    pg_r2 = :erpc.call(r2, GroupBench.Replica, :total_pg_count, [@name])
+
+    IO.puts("  converge:      #{format_number(div(converge_us, 1000))} ms")
+    IO.puts("  registry r1:   #{format_number(final_r1)}")
+    IO.puts("  registry r2:   #{format_number(final_r2)}")
+    IO.puts("  pg r1:         #{format_number(pg_r1)}")
+    IO.puts("  pg r2:         #{format_number(pg_r2)}")
+    IO.puts("  match:         #{if final_r1 == final_r2 and pg_r1 == pg_r2, do: "YES", else: "NO"}")
+
+    # Cleanup
+    for node <- replicas do
+      local_pids = Enum.filter(all_pids, fn pid -> node(pid) == node end)
+      :erpc.call(node, GroupBench.Replica, :kill_processes, [local_pids])
+    end
+
     stop_groups(replicas)
   end
 end

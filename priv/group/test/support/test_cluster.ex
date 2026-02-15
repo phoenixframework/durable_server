@@ -313,6 +313,94 @@ defmodule Group.TestCluster do
     end
   end
 
+  @doc """
+  Asserts that all ETS dual-index tables are in sync for a Group instance.
+
+  Verifies:
+  - reg_by_key ↔ reg_by_pid contain the same entries (across all shards)
+  - pg_by_key ↔ pg_by_pid contain the same entries (across all shards)
+  - cluster_nodes ↔ node_clusters contain the same pairs
+
+  Raises on inconsistency with details about orphaned/missing entries.
+  """
+  def assert_ets_consistent(name) do
+    num_shards = Group.get_config(name).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      # Registry: by_key entries should match by_pid entries
+      reg_key_table = Group.Replica.Data.reg_by_key_table(name, shard)
+      reg_pid_table = Group.Replica.Data.reg_by_pid_table(name, shard)
+
+      # by_key: {{cluster, key}, pid, meta, time, node}
+      key_set =
+        :ets.tab2list(reg_key_table)
+        |> MapSet.new(fn {{cluster, key}, pid, meta, time, nd} ->
+          {cluster, key, pid, meta, time, nd}
+        end)
+
+      # by_pid: {{pid, cluster, key}, meta, time, node}
+      pid_set =
+        :ets.tab2list(reg_pid_table)
+        |> MapSet.new(fn {{pid, cluster, key}, meta, time, nd} ->
+          {cluster, key, pid, meta, time, nd}
+        end)
+
+      if key_set != pid_set do
+        orphaned = MapSet.difference(pid_set, key_set) |> MapSet.to_list()
+        missing = MapSet.difference(key_set, pid_set) |> MapSet.to_list()
+
+        raise "ETS inconsistency in #{name} shard #{shard} (registry)!\n" <>
+                "  Orphaned in reg_by_pid (no matching by_key): #{inspect(orphaned)}\n" <>
+                "  Missing from reg_by_pid (in by_key only): #{inspect(missing)}"
+      end
+
+      # PG: by_key entries should match by_pid entries
+      pg_key_table = Group.Replica.Data.pg_by_key_table(name, shard)
+      pg_pid_table = Group.Replica.Data.pg_by_pid_table(name, shard)
+
+      # pg_by_key: {{cluster, key, pid}, meta, time, node}
+      pg_key_set =
+        :ets.tab2list(pg_key_table)
+        |> MapSet.new(fn {{cluster, key, pid}, meta, time, nd} ->
+          {cluster, key, pid, meta, time, nd}
+        end)
+
+      # pg_by_pid: {{pid, cluster, key}, meta, time, node}
+      pg_pid_set =
+        :ets.tab2list(pg_pid_table)
+        |> MapSet.new(fn {{pid, cluster, key}, meta, time, nd} ->
+          {cluster, key, pid, meta, time, nd}
+        end)
+
+      if pg_key_set != pg_pid_set do
+        orphaned = MapSet.difference(pg_pid_set, pg_key_set) |> MapSet.to_list()
+        missing = MapSet.difference(pg_key_set, pg_pid_set) |> MapSet.to_list()
+
+        raise "ETS inconsistency in #{name} shard #{shard} (PG)!\n" <>
+                "  Orphaned in pg_by_pid (no matching by_key): #{inspect(orphaned)}\n" <>
+                "  Missing from pg_by_pid (in by_key only): #{inspect(missing)}"
+      end
+    end
+
+    # Cluster membership: cluster_nodes ↔ node_clusters
+    cn_table = Group.Replica.Data.cluster_nodes_table(name)
+    nc_table = Group.Replica.Data.node_clusters_table(name)
+
+    cn_set = :ets.tab2list(cn_table) |> MapSet.new(fn {cluster, nd} -> {cluster, nd} end)
+    nc_set = :ets.tab2list(nc_table) |> MapSet.new(fn {nd, cluster} -> {cluster, nd} end)
+
+    if cn_set != nc_set do
+      only_cn = MapSet.difference(cn_set, nc_set) |> MapSet.to_list()
+      only_nc = MapSet.difference(nc_set, cn_set) |> MapSet.to_list()
+
+      raise "cluster_nodes / node_clusters inconsistency in #{name}!\n" <>
+              "  Only in cluster_nodes: #{inspect(only_cn)}\n" <>
+              "  Only in node_clusters: #{inspect(only_nc)}"
+    end
+
+    :ok
+  end
+
   @doc "Wait for a condition to become true, with retries"
   def assert_eventually(fun, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 2000)
