@@ -26,72 +26,217 @@ defmodule Group.Replica do
 
   ## Protocol Flows
 
-  ### Peer Discovery (nodeup or init)
+  ### 1. Peer Discovery (nodeup or init)
 
-  Both sides exchange cluster lists via peer_connect/peer_connect_ack, then send
-  per-cluster cluster_state messages only for shared clusters. The nil cluster is
-  always shared (all Group peers are in it). Peer discovery is per-shard — each
-  shard independently discovers its remote counterpart.
+  Triggered by `nodeup` or `init`. Each shard independently discovers its
+  counterpart on the remote node. Both sides exchange cluster lists, then send
+  per-cluster `cluster_state` snapshots for shared clusters (always includes
+  nil). Merge applies data; conflicts with local entries go through
+  `resolve_conflict`.
 
-  When `peer_connect_ack` discovers named shared clusters (i.e. both sides are
-  already in the same named cluster), it exchanges `cluster_state` data for
-  those clusters. This naturally handles the case where `connect/2` ran between
-  peer_connect send and ack processing — by the time the ack is processed, the
-  local node's cluster list includes the newly connected cluster, so the
-  intersection picks it up.
+      Node A shard i                          Node B shard i
+      ────────────                            ────────────
+           │                                       │
+           │  {:peer_connect, pid, i, N, clusters} │
+           │──────────────────────────────────────>│
+           │                                       │── add A to nil cluster ETS
+           │                                       │── compute shared clusters
+           │                                       │── add A to shared named clusters
+           │                                       │── monitor A's shard pid
+           │                                       │
+           │  {:peer_connect_ack, pid, i, N, clusters}
+           │<──────────────────────────────────────│
+           │── add B to nil cluster ETS            │
+           │── compute shared clusters             │  {:cluster_state, C, reg, pg}
+           │── add B to shared named clusters      │──────────────────────────────>│
+           │── monitor B's shard pid               │  (one per shared cluster)     │
+           │                                       │                               │
+           │  {:cluster_state, C, reg, pg}         │                               │
+           │──────────────────────────────>│        │                               │
+           │  (one per shared cluster)     │        │                               │
+           │                               │        │                               │
+           ▼                               ▼        ▼                               ▼
+      merge_remote_cluster_data       merge_remote_cluster_data
+        ├─ no conflict: insert          ├─ no conflict: insert
+        ├─ local vs remote: resolve_conflict (kill loser, re-broadcast winner)
+        └─ both remote: timestamp wins  └─ both remote: timestamp wins
 
-  ### Named Cluster Join (single shard notification + fan-out)
+  ### 2. Steady-State Replication
 
-  1. Caller calls `Group.connect/2` which picks a random shard S and sends a
-     single GenServer.call to shard S.
-  2. Shard S reads peers from shared ETS (`cluster_nodes` for nil cluster) and
-     sends `cluster_connect` to remote shard S on each peer.
-  3. Remote shard S adds membership to ETS, bundles its shard data into
-     `cluster_connect_ack`, and fans out `{:send_cluster_data, clusters, node}`
-     to local sibling shards.
-  4. Each sibling shard sends its own `cluster_state` to the matching remote shard.
-  5. On receiving `cluster_connect_ack`, the initiator's shard S merges the
-     bundled data, adds membership to ETS, sends its shard S `cluster_state`,
-     and fans out to siblings.
+  After peer discovery, all writes broadcast to cluster members. The nil cluster
+  uses `remote_shards` (per-shard map); named clusters use `cluster_nodes` ETS.
+  Reads (`lookup`, `members`) go directly to ETS — no GenServer involved.
 
-  Using shared ETS for peer lookup (instead of per-shard `remote_shards`) avoids
-  the race where `connect/2` runs before the random shard's `peer_connect_ack`
-  has populated `remote_shards`. The nil cluster ETS is populated by ANY shard
-  processing an incoming `peer_connect`, so it's available much earlier.
+      Node A shard i                          Node B shard i
+      ────────────                            ────────────
+           │                                       │
+      Group.register(name, key, meta)              │
+           │── ETS insert (by_key + by_pid)        │
+           │── monitor pid                         │
+           │                                       │
+           │  {:replicate_register, C, key, pid, meta, time, reason}
+           │──────────────────────────────────────>│
+           │                                       │── lookup existing
+           │                                       │   ├─ nil: insert
+           │                                       │   ├─ same pid: update
+           │                                       │   ├─ local conflict:
+           │                                       │   │  resolve_conflict()
+           │                                       │   └─ both remote:
+           │                                       │      timestamp wins
+           │                                       │
+      Group.join(name, group, meta)                │
+           │── ETS insert (by_key + by_pid)        │
+           │                                       │
+           │  {:replicate_join, C, key, pid, meta, time, reason}
+           │──────────────────────────────────────>│
+           │                                       │── insert (no overwrite
+           │                                       │   conflict for PG)
+           │                                       │
 
-  Bundling shard S's data into the ack eliminates K separate `cluster_state`
-  messages (one per shared cluster) in each direction per connect.
+  ### 3. Named Cluster Connect (random shard S + fan-out)
 
-  Randomizing the notification shard load-balances across shards when many
-  concurrent `connect` calls happen (e.g., 10,000 clusters).
+  `Group.connect/2` adds local node to ETS, picks random shard S, and sends
+  one GenServer.call. Shard S notifies remote shard S, which acks with bundled
+  data and fans out to siblings. Randomizing S load-balances across shards
+  when many concurrent connects happen.
 
-  ### Named Cluster Disconnect (shard 0 + fan-out)
+      Node A                                  Node B
+      ──────                                  ──────
+      Group.connect(name, "game")
+        │── ETS: add self to "game"
+        │── pick random shard S
+        │
+      Shard S                                 Shard S
+      ───────                                 ───────
+        │                                       │
+        │  {:cluster_connect, ["game"], pid}    │
+        │──────────────────────────────────────>│
+        │                                       │── ETS: add A to "game"
+        │                                       │── bundle shard S data
+        │                                       │
+        │  {:cluster_connect_ack, ["game"], pid, [{cluster, reg, pg}]}
+        │<──────────────────────────────────────│
+        │                                       │
+        │                                  Shard S sends to siblings:
+        │                                  {:send_cluster_data, ["game"], A}
+        │                                       │
+        │                                  Shards 0..N (except S):
+        │                                       │── {:cluster_state, "game", reg, pg}
+        │                                       │──────────────────────────────>│
+        │                                       │   (to matching A shard)       │
+        │                                       │                               │
+        │── merge bundled ack data              │
+        │── ETS: add B to "game"                │
+        │── send shard S cluster_state ────────>│
+        │── fan out to siblings:                │
+        │   {:send_cluster_data, ["game"], B}   │
+        │                                       │
+      Shards 0..N (except S):                   │
+        │── {:cluster_state, "game", reg, pg}   │
+        │──────────────────────────────────────>│
+        │   (to matching B shard)               │
 
-  1. Caller calls `Group.disconnect/2` which calls all N local shards to purge
-     their own entries, but only shard 0 broadcasts `cluster_disconnect` to remote
-     shard 0s. (Disconnect still uses all shards since each must purge its own
-     ETS entries.)
-  2. Remote shard 0 removes membership from ETS and fans out to siblings.
-  3. Each shard (0 and siblings) purges entries for the disconnected cluster+node.
+  ### 4. Named Cluster Disconnect (all shards local + shard 0 broadcast)
 
-  ### Cluster Connect Ack Guards
+  `Group.disconnect/2` removes local node from ETS, then calls ALL local shards
+  to purge their entries. Only shard 0 broadcasts to remote shard 0, which fans
+  out to siblings for per-shard purge.
 
-  The `cluster_connect_ack` handler guards against two stale-state races:
+      Node A                                  Node B
+      ──────                                  ──────
+      Group.disconnect(name, "game")
+        │── ETS: remove self from "game"
+        │
+      Shards 0..N (all called):
+        │── purge own entries for "game"+A
+        │── dispatch :unregistered/:left events
+        │
+      Shard 0 only:
+        │  {:cluster_disconnect, ["game"], pid}
+        │──────────────────────────────────────>│ Shard 0
+        │                                       │── ETS: remove A from "game"
+        │                                       │── fan out to siblings:
+        │                                       │   {:cluster_disconnect, ["game"], pid}
+        │                                       │
+        │                                  Shards 0..N:
+        │                                       │── purge entries for "game"+A
+        │                                       │── dispatch events
 
-  1. **Disconnect race**: If `connect/2` and `disconnect/2` overlap on the same
-     cluster, a delayed ack could re-add the remote node to cluster_nodes for a
-     cluster we already left. Guard: only process clusters where `node()` is
-     still a member of `cluster_nodes`.
+  ### 5. Partition Heal (peer discovery re-runs + conflict resolution)
 
-  2. **Nodedown race**: If the remote node dies and `nodedown` purges it from
-     cluster_nodes, a delayed ack (already in mailbox) could re-add the dead
-     node as a ghost. Guard: only process acks from nodes still in
-     `remote_shards` (cleared on nodedown/DOWN).
+  When a partition heals, `nodeup` triggers peer discovery on both sides.
+  Both exchange `cluster_state` snapshots. Registry key conflicts where the
+  existing entry is local go through `resolve_conflict` — the same path used
+  for live contention. The default resolver kills the loser process.
 
-  ### Steady-State Replication
+      Node A                                  Node B
+      ──────                                  ──────
+      (partition: A and B both register key K)
+      A has: {K, pid_a, time_a, local}        B has: {K, pid_b, time_b, local}
+           │                                       │
+      ─────── partition heals (nodeup) ────────────
+           │                                       │
+           │  peer_connect / peer_connect_ack      │
+           │<─────────────────────────────────────>│
+           │                                       │
+           │  {:cluster_state, nil, [{K, pid_b, ...}], []}
+           │<──────────────────────────────────────│
+           │                                       │
+           │  {:cluster_state, nil, [{K, pid_a, ...}], []}
+           │──────────────────────────────────────>│
+           │                                       │
+      merge: K exists locally                 merge: K exists locally
+        resolve_conflict(                       resolve_conflict(
+          local={pid_a, time_a},                  local={pid_b, time_b},
+          remote={pid_b, time_b})                 remote={pid_a, time_a})
+           │                                       │
+      (assuming time_b > time_a):             (assuming time_b > time_a):
+        pid_b wins (remote)                     pid_b wins (local)
+        ├─ kill pid_a                           ├─ kill pid_a (cross-node, idempotent)
+        ├─ delete pid_a entry                   ├─ re-insert pid_b with new timestamp
+        ├─ insert pid_b                         └─ re-broadcast pid_b
+        └─ demonitor pid_a                         {:replicate_register, ...}
+           │                                       │──────────────────────────>│
+           │                                       │  (arrives as same-pid     │
+           │                                       │   update — harmless)      │
 
-  Operations broadcast replicate_* messages to cluster members. nil cluster uses
-  remote_shards keys; named clusters use cluster_nodes ETS.
+  ### 6. Nodedown / Process Death Cleanup
+
+  `nodedown` purges all remote node data. Local process `DOWN` purges the pid's
+  entries and broadcasts unregister/leave to cluster members.
+
+      Node A                                  Node B dies
+      ──────                                  ──────────
+           │                                       X
+      {:nodedown, B}                               │
+           │                                       │
+      Shard 0:                                     │
+        │── purge_cluster_node(B)                  │
+        │   (remove B from all cluster_nodes       │
+        │    and node_clusters ETS entries)         │
+           │                                       │
+      All shards:                                  │
+        │── purge_node(shard, B)                   │
+        │   (scan by_key for node==B,              │
+        │    delete from both by_key + by_pid)     │
+        │── dispatch :unregistered/:left events    │
+        │── remove B from remote_shards            │
+
+      ──────────────────────────────────────────────
+
+      Local process dies                      Node B
+      ──────────────────                      ──────
+      {:DOWN, mref, :process, pid, reason}         │
+           │                                       │
+      Owning shard:                                │
+        │── delete_all_for_pid(shard, pid)         │
+        │   (scan by_pid, delete from by_key,      │
+        │    match_delete from by_pid)             │
+        │── broadcast per cluster:                 │
+        │   {:replicate_unregister, ...}  ────────>│── delete if pid matches
+        │   {:replicate_leave, ...}       ────────>│── delete if pid matches
+        │── demonitor pid                          │
+        │── dispatch events                        │
 
   ## Cluster Membership Tracking
 
@@ -112,7 +257,7 @@ defmodule Group.Replica do
   uniformity is <2%. In practice, real workloads with varied key prefixes will
   see balanced shard load.
 
-  **Hot keys":** A single extremely popular key (e.g. a chat room
+  **Hot keys:** A single extremely popular key (e.g. a chat room
   with thousands of joins/leaves) always hashes to one shard, so all *writes*
   for that key serialize through that shard's GenServer. However, *reads* —
   `Group.lookup/3` and `Group.members/3` — go directly to ETS and bypass the
@@ -1039,24 +1184,52 @@ defmodule Group.Replica do
   defp merge_remote_cluster_data(state, cluster, reg_data, pg_data) do
     %{name: name, shard_index: shard, num_shards: num_shards} = state
 
-    for {key, pid, meta, time} <- reg_data,
-        shard_index_for(cluster, key, num_shards) == shard do
-      case Data.registry_lookup(name, shard, cluster, key) do
-        nil ->
-          Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+    # Registry merge uses Enum.reduce to thread state, because resolve_conflict
+    # modifies state.monitors (demonitor evicted local pids).
+    state =
+      Enum.reduce(reg_data, state, fn {key, pid, meta, time}, acc ->
+        if shard_index_for(cluster, key, num_shards) != shard do
+          acc
+        else
+          case Data.registry_lookup(name, shard, cluster, key) do
+            nil ->
+              Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+              acc
 
-        {existing_pid, _meta, existing_time, _node} when time > existing_time ->
-          # Clean up old pid's by_pid entry before overwriting by_key
-          if existing_pid != pid do
-            Data.registry_delete(name, shard, cluster, key, existing_pid)
+            {^pid, _meta, existing_time, _node} ->
+              # Same pid (bounceback or metadata update) — apply if newer
+              if time > existing_time do
+                Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+              end
+
+              acc
+
+            {existing_pid, existing_meta, existing_time, existing_node}
+            when existing_node == node() ->
+              # Local entry vs incoming remote — use full conflict resolution
+              # (kills loser, re-broadcasts winner, invokes user's resolver)
+              resolve_conflict(
+                acc,
+                cluster,
+                key,
+                {existing_pid, existing_meta, existing_time},
+                {pid, meta, time}
+              )
+
+            {existing_pid, _meta, existing_time, _node} when time > existing_time ->
+              # Both remote — keep the more recent one
+              if existing_pid != pid do
+                Data.registry_delete(name, shard, cluster, key, existing_pid)
+              end
+
+              Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+              acc
+
+            _ ->
+              acc
           end
-
-          Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-
-        _ ->
-          :ok
-      end
-    end
+        end
+      end)
 
     for {key, pid, meta, time} <- pg_data,
         shard_index_for(cluster, key, num_shards) == shard do

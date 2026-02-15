@@ -248,6 +248,88 @@ defmodule Group.DistributedTest do
 
   describe "conflict resolution — partition heal" do
     @tag timeout: 60_000
+    test "merge invokes resolve_conflict and kills loser process" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_merge_resolve_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      # Verify connectivity
+      pid_init = TestCluster.spawn_register(node_a, name, "init", %{})
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) == nil
+      end)
+
+      # Set up nodedown monitors
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+
+      # Partition
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Register same key on both sides. A first (lower timestamp), B second.
+      pid_a = TestCluster.spawn_register(node_a, name, "user/conflict", %{side: :a})
+      # Ensure B's registration gets a strictly higher timestamp
+      Process.sleep(50)
+      pid_b = TestCluster.spawn_register(node_b, name, "user/conflict", %{side: :b})
+
+      # Both are alive before heal
+      assert TestCluster.rpc!(node_a, Process, :alive?, [pid_a])
+      assert TestCluster.rpc!(node_b, Process, :alive?, [pid_b])
+
+      # Reconnect
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # After convergence, both sides agree on the winner
+      TestCluster.assert_eventually(
+        fn ->
+          lookup_a = TestCluster.rpc!(node_a, Group, :lookup, [name, "user/conflict"])
+          lookup_b = TestCluster.rpc!(node_b, Group, :lookup, [name, "user/conflict"])
+
+          case {lookup_a, lookup_b} do
+            {{pid, _}, {pid, _}} when is_pid(pid) -> true
+            _ -> false
+          end
+        end,
+        timeout: 10_000
+      )
+
+      # The loser (pid_a, lower timestamp) should be killed by resolve_conflict.
+      # The default resolver calls Process.exit(loser, {:group_registry_conflict, ...}).
+      TestCluster.assert_eventually(
+        fn -> not TestCluster.rpc!(node_a, Process, :alive?, [pid_a]) end,
+        timeout: 5000
+      )
+
+      # Winner should be pid_b (higher timestamp)
+      {winner_pid, _} = TestCluster.rpc!(node_a, Group, :lookup, [name, "user/conflict"])
+      assert winner_pid == pid_b
+
+      # ETS should be consistent
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+
+    @tag timeout: 60_000
     test "same key registered on both sides during partition" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
