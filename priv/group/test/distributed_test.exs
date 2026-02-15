@@ -1471,6 +1471,150 @@ defmodule Group.DistributedTest do
     end
   end
 
+  describe "peer discovery — nodeup vs Node.list() coverage" do
+    test "Group starting after Erlang connection discovers via Node.list()" do
+      # Exercises the init Node.list() path: B is already Erlang-connected
+      # to A but only A has Group running. When Group starts on B, B's init
+      # enumerates Node.list() and sends peer_connect to A (no nodeup fires
+      # because A was already connected before monitor_nodes subscription).
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_nodelist_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      # Wait for full Erlang mesh between peers (transitive via test node)
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Node, :list, [])
+      end)
+
+      # Start Group on A only, register data
+      TestCluster.start_group(node_a, opts)
+      TestCluster.spawn_register(node_a, name, "user/1", %{from: :a})
+      TestCluster.spawn_join(node_a, name, "room/1", %{from: :a})
+
+      # Now start Group on B — must discover A via init Node.list(), not nodeup
+      TestCluster.start_group(node_b, opts)
+
+      # B should see A's data (proves Node.list() init path works)
+      TestCluster.assert_eventually(
+        fn ->
+          lookup = TestCluster.rpc!(node_b, Group, :lookup, [name, "user/1"])
+          members = TestCluster.rpc!(node_b, Group, :members, [name, "room/1"])
+
+          match?({_pid, %{from: :a}}, lookup) and
+            match?([{_pid, %{from: :a}}], members)
+        end,
+        timeout: 5000
+      )
+
+      # A should also see B as a peer (B's peer_connect was received)
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+    end
+
+    test "staggered Group startup across 3 nodes discovers all peers" do
+      # All 3 nodes are Erlang-connected from the start, but Group starts
+      # at different times. Each must discover the others regardless of
+      # whether discovery happens via nodeup or Node.list().
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      name = :"dist_stagger_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      # Wait for full Erlang mesh
+      TestCluster.assert_eventually(fn ->
+        a_nodes = TestCluster.rpc!(node_a, Node, :list, [])
+        node_b in a_nodes and node_c in a_nodes
+      end)
+
+      # Start Group on A, register data
+      TestCluster.start_group(node_a, opts)
+      TestCluster.spawn_register(node_a, name, "from_a", %{origin: :a})
+
+      # Start Group on B (A already connected, C already connected but no Group)
+      TestCluster.start_group(node_b, opts)
+      TestCluster.spawn_register(node_b, name, "from_b", %{origin: :b})
+
+      # A and B should discover each other
+      TestCluster.assert_eventually(fn ->
+        match?({_, %{origin: :b}}, TestCluster.rpc!(node_a, Group, :lookup, [name, "from_b"])) and
+          match?({_, %{origin: :a}}, TestCluster.rpc!(node_b, Group, :lookup, [name, "from_a"]))
+      end)
+
+      # Start Group on C (A and B already connected AND running Group)
+      TestCluster.start_group(node_c, opts)
+      TestCluster.spawn_register(node_c, name, "from_c", %{origin: :c})
+
+      # All 3 should see all data
+      expected = %{"from_a" => :a, "from_b" => :b, "from_c" => :c}
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?([node_a, node_b, node_c], fn check_node ->
+            Enum.all?(expected, fn {key, origin} ->
+              match?(
+                {_, %{origin: ^origin}},
+                TestCluster.rpc!(check_node, Group, :lookup, [name, key])
+              )
+            end)
+          end)
+        end,
+        timeout: 5000
+      )
+
+      # All should see 2 peers
+      for node <- [node_a, node_b, node_c] do
+        nodes = TestCluster.rpc!(node, Group, :nodes, [name])
+        assert length(nodes) == 2, "#{node} sees #{length(nodes)} peers, expected 2"
+      end
+    end
+
+    test "new Erlang connection after Group start discovers via nodeup" do
+      # Exercises the nodeup path: A starts Group, then a brand new peer node
+      # is started (new Erlang connection triggers nodeup on A).
+      peers_a = TestCluster.start_peers(1)
+      [{_, node_a}] = peers_a
+
+      name = :"dist_nodeup_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      TestCluster.start_group(node_a, opts)
+      TestCluster.spawn_register(node_a, name, "user/early", %{from: :a})
+
+      # Start a brand new peer — this triggers nodeup on A
+      peers_b = TestCluster.start_peers(1)
+      [{_, node_b}] = peers_b
+
+      on_exit(fn ->
+        TestCluster.stop_peers(peers_a)
+        TestCluster.stop_peers(peers_b)
+      end)
+
+      TestCluster.start_group(node_b, opts)
+      TestCluster.spawn_register(node_b, name, "user/late", %{from: :b})
+
+      # Both should see each other's data
+      TestCluster.assert_eventually(
+        fn ->
+          match?(
+            {_, %{from: :b}},
+            TestCluster.rpc!(node_a, Group, :lookup, [name, "user/late"])
+          ) and
+            match?(
+              {_, %{from: :a}},
+              TestCluster.rpc!(node_b, Group, :lookup, [name, "user/early"])
+            )
+        end,
+        timeout: 5000
+      )
+    end
+  end
+
   describe "chatty convergence" do
     @tag timeout: 60_000
     test "many clusters, registrations, groups, churn, and dispatch all converge" do
