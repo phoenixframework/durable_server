@@ -226,8 +226,7 @@ defmodule Group.Replica.Data do
 
     reg_entries =
       :ets.select(reg_pid_table, [
-        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [],
-         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [], [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
       ])
 
     for {cluster, key, _meta, _time, _node} <- reg_entries do
@@ -242,8 +241,7 @@ defmodule Group.Replica.Data do
 
     pg_entries =
       :ets.select(pg_pid_table, [
-        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [],
-         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [], [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
       ])
 
     for {cluster, key, _meta, _time, _node} <- pg_entries do
@@ -473,18 +471,27 @@ defmodule Group.Replica.Data do
     # serializes writes per shard, so ETS write locking is never contended. Adding
     # write_concurrency adds overhead (~30-40% on serial benchmarks) without benefit.
     set_opts = [
-      :set, :public, :named_table,
-      read_concurrency: true, decentralized_counters: true
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      decentralized_counters: true
     ]
 
     ordered_set_opts = [
-      :ordered_set, :public, :named_table,
-      read_concurrency: true, decentralized_counters: true
+      :ordered_set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      decentralized_counters: true
     ]
 
     bag_opts = [
-      :bag, :public, :named_table,
-      read_concurrency: true, decentralized_counters: true
+      :bag,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      decentralized_counters: true
     ]
 
     for shard <- 0..(num_shards - 1) do

@@ -314,6 +314,23 @@ defmodule Group.TestCluster do
   end
 
   @doc """
+  Synchronously flushes all shard GenServers on a remote node.
+
+  Issues `:sys.get_state` on each shard, which processes all messages
+  queued before the call. Use after `assert_eventually` to drain any
+  remaining async fan-out or cleanup messages before checking ETS state.
+  """
+  def flush_shards(node, name) do
+    num_shards = rpc!(node, Group, :get_config, [name]).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      rpc!(node, :sys, :get_state, [:"#{name}_replica_#{shard}"])
+    end
+
+    :ok
+  end
+
+  @doc """
   Asserts that all ETS dual-index tables are in sync for a Group instance.
 
   Verifies:

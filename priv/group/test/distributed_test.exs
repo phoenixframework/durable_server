@@ -1747,6 +1747,7 @@ defmodule Group.DistributedTest do
       # Register same key on both sides during partition.
       # B registers later (higher timestamp) — B will win the merge.
       _pid_a = TestCluster.spawn_register(node_a, name, "conflict/1", %{side: :a})
+      # Ensure B's registration gets a strictly higher timestamp
       Process.sleep(50)
       _pid_b = TestCluster.spawn_register(node_b, name, "conflict/1", %{side: :b})
 
@@ -1770,8 +1771,9 @@ defmodule Group.DistributedTest do
         timeout: 10_000
       )
 
-      # Allow any async cleanup to settle
-      Process.sleep(200)
+      # Flush all shards to drain async fan-out messages
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
 
       # ETS dual-index tables should be consistent (no orphaned by_pid entries)
       assert :ok =
@@ -1817,6 +1819,7 @@ defmodule Group.DistributedTest do
       # A registers first (lower timestamp), B registers later (higher timestamp).
       # After heal, B's entry wins via merge_remote_cluster_data on A.
       pid_a = TestCluster.spawn_register(node_a, name, "conflict/2", %{side: :a})
+      # Ensure B's registration gets a strictly higher timestamp
       Process.sleep(50)
       _pid_b = TestCluster.spawn_register(node_b, name, "conflict/2", %{side: :b})
 
@@ -1844,7 +1847,10 @@ defmodule Group.DistributedTest do
       # If there's an orphaned by_pid entry for pid_a, the DOWN handler will
       # incorrectly delete the winner's reg_by_key entry for "conflict/2".
       TestCluster.rpc!(node_a, Process, :exit, [pid_a, :kill])
-      Process.sleep(200)
+
+      # Flush shards to process the DOWN message and any replication
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
 
       # The winner's entry should still be visible on both nodes
       lookup_a = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/2"])
@@ -1862,6 +1868,574 @@ defmodule Group.DistributedTest do
 
       assert :ok =
                TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "many conflicting keys across shards during partition" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_ets_multi_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 8]
+
+      start_group_on_peers(peers, opts)
+
+      # Verify connectivity
+      pid_init = TestCluster.spawn_register(node_a, name, "init", %{})
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) == nil
+      end)
+
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Register 20 conflicting keys on each side (spread across 8 shards).
+      # A registers first, then B registers — B gets higher timestamps so B wins merges.
+      num_keys = 20
+
+      a_pids =
+        for i <- 1..num_keys do
+          TestCluster.spawn_register(node_a, name, "conflict/#{i}", %{side: :a, i: i})
+        end
+
+      # Ensure B's registrations get strictly higher timestamps
+      Process.sleep(50)
+
+      b_pids =
+        for i <- 1..num_keys do
+          TestCluster.spawn_register(node_b, name, "conflict/#{i}", %{side: :b, i: i})
+        end
+
+      # Also register non-conflicting keys to add noise
+      for i <- 1..10 do
+        TestCluster.spawn_register(node_a, name, "only_a/#{i}", %{side: :a})
+      end
+
+      for i <- 1..10 do
+        TestCluster.spawn_register(node_b, name, "only_b/#{i}", %{side: :b})
+      end
+
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # Wait for all conflicting keys to converge
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(1..num_keys, fn i ->
+            la = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/#{i}"])
+            lb = TestCluster.rpc!(node_b, Group, :lookup, [name, "conflict/#{i}"])
+
+            case {la, lb} do
+              {{pa, _}, {pb, _}} -> pa == pb
+              _ -> false
+            end
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+
+      # Kill all losing processes — winners must survive
+      winners =
+        for i <- 1..num_keys do
+          {pid, _} = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/#{i}"])
+          pid
+        end
+
+      Enum.each(a_pids, fn pid ->
+        if pid not in winners do
+          TestCluster.rpc!(node_a, Process, :exit, [pid, :kill])
+        end
+      end)
+
+      Enum.each(b_pids, fn pid ->
+        if pid not in winners do
+          TestCluster.rpc!(node_b, Process, :exit, [pid, :kill])
+        end
+      end)
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      # All winners must still be visible
+      for i <- 1..num_keys do
+        la = TestCluster.rpc!(node_a, Group, :lookup, [name, "conflict/#{i}"])
+        assert la != nil, "conflict/#{i} winner was lost after loser cleanup"
+      end
+
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "named cluster partition heal: no orphans" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_ets_named_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # Both join named cluster
+      TestCluster.rpc!(node_a, Group, :connect, [name, "lobby"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "lobby"])
+
+      # Verify connectivity with a probe key
+      pid_init =
+        TestCluster.spawn_register_in_cluster(node_a, name, "probe", %{}, "lobby")
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "probe", [cluster: "lobby"]]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "probe", [cluster: "lobby"]]) == nil
+      end)
+
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Register conflicting keys in named cluster on both sides.
+      # A first, then B — B gets higher timestamp.
+      _pid_a =
+        TestCluster.spawn_register_in_cluster(node_a, name, "user/1", %{side: :a}, "lobby")
+
+      # Ensure B's registration gets a strictly higher timestamp
+      Process.sleep(50)
+
+      _pid_b =
+        TestCluster.spawn_register_in_cluster(node_b, name, "user/1", %{side: :b}, "lobby")
+
+      # Also register in nil cluster for cross-cluster noise
+      TestCluster.spawn_register(node_a, name, "nil_key", %{})
+      TestCluster.spawn_register(node_b, name, "nil_key_b", %{})
+
+      # Reconnect — both nodes need to re-connect to "lobby" as well since
+      # cluster membership for remote node was purged on nodedown
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # Wait for named cluster conflict to resolve
+      TestCluster.assert_eventually(
+        fn ->
+          la =
+            TestCluster.rpc!(node_a, Group, :lookup, [name, "user/1", [cluster: "lobby"]])
+
+          lb =
+            TestCluster.rpc!(node_b, Group, :lookup, [name, "user/1", [cluster: "lobby"]])
+
+          case {la, lb} do
+            {{pa, _}, {pb, _}} -> pa == pb
+            _ -> false
+          end
+        end,
+        timeout: 10_000
+      )
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "node death: all table types fully cleaned on survivor" do
+      peers = TestCluster.start_peers(2)
+
+      [{peer_a_pid, node_a}, {peer_b_pid, node_b}] = peers
+
+      name = :"dist_ets_nodedown_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # B connects to named clusters
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "chat"])
+      # A also connects so it's a shared cluster
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_a, Group, :connect, [name, "chat"])
+
+      # B registers in nil cluster
+      TestCluster.spawn_register(node_b, name, "user/b1", %{t: :nil_reg})
+      TestCluster.spawn_register(node_b, name, "user/b2", %{t: :nil_reg})
+
+      # B joins in nil cluster
+      TestCluster.spawn_join(node_b, name, "room/nil", %{t: :nil_pg})
+
+      # B registers in named clusters
+      TestCluster.spawn_register_in_cluster(node_b, name, "player/1", %{}, "game")
+      TestCluster.spawn_register_in_cluster(node_b, name, "player/2", %{}, "game")
+      TestCluster.spawn_register_in_cluster(node_b, name, "chatter/1", %{}, "chat")
+
+      # B joins in named clusters
+      TestCluster.spawn_join(node_b, name, "arena/1", %{}, cluster: "game")
+      TestCluster.spawn_join(node_b, name, "channel/1", %{}, cluster: "chat")
+
+      # Wait for all to replicate to A
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "user/b2"]) != nil and
+            TestCluster.rpc!(node_a, Group, :lookup, [
+              name,
+              "player/2",
+              [cluster: "game"]
+            ]) != nil and
+            TestCluster.rpc!(node_a, Group, :lookup, [
+              name,
+              "chatter/1",
+              [cluster: "chat"]
+            ]) != nil and
+            length(TestCluster.rpc!(node_a, Group, :members, [name, "room/nil"])) == 1 and
+            length(
+              TestCluster.rpc!(node_a, Group, :members, [
+                name,
+                "arena/1",
+                [cluster: "game"]
+              ])
+            ) == 1
+        end,
+        timeout: 5000
+      )
+
+      # Kill node B
+      :peer.stop(peer_b_pid)
+
+      # Wait for nodedown cleanup
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "user/b1"]) == nil and
+            TestCluster.rpc!(node_a, Group, :lookup, [name, "user/b2"]) == nil and
+            TestCluster.rpc!(node_a, Group, :lookup, [
+              name,
+              "player/1",
+              [cluster: "game"]
+            ]) == nil and
+            TestCluster.rpc!(node_a, Group, :lookup, [
+              name,
+              "chatter/1",
+              [cluster: "chat"]
+            ]) == nil and
+            TestCluster.rpc!(node_a, Group, :members, [name, "room/nil"]) == [] and
+            TestCluster.rpc!(node_a, Group, :members, [
+              name,
+              "arena/1",
+              [cluster: "game"]
+            ]) == [] and
+            TestCluster.rpc!(node_a, Group, :members, [
+              name,
+              "channel/1",
+              [cluster: "chat"]
+            ]) == []
+        end,
+        timeout: 5000
+      )
+
+      # All ETS tables should be consistent (no orphaned by_pid entries)
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      # Verify node B's entries are truly gone from ALL tables (not just by_key)
+      num_shards = 4
+
+      for shard <- 0..(num_shards - 1) do
+        for table_fn <- [
+              &Group.Replica.Data.reg_by_key_table/2,
+              &Group.Replica.Data.reg_by_pid_table/2,
+              &Group.Replica.Data.pg_by_key_table/2,
+              &Group.Replica.Data.pg_by_pid_table/2
+            ] do
+          table = table_fn.(name, shard)
+
+          size =
+            TestCluster.rpc!(node_a, :ets, :info, [table, :size])
+
+          assert size == 0,
+                 "Table #{table} on node_a has #{size} entries after node_b death"
+        end
+      end
+
+      on_exit(fn -> :peer.stop(peer_a_pid) end)
+    end
+
+    @tag timeout: 60_000
+    test "partition heal + immediate process death: no stale entries" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_ets_healdie_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      pid_init = TestCluster.spawn_register(node_a, name, "init", %{})
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) == nil
+      end)
+
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Register + join on both sides during partition (capture ALL pids)
+      a_pids =
+        for i <- 1..10 do
+          reg_pid = TestCluster.spawn_register(node_a, name, "key/#{i}", %{side: :a})
+          join_pid = TestCluster.spawn_join(node_a, name, "grp/#{i}", %{side: :a})
+          [reg_pid, join_pid]
+        end
+        |> List.flatten()
+
+      b_pids =
+        for i <- 1..10 do
+          reg_pid = TestCluster.spawn_register(node_b, name, "bkey/#{i}", %{side: :b})
+          join_pid = TestCluster.spawn_join(node_b, name, "bgrp/#{i}", %{side: :b})
+          [reg_pid, join_pid]
+        end
+        |> List.flatten()
+
+      # Heal partition
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # Wait for some replication to start
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_b, Group, :lookup, [name, "key/1"]) != nil
+        end,
+        timeout: 10_000
+      )
+
+      # IMMEDIATELY kill all processes on both sides — race with ongoing merge
+      Enum.each(a_pids, fn pid ->
+        TestCluster.rpc!(node_a, Process, :exit, [pid, :kill])
+      end)
+
+      Enum.each(b_pids, fn pid ->
+        TestCluster.rpc!(node_b, Process, :exit, [pid, :kill])
+      end)
+
+      # Wait for all cleanup to propagate (both registry and pg)
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(1..10, fn i ->
+            TestCluster.rpc!(node_a, Group, :lookup, [name, "key/#{i}"]) == nil and
+              TestCluster.rpc!(node_a, Group, :lookup, [name, "bkey/#{i}"]) == nil and
+              TestCluster.rpc!(node_b, Group, :lookup, [name, "key/#{i}"]) == nil and
+              TestCluster.rpc!(node_b, Group, :lookup, [name, "bkey/#{i}"]) == nil and
+              TestCluster.rpc!(node_a, Group, :members, [name, "grp/#{i}"]) == [] and
+              TestCluster.rpc!(node_a, Group, :members, [name, "bgrp/#{i}"]) == [] and
+              TestCluster.rpc!(node_b, Group, :members, [name, "grp/#{i}"]) == [] and
+              TestCluster.rpc!(node_b, Group, :members, [name, "bgrp/#{i}"]) == []
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      # Tables must be consistent AND empty
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+
+      num_shards = 4
+
+      for node <- [node_a, node_b], shard <- 0..(num_shards - 1) do
+        for {label, table_fn} <- [
+              {"reg_by_key", &Group.Replica.Data.reg_by_key_table/2},
+              {"reg_by_pid", &Group.Replica.Data.reg_by_pid_table/2},
+              {"pg_by_key", &Group.Replica.Data.pg_by_key_table/2},
+              {"pg_by_pid", &Group.Replica.Data.pg_by_pid_table/2}
+            ] do
+          table = table_fn.(name, shard)
+          size = TestCluster.rpc!(node, :ets, :info, [table, :size])
+
+          assert size == 0,
+                 "#{label} shard #{shard} on #{node} has #{size} stale entries"
+        end
+      end
+    end
+
+    @tag timeout: 60_000
+    test "node flapping: ETS consistent after rapid disconnect/reconnect cycles" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_ets_flap_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # Both join a named cluster
+      TestCluster.rpc!(node_a, Group, :connect, [name, "live"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "live"])
+
+      # Register data in both nil and named clusters
+      TestCluster.spawn_register(node_a, name, "stable/a", %{})
+      TestCluster.spawn_register_in_cluster(node_a, name, "live/a", %{}, "live")
+      TestCluster.spawn_join(node_b, name, "room/nil", %{})
+      TestCluster.spawn_join(node_b, name, "room/live", %{}, cluster: "live")
+
+      # Wait for full replication
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "stable/a"]) != nil and
+          TestCluster.rpc!(node_a, Group, :members, [name, "room/nil"]) != []
+      end)
+
+      TestCluster.monitor_nodes_on(node_a, self())
+
+      # Flap 3 times
+      for _i <- 1..3 do
+        TestCluster.disconnect_nodes(node_a, node_b)
+        assert_receive {:nodedown_on_remote, ^node_b}, 5000
+
+        TestCluster.reconnect_nodes(node_a, node_b)
+
+        # Wait for data to re-sync
+        TestCluster.assert_eventually(
+          fn ->
+            TestCluster.rpc!(node_b, Group, :lookup, [name, "stable/a"]) != nil and
+              TestCluster.rpc!(node_a, Group, :members, [name, "room/nil"]) != []
+          end,
+          timeout: 5000
+        )
+      end
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      # After all flapping, tables must be consistent
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "cluster disconnect + nodedown: overlapping cleanup paths" do
+      peers = TestCluster.start_peers(2)
+
+      [{peer_a_pid, node_a}, {peer_b_pid, node_b}] = peers
+
+      name = :"dist_ets_disc_down_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      # Both join named cluster
+      TestCluster.rpc!(node_a, Group, :connect, [name, "ephemeral"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "ephemeral"])
+
+      # B registers and joins in the named cluster
+      TestCluster.spawn_register_in_cluster(node_b, name, "eph/1", %{}, "ephemeral")
+      TestCluster.spawn_register_in_cluster(node_b, name, "eph/2", %{}, "ephemeral")
+      TestCluster.spawn_join(node_b, name, "eph_room", %{}, cluster: "ephemeral")
+
+      # Also nil cluster data
+      TestCluster.spawn_register(node_b, name, "nil/b1", %{})
+
+      # Wait for replication
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "eph/2", [cluster: "ephemeral"]]) !=
+          nil and
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "nil/b1"]) != nil
+      end)
+
+      # B disconnects from the named cluster
+      TestCluster.rpc!(node_b, Group, :disconnect, [name, "ephemeral"])
+
+      # Wait for disconnect to propagate to A
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "eph/1", [cluster: "ephemeral"]]) ==
+          nil
+      end)
+
+      # Then B dies entirely
+      :peer.stop(peer_b_pid)
+
+      # A should clean up everything — both the cluster disconnect and nodedown
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_a, Group, :lookup, [name, "eph/1", [cluster: "ephemeral"]]) ==
+            nil and
+            TestCluster.rpc!(node_a, Group, :lookup, [name, "nil/b1"]) == nil and
+            TestCluster.rpc!(node_a, Group, :members, [
+              name,
+              "eph_room",
+              [cluster: "ephemeral"]
+            ]) == []
+        end,
+        timeout: 5000
+      )
+
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      # Only A's own nil cluster membership should remain (and "ephemeral" since A is still connected)
+      num_shards = 4
+
+      for shard <- 0..(num_shards - 1) do
+        for {label, table_fn} <- [
+              {"reg_by_key", &Group.Replica.Data.reg_by_key_table/2},
+              {"reg_by_pid", &Group.Replica.Data.reg_by_pid_table/2},
+              {"pg_by_key", &Group.Replica.Data.pg_by_key_table/2},
+              {"pg_by_pid", &Group.Replica.Data.pg_by_pid_table/2}
+            ] do
+          table = table_fn.(name, shard)
+          size = TestCluster.rpc!(node_a, :ets, :info, [table, :size])
+
+          assert size == 0,
+                 "#{label} shard #{shard} on node_a has #{size} entries after B disconnect+death"
+        end
+      end
+
+      on_exit(fn -> :peer.stop(peer_a_pid) end)
     end
   end
 end
