@@ -99,6 +99,7 @@ defmodule DurableServer.Supervisor do
     `:task_supervisor`, `:dynamic_supervisor`). Example: `init_info: %{api_client: MyApp.API}`
   - `:group` - Options to pass to `Group`
     - `:shards` - The number of group shards. Defaults to 8
+    - `:log` - The log level. One of `false`, `:info`, or `:verbose`. Defaults `:info`.
 
   ## Examples
 
@@ -1655,7 +1656,10 @@ defmodule DurableServer.Supervisor do
     shutdown_timeout = config.supervisor_shutdown_timeout_ms
 
     group_opts =
-      Keyword.merge(Keyword.take(opts, [:group]),
+      opts
+      |> Keyword.get(:group, [])
+      |> Keyword.take([:log])
+      |> Keyword.merge(
         name: name,
         extract_meta: {DurableServer, :extract_user_meta, []},
         resolve_registry_conflict: {DurableServer.GroupConflictResolver, :resolve, []}

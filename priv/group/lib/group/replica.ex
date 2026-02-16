@@ -379,6 +379,10 @@ defmodule Group.Replica do
         mref = monitor_pid(state, pid)
         Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
         broadcast_to_cluster(
           state,
           cluster,
@@ -400,6 +404,10 @@ defmodule Group.Replica do
         # Same pid re-registering — update metadata
         time = System.system_time()
         Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} re-register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
 
         broadcast_to_cluster(
           state,
@@ -426,6 +434,10 @@ defmodule Group.Replica do
       {pid, meta, _time, entry_node} when entry_node == node() ->
         Data.registry_delete(name, shard, cluster, key, pid)
         state = maybe_demonitor_pid(state, name, shard, pid)
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} unregister key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
 
         broadcast_to_cluster(
           state,
@@ -461,6 +473,10 @@ defmodule Group.Replica do
         mref = monitor_pid(state, pid)
         Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
         broadcast_to_cluster(
           state,
           cluster,
@@ -482,6 +498,10 @@ defmodule Group.Replica do
         # Re-join with updated metadata
         time = System.system_time()
         Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} re-join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
 
         broadcast_to_cluster(
           state,
@@ -509,6 +529,10 @@ defmodule Group.Replica do
         Data.pg_delete(name, shard, cluster, key, pid)
         state = maybe_demonitor_pid(state, name, shard, pid)
 
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} leave key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
         broadcast_to_cluster(
           state,
           cluster,
@@ -532,7 +556,7 @@ defmodule Group.Replica do
     %{name: name} = state
 
     log_once(state, fn ->
-      "#{log_prefix(state)} cluster_connect (#{length(clusters)} clusters)"
+      "#{log_prefix(state)} cluster_connect #{inspect(clusters)}"
     end)
 
     # Use shared ETS (cluster_nodes for nil cluster) instead of per-shard
@@ -554,7 +578,7 @@ defmodule Group.Replica do
     %{name: name, shard_index: shard} = state
 
     log_once(state, fn ->
-      "#{log_prefix(state)} cluster_disconnect (#{length(clusters)} clusters)"
+      "#{log_prefix(state)} cluster_disconnect #{inspect(clusters)}"
     end)
 
     for cluster <- clusters do
@@ -864,7 +888,7 @@ defmodule Group.Replica do
       end)
 
     log_once(state, fn ->
-      "#{log_prefix(state)} #{remote_node} cluster_connect (#{length(shared)}/#{length(clusters)} shared)"
+      "#{log_prefix(state)} #{remote_node} cluster_connect #{inspect(shared)} (#{length(shared)}/#{length(clusters)} shared)"
     end)
 
     for cluster <- shared do
@@ -929,7 +953,7 @@ defmodule Group.Replica do
     remote_node = node(remote_pid)
 
     log_once(state, fn ->
-      "#{log_prefix(state)} #{remote_node} cluster_disconnect (#{length(clusters)} clusters)"
+      "#{log_prefix(state)} #{remote_node} cluster_disconnect #{inspect(clusters)}"
     end)
 
     if shard == 0 do

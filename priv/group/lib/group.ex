@@ -727,6 +727,18 @@ defmodule Group do
   # Public Helpers
   # ===========================================================================
 
+  @doc """
+  Set the log level at runtime. Accepts `:info`, `:verbose`, or `false`.
+
+  Updates the persistent_term config so the change takes effect immediately
+  on all shards without restart.
+  """
+  def log_level(name, level) when level in [:info, :verbose, false] do
+    config = get_config(name)
+    :persistent_term.put({__MODULE__, name}, %{config | log: level})
+    :ok
+  end
+
   @doc false
   def get_config(name) when is_atom(name) do
     :persistent_term.get({__MODULE__, name}, nil)
