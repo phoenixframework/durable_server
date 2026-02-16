@@ -127,21 +127,26 @@ Monitor lifecycle events for DurableServers:
 :ok = Group.monitor(MyDurableSup, :all)
 ```
 
-Monitors receive `%Group.Event{}` structs in their mailbox:
+Monitors receive `{:group, events, info}` tuples in their mailbox:
 
 ```elixir
-def handle_info(%Group.Event{type: :registered, key: key, pid: pid, previous_meta: nil}, state) do
-  # A DurableServer started (previous_meta is nil for first registration)
-end
-
-def handle_info(%Group.Event{type: :unregistered, key: key, reason: reason}, state) do
-  # A DurableServer stopped
+def handle_info({:group, events, _info}, state) do
+  Enum.each(events, fn
+    %Group.Event{type: :registered, key: key, pid: pid, previous_meta: nil} ->
+      # A DurableServer started (previous_meta is nil for first registration)
+      :ok
+    %Group.Event{type: :unregistered, key: key, reason: reason} ->
+      # A DurableServer stopped
+      :ok
+    _ -> :ok
+  end)
+  {:noreply, state}
 end
 ```
 
 Event types: `:registered`, `:unregistered`, `:joined`, `:left`
 
-`:registered` and `:joined` events include a `previous_meta` field (`nil` for new, old meta for re-register/re-join).
+`:registered` and `:joined` events include a `previous_meta` field (`nil` for new, old meta for re-register/re-join). Single operations produce one event per tuple; bulk operations (nodedown, process death) batch all events together.
 
 ### Joining as a Member
 

@@ -247,7 +247,9 @@ defmodule GroupBench.Local do
 
   defp drain_events(remaining) do
     receive do
-      %Group.Event{type: :registered} -> drain_events(remaining - 1)
+      {:group, events, _info} ->
+        count = Enum.count(events, &match?(%Group.Event{type: :registered}, &1))
+        drain_events(remaining - count)
     after
       5_000 -> IO.puts("    WARNING: timed out waiting for events, #{remaining} remaining")
     end

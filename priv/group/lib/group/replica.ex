@@ -311,6 +311,29 @@ defmodule Group.Replica do
   Callers must ensure their resolver returns quickly. Any information needed for the
   decision (e.g. priority, version, creation time) should be carried in the
   registration metadata, not fetched at resolution time.
+
+  ## Monitor Event Delivery
+
+  Lifecycle events (`:registered`, `:unregistered`, `:joined`, `:left`) are delivered
+  to `Group.monitor/3` subscribers as `{:group, events, info}` tuples. Each
+  GenServer handler invocation is a natural batch boundary:
+
+  - **Single operations** (register, join, leave, unregister, replicate_*): build one
+    event, deliver one tuple with one event per matching subscriber.
+  - **Bulk operations** (nodedown, process DOWN, cluster_disconnect, cluster_state
+    merge): accumulate events into a local variable, then deliver one tuple per
+    subscriber containing all matching events from that handler turn.
+
+  Events are built by `build_event/6`, accumulated in reverse via prepend, and
+  flushed by `notify_monitors/2` which reverses once, groups by cluster, matches
+  against subscriber patterns (`:all`, `{:prefix, _}`, `{:exact, _}`), and sends
+  one `{:group, events, %{name: name}}` per subscriber. Both functions are private
+  to this module.
+
+  `resolve_conflict/5` returns `{state, event_or_nil}` so callers can accumulate
+  the event. `merge_remote_cluster_data/5` threads `{state, events}` through its
+  reduce so conflict events accumulate across the merge. `build_purged_events/5`
+  takes an events accumulator and prepends purged-entry events to it.
   """
 
   require Logger
@@ -406,12 +429,13 @@ defmodule Group.Replica do
           {:replicate_register, cluster, key, pid, meta, time, :register}
         )
 
-        Group.__dispatch__(name, :registered, key, pid, meta, %{
-          previous_meta: nil,
-          cluster: cluster
-        })
+        state = put_monitor(state, pid, mref)
 
-        {:reply, :ok, put_monitor(state, pid, mref)}
+        event =
+          build_event(name, :registered, key, pid, meta, %{previous_meta: nil, cluster: cluster})
+
+        notify_monitors(name, [event])
+        {:reply, :ok, state}
 
       {^pid, old_meta, _time, _node} when old_meta == meta ->
         # Same pid, same metadata — noop
@@ -432,11 +456,13 @@ defmodule Group.Replica do
           {:replicate_register, cluster, key, pid, meta, time, :update}
         )
 
-        Group.__dispatch__(name, :registered, key, pid, meta, %{
-          previous_meta: old_meta,
-          cluster: cluster
-        })
+        event =
+          build_event(name, :registered, key, pid, meta, %{
+            previous_meta: old_meta,
+            cluster: cluster
+          })
 
+        notify_monitors(name, [event])
         {:reply, :ok, state}
 
       _other ->
@@ -462,11 +488,13 @@ defmodule Group.Replica do
           {:replicate_unregister, cluster, key, pid, meta, :unregister}
         )
 
-        Group.__dispatch__(name, :unregistered, key, pid, meta, %{
-          reason: :unregister,
-          cluster: cluster
-        })
+        event =
+          build_event(name, :unregistered, key, pid, meta, %{
+            reason: :unregister,
+            cluster: cluster
+          })
 
+        notify_monitors(name, [event])
         {:reply, :ok, state}
 
       nil ->
@@ -500,12 +528,13 @@ defmodule Group.Replica do
           {:replicate_join, cluster, key, pid, meta, time, :join}
         )
 
-        Group.__dispatch__(name, :joined, key, pid, meta, %{
-          previous_meta: nil,
-          cluster: cluster
-        })
+        state = put_monitor(state, pid, mref)
 
-        {:reply, :ok, put_monitor(state, pid, mref)}
+        event =
+          build_event(name, :joined, key, pid, meta, %{previous_meta: nil, cluster: cluster})
+
+        notify_monitors(name, [event])
+        {:reply, :ok, state}
 
       {old_meta, _time, _node} when old_meta == meta ->
         # Same metadata — noop
@@ -526,11 +555,10 @@ defmodule Group.Replica do
           {:replicate_join, cluster, key, pid, meta, time, :update}
         )
 
-        Group.__dispatch__(name, :joined, key, pid, meta, %{
-          previous_meta: old_meta,
-          cluster: cluster
-        })
+        event =
+          build_event(name, :joined, key, pid, meta, %{previous_meta: old_meta, cluster: cluster})
 
+        notify_monitors(name, [event])
         {:reply, :ok, state}
     end
   end
@@ -556,11 +584,8 @@ defmodule Group.Replica do
           {:replicate_leave, cluster, key, pid, meta, :leave}
         )
 
-        Group.__dispatch__(name, :left, key, pid, meta, %{
-          reason: :leave,
-          cluster: cluster
-        })
-
+        event = build_event(name, :left, key, pid, meta, %{reason: :leave, cluster: cluster})
+        notify_monitors(name, [event])
         {:reply, :ok, state}
     end
   end
@@ -598,15 +623,17 @@ defmodule Group.Replica do
       "#{log_prefix(state)} cluster_disconnect #{inspect(clusters)}"
     end)
 
-    for cluster <- clusters do
-      {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
-      dispatch_purged(state, cluster, purged_reg, purged_pg, :cluster_disconnect)
-    end
+    events =
+      Enum.reduce(clusters, [], fn cluster, acc ->
+        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
+        build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, acc)
+      end)
 
     if shard == 0 do
       broadcast_to_peers(state, {:cluster_disconnect, clusters, self()})
     end
 
+    notify_monitors(name, events)
     {:reply, :ok, state}
   end
 
@@ -622,32 +649,27 @@ defmodule Group.Replica do
       "#{log_prefix_shard(state)} replicate_register key=#{inspect(key)} from #{node(pid)}"
     end)
 
-    case Data.registry_lookup(name, shard, cluster, key) do
-      nil ->
-        Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+    {state, event} =
+      case Data.registry_lookup(name, shard, cluster, key) do
+        nil ->
+          Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-        Group.__dispatch__(name, :registered, key, pid, meta, %{
-          previous_meta: nil,
-          cluster: cluster
-        })
+          {state,
+           build_event(name, :registered, key, pid, meta, %{previous_meta: nil, cluster: cluster})}
 
-        {:noreply, state}
+        {^pid, old_meta, _old_time, _node} ->
+          # Same pid updating
+          Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
 
-      {^pid, old_meta, _old_time, _node} ->
-        # Same pid updating
-        Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+          {state,
+           build_event(name, :registered, key, pid, meta, %{
+             previous_meta: old_meta,
+             cluster: cluster
+           })}
 
-        Group.__dispatch__(name, :registered, key, pid, meta, %{
-          previous_meta: old_meta,
-          cluster: cluster
-        })
-
-        {:noreply, state}
-
-      {existing_pid, existing_meta, existing_time, existing_node}
-      when existing_node == node() ->
-        # Conflict: incoming remote registration vs local entry
-        state =
+        {existing_pid, existing_meta, existing_time, existing_node}
+        when existing_node == node() ->
+          # Conflict: incoming remote registration vs local entry
           resolve_conflict(
             state,
             cluster,
@@ -656,28 +678,27 @@ defmodule Group.Replica do
             {pid, meta, time}
           )
 
-        {:noreply, state}
+        {existing_pid, _existing_meta, existing_time, _existing_node} ->
+          # Both remote — keep the more recent one
+          if time > existing_time do
+            if existing_pid != pid do
+              Data.registry_delete(name, shard, cluster, key, existing_pid)
+            end
 
-      {existing_pid, _existing_meta, existing_time, _existing_node} ->
-        # Both remote — keep the more recent one
-        if time > existing_time do
-          # Clean up old pid's by_pid entry before overwriting by_key
-          if existing_pid != pid do
-            Data.registry_delete(name, shard, cluster, key, existing_pid)
+            Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+            {state,
+             build_event(name, :registered, key, pid, meta, %{
+               previous_meta: nil,
+               cluster: cluster
+             })}
+          else
+            {state, nil}
           end
+      end
 
-          Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-
-          Group.__dispatch__(name, :registered, key, pid, meta, %{
-            previous_meta: nil,
-            cluster: cluster
-          })
-
-          {:noreply, state}
-        else
-          {:noreply, state}
-        end
-    end
+    if event, do: notify_monitors(name, [event])
+    {:noreply, state}
   end
 
   def handle_info({:replicate_unregister, cluster, key, pid, meta, reason}, state) do
@@ -691,16 +712,16 @@ defmodule Group.Replica do
       {^pid, _meta, _time, _node} ->
         Data.registry_delete(name, shard, cluster, key, pid)
 
-        Group.__dispatch__(name, :unregistered, key, pid, meta, %{
-          reason: reason,
-          cluster: cluster
-        })
+        event =
+          build_event(name, :unregistered, key, pid, meta, %{reason: reason, cluster: cluster})
 
-        {:noreply, state}
+        notify_monitors(name, [event])
 
       _ ->
-        {:noreply, state}
+        :ok
     end
+
+    {:noreply, state}
   end
 
   def handle_info({:replicate_join, cluster, key, pid, meta, time, reason}, state) do
@@ -710,29 +731,24 @@ defmodule Group.Replica do
       "#{log_prefix_shard(state)} replicate_join key=#{inspect(key)} pid=#{inspect(pid)} from #{node(pid)}"
     end)
 
-    case Data.pg_lookup(name, shard, cluster, key, pid) do
-      nil ->
-        Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+    event =
+      case Data.pg_lookup(name, shard, cluster, key, pid) do
+        nil ->
+          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+          build_event(name, :joined, key, pid, meta, %{previous_meta: nil, cluster: cluster})
 
-        Group.__dispatch__(name, :joined, key, pid, meta, %{
-          previous_meta: nil,
-          cluster: cluster
-        })
+        {old_meta, _old_time, _node} ->
+          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+          previous_meta = if reason == :update, do: old_meta, else: nil
 
-        {:noreply, state}
+          build_event(name, :joined, key, pid, meta, %{
+            previous_meta: previous_meta,
+            cluster: cluster
+          })
+      end
 
-      {old_meta, _old_time, _node} ->
-        Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-
-        previous_meta = if reason == :update, do: old_meta, else: nil
-
-        Group.__dispatch__(name, :joined, key, pid, meta, %{
-          previous_meta: previous_meta,
-          cluster: cluster
-        })
-
-        {:noreply, state}
-    end
+    notify_monitors(name, [event])
+    {:noreply, state}
   end
 
   def handle_info({:replicate_leave, cluster, key, pid, meta, reason}, state) do
@@ -749,11 +765,8 @@ defmodule Group.Replica do
       {_meta, _time, _node} ->
         Data.pg_delete(name, shard, cluster, key, pid)
 
-        Group.__dispatch__(name, :left, key, pid, meta, %{
-          reason: reason,
-          cluster: cluster
-        })
-
+        event = build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster})
+        notify_monitors(name, [event])
         {:noreply, state}
     end
   end
@@ -884,7 +897,8 @@ defmodule Group.Replica do
         "#{log_prefix_shard(state)} merging cluster=#{inspect(cluster)} (#{length(reg_data)} reg, #{length(pg_data)} pg entries)"
       end)
 
-      state = merge_remote_cluster_data(state, cluster, reg_data, pg_data)
+      {state, events} = merge_remote_cluster_data(state, cluster, reg_data, pg_data)
+      notify_monitors(name, events)
       {:noreply, state}
     else
       {:noreply, state}
@@ -939,29 +953,37 @@ defmodule Group.Replica do
     # Guard: skip if remote node went down (nodedown race) or if we left the
     # cluster (connect+disconnect race). Without these, a delayed ack would
     # re-add a dead/irrelevant node to cluster_nodes permanently.
-    if Map.has_key?(state.remote_shards, remote_node) do
-      active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
+    {state, events} =
+      if Map.has_key?(state.remote_shards, remote_node) do
+        active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
 
-      for cluster <- active do
-        Data.add_cluster_node(name, cluster, remote_node)
+        for cluster <- active do
+          Data.add_cluster_node(name, cluster, remote_node)
+        end
+
+        if active != [] do
+          # Merge the data bundled in the ack
+          {new_state, events} =
+            Enum.reduce(cluster_data, {state, []}, fn {cluster, reg_data, pg_data},
+                                                      {acc_state, acc_events} ->
+              if cluster in active and (reg_data != [] or pg_data != []) do
+                merge_remote_cluster_data(acc_state, cluster, reg_data, pg_data, acc_events)
+              else
+                {acc_state, acc_events}
+              end
+            end)
+
+          send_cluster_states(new_state, active, remote_node)
+          fan_out_to_siblings(new_state, {:send_cluster_data, active, remote_node})
+          {new_state, events}
+        else
+          {state, []}
+        end
+      else
+        {state, []}
       end
 
-      if active != [] do
-        # Merge the data bundled in the ack
-        state =
-          Enum.reduce(cluster_data, state, fn {cluster, reg_data, pg_data}, acc ->
-            if cluster in active and (reg_data != [] or pg_data != []) do
-              merge_remote_cluster_data(acc, cluster, reg_data, pg_data)
-            else
-              acc
-            end
-          end)
-
-        send_cluster_states(state, active, remote_node)
-        fan_out_to_siblings(state, {:send_cluster_data, active, remote_node})
-      end
-    end
-
+    notify_monitors(name, events)
     {:noreply, state}
   end
 
@@ -981,11 +1003,13 @@ defmodule Group.Replica do
       fan_out_to_siblings(state, {:cluster_disconnect, clusters, remote_pid})
     end
 
-    for cluster <- clusters do
-      {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, remote_node)
-      dispatch_purged(state, cluster, purged_reg, purged_pg, :cluster_disconnect)
-    end
+    events =
+      Enum.reduce(clusters, [], fn cluster, acc ->
+        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, remote_node)
+        build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, acc)
+      end)
 
+    notify_monitors(name, events)
     {:noreply, state}
   end
 
@@ -1022,21 +1046,8 @@ defmodule Group.Replica do
       "#{log_prefix(state)} nodedown #{dead_node} (purged #{length(purged_reg)} reg, #{length(purged_pg)} pg entries)"
     end)
 
-    # Fire events for purged entries
-    for {cluster, key, pid, meta, _time} <- purged_reg do
-      Group.__dispatch__(name, :unregistered, key, pid, meta, %{
-        reason: :nodedown,
-        cluster: cluster
-      })
-    end
-
-    for {cluster, key, pid, meta, _time} <- purged_pg do
-      Group.__dispatch__(name, :left, key, pid, meta, %{
-        reason: :nodedown,
-        cluster: cluster
-      })
-    end
-
+    events = build_purged_events(name, purged_reg, purged_pg, :nodedown)
+    notify_monitors(name, events)
     state = %{state | remote_shards: Map.delete(state.remote_shards, dead_node)}
     {:noreply, state}
   end
@@ -1060,20 +1071,8 @@ defmodule Group.Replica do
         "#{log_prefix_shard(state)} remote_shard_down #{remote_node} (purged #{length(purged_reg)} reg, #{length(purged_pg)} pg)"
       end)
 
-      for {cluster, key, dead_pid, meta, _time} <- purged_reg do
-        Group.__dispatch__(name, :unregistered, key, dead_pid, meta, %{
-          reason: {:nodedown, remote_node},
-          cluster: cluster
-        })
-      end
-
-      for {cluster, key, dead_pid, meta, _time} <- purged_pg do
-        Group.__dispatch__(name, :left, key, dead_pid, meta, %{
-          reason: {:nodedown, remote_node},
-          cluster: cluster
-        })
-      end
-
+      events = build_purged_events(name, purged_reg, purged_pg, {:nodedown, remote_node})
+      notify_monitors(name, events)
       state = %{state | remote_shards: Map.delete(state.remote_shards, remote_node)}
       state = %{state | monitors: Map.delete(state.monitors, pid)}
       {:noreply, state}
@@ -1087,32 +1086,32 @@ defmodule Group.Replica do
         "#{log_prefix_shard(state)} process_down pid=#{inspect(pid)} reason=#{inspect(reason)} (#{length(purged_reg) + length(purged_pg)} entries cleaned)"
       end)
 
-      for {cluster, key, meta, _time, _node} <- purged_reg do
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_unregister, cluster, key, pid, meta, reason}
-        )
+      events =
+        Enum.reduce(purged_reg, [], fn {cluster, key, meta, _time, _node}, acc ->
+          broadcast_to_cluster(
+            state,
+            cluster,
+            {:replicate_unregister, cluster, key, pid, meta, reason}
+          )
 
-        Group.__dispatch__(name, :unregistered, key, pid, meta, %{
-          reason: reason,
-          cluster: cluster
-        })
-      end
+          [
+            build_event(name, :unregistered, key, pid, meta, %{reason: reason, cluster: cluster})
+            | acc
+          ]
+        end)
 
-      for {cluster, key, meta, _time, _node} <- purged_pg do
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_leave, cluster, key, pid, meta, reason}
-        )
+      events =
+        Enum.reduce(purged_pg, events, fn {cluster, key, meta, _time, _node}, acc ->
+          broadcast_to_cluster(
+            state,
+            cluster,
+            {:replicate_leave, cluster, key, pid, meta, reason}
+          )
 
-        Group.__dispatch__(name, :left, key, pid, meta, %{
-          reason: reason,
-          cluster: cluster
-        })
-      end
+          [build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster}) | acc]
+        end)
 
+      notify_monitors(name, events)
       state = %{state | monitors: Map.delete(state.monitors, pid)}
       {:noreply, state}
     end
@@ -1256,20 +1255,21 @@ defmodule Group.Replica do
     node() in Data.cluster_nodes(name, cluster)
   end
 
-  defp merge_remote_cluster_data(state, cluster, reg_data, pg_data) do
+  defp merge_remote_cluster_data(state, cluster, reg_data, pg_data, events \\ []) do
     %{name: name, shard_index: shard, num_shards: num_shards} = state
 
-    # Registry merge uses Enum.reduce to thread state, because resolve_conflict
-    # modifies state.monitors (demonitor evicted local pids).
-    state =
-      Enum.reduce(reg_data, state, fn {key, pid, meta, time}, acc ->
+    # Registry merge uses Enum.reduce to thread state + events, because
+    # resolve_conflict modifies state.monitors (demonitor evicted local pids)
+    # and may produce an event.
+    {state, events} =
+      Enum.reduce(reg_data, {state, events}, fn {key, pid, meta, time}, {acc_state, acc_events} ->
         if shard_index_for(cluster, key, num_shards) != shard do
-          acc
+          {acc_state, acc_events}
         else
           case Data.registry_lookup(name, shard, cluster, key) do
             nil ->
               Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              acc
+              {acc_state, acc_events}
 
             {^pid, _meta, existing_time, _node} ->
               # Same pid (bounceback or metadata update) — apply if newer
@@ -1277,19 +1277,23 @@ defmodule Group.Replica do
                 Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
               end
 
-              acc
+              {acc_state, acc_events}
 
             {existing_pid, existing_meta, existing_time, existing_node}
             when existing_node == node() ->
               # Local entry vs incoming remote — use full conflict resolution
               # (kills loser, re-broadcasts winner, invokes user's resolver)
-              resolve_conflict(
-                acc,
-                cluster,
-                key,
-                {existing_pid, existing_meta, existing_time},
-                {pid, meta, time}
-              )
+              {new_state, event} =
+                resolve_conflict(
+                  acc_state,
+                  cluster,
+                  key,
+                  {existing_pid, existing_meta, existing_time},
+                  {pid, meta, time}
+                )
+
+              acc_events = if event, do: [event | acc_events], else: acc_events
+              {new_state, acc_events}
 
             {existing_pid, _meta, existing_time, _node} when time > existing_time ->
               # Both remote — keep the more recent one
@@ -1298,10 +1302,10 @@ defmodule Group.Replica do
               end
 
               Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              acc
+              {acc_state, acc_events}
 
             _ ->
-              acc
+              {acc_state, acc_events}
           end
         end
       end)
@@ -1320,7 +1324,7 @@ defmodule Group.Replica do
       end
     end
 
-    state
+    {state, events}
   end
 
   defp resolve_conflict(
@@ -1376,12 +1380,13 @@ defmodule Group.Replica do
         # Dispatch lifecycle events so monitors see the eviction.
         # The :registered event for remote_pid will arrive via the winner's
         # re-broadcast (replicate_register), so we only dispatch :unregistered here.
-        Group.__dispatch__(name, :unregistered, key, local_pid, local_meta, %{
-          reason: :resolve_conflict,
-          cluster: cluster
-        })
+        event =
+          build_event(name, :unregistered, key, local_pid, local_meta, %{
+            reason: :resolve_conflict,
+            cluster: cluster
+          })
 
-        state
+        {state, event}
 
       winner_pid == local_pid ->
         # Local wins — re-broadcast to override remote
@@ -1404,7 +1409,7 @@ defmodule Group.Replica do
           {:replicate_register, cluster, key, local_pid, local_meta, time, :resolve_conflict}
         )
 
-        state
+        {state, nil}
 
       true ->
         # Neither wins — remove both
@@ -1417,12 +1422,13 @@ defmodule Group.Replica do
           {:replicate_unregister, cluster, key, local_pid, local_meta, :resolve_conflict}
         )
 
-        Group.__dispatch__(name, :unregistered, key, local_pid, local_meta, %{
-          reason: :resolve_conflict,
-          cluster: cluster
-        })
+        event =
+          build_event(name, :unregistered, key, local_pid, local_meta, %{
+            reason: :resolve_conflict,
+            cluster: cluster
+          })
 
-        state
+        {state, event}
     end
   end
 
@@ -1505,24 +1511,96 @@ defmodule Group.Replica do
     {purged_reg, purged_pg}
   end
 
-  defp dispatch_purged(state, cluster, purged_reg, purged_pg, reason) do
-    %{name: name} = state
+  defp build_purged_events(name, purged_reg, purged_pg, reason, events \\ []) do
+    events =
+      Enum.reduce(purged_reg, events, fn {cluster, key, pid, meta, _time}, acc ->
+        [
+          build_event(name, :unregistered, key, pid, meta, %{reason: reason, cluster: cluster})
+          | acc
+        ]
+      end)
 
-    for {^cluster, key, pid, meta, _time} <- purged_reg do
-      Group.__dispatch__(name, :unregistered, key, pid, meta, %{
-        reason: reason,
-        cluster: cluster
-      })
+    Enum.reduce(purged_pg, events, fn {cluster, key, pid, meta, _time}, acc ->
+      [build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster}) | acc]
+    end)
+  end
+
+  defp build_event(name, event_type, key, pid, meta, extra) do
+    extract_fn = extract_meta_fn(name)
+
+    %Group.Event{
+      type: event_type,
+      supervisor: name,
+      cluster: Map.get(extra, :cluster),
+      key: key,
+      pid: pid,
+      meta: extract_fn.(meta),
+      previous_meta:
+        case Map.get(extra, :previous_meta) do
+          nil -> nil
+          prev -> extract_fn.(prev)
+        end,
+      reason: Map.get(extra, :reason)
+    }
+  end
+
+  defp extract_meta_fn(name) do
+    case Group.get_config(name) do
+      %{extract_meta: {mod, func, args}} -> fn meta -> apply(mod, func, [meta | args]) end
+      _ -> & &1
+    end
+  end
+
+  # =====================================================================
+  # Monitor notification
+  # =====================================================================
+
+  defp notify_monitors(_name, []), do: :ok
+
+  defp notify_monitors(name, events) do
+    events = Enum.reverse(events)
+    events_by_cluster = Enum.group_by(events, & &1.cluster)
+
+    subscriber_events =
+      Enum.reduce(events_by_cluster, %{}, fn {cluster, cluster_events}, acc ->
+        subs = get_subscribers_with_patterns(name, cluster)
+
+        Enum.reduce(cluster_events, acc, fn event, inner ->
+          matching_pids =
+            for {pattern, sub_pid} <- subs,
+                matches_pattern?(pattern, event.key),
+                uniq: true,
+                do: sub_pid
+
+          Enum.reduce(matching_pids, inner, fn sub_pid, acc ->
+            Map.update(acc, sub_pid, [event], &[event | &1])
+          end)
+        end)
+      end)
+
+    for {sub_pid, sub_events} <- subscriber_events do
+      send(sub_pid, {:group, Enum.reverse(sub_events), %{name: name}})
     end
 
-    for {^cluster, key, pid, meta, _time} <- purged_pg do
-      Group.__dispatch__(name, :left, key, pid, meta, %{
-        reason: reason,
-        cluster: cluster
-      })
-    end
+    :ok
+  end
 
-    state
+  defp matches_pattern?(:all, _key), do: true
+  defp matches_pattern?({:exact, pattern}, key), do: pattern == key
+  defp matches_pattern?({:prefix, prefix}, key), do: String.starts_with?(key, prefix)
+
+  defp get_subscribers_with_patterns(name, cluster) do
+    Group.registry_name(name)
+    |> Registry.select([
+      {
+        {{:"$1", :"$2", :"$3"}, :"$4", :_},
+        [{:andalso, {:==, :"$1", name}, {:==, :"$2", cluster}}],
+        [{{:"$3", :"$4"}}]
+      }
+    ])
+    |> Enum.uniq()
+  rescue
+    ArgumentError -> []
   end
 
   # =====================================================================

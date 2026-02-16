@@ -2,7 +2,8 @@ defmodule Group.Event do
   @moduledoc """
   Struct representing a lifecycle event from `Group`.
 
-  Delivered to processes that called `Group.monitor/2`.
+  Events are delivered as `{:group, events, info}` tuples to processes
+  that called `Group.monitor/2`.
 
   ## Fields
 

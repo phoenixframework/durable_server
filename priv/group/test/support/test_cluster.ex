@@ -153,8 +153,8 @@ defmodule Group.TestCluster do
 
   defp forward_events(target_pid) do
     receive do
-      %Group.Event{} = event ->
-        send(target_pid, {:got_event, event})
+      {:group, events, _info} ->
+        for event <- events, do: send(target_pid, {:got_event, event})
         forward_events(target_pid)
     after
       30_000 -> :ok

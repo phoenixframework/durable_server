@@ -46,7 +46,7 @@ defmodule GroupTest do
       end
 
       # Should receive :joined event
-      assert_receive %Group.Event{type: :joined} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :joined} = event], _}, 1000
       assert event.supervisor == name
       assert event.key == key
       assert event.pid == spawn_pid
@@ -60,14 +60,14 @@ defmodule GroupTest do
       :ok = Group.monitor(name, key)
       :ok = Group.join(name, key, %{role: :listener})
 
-      assert_receive %Group.Event{type: :joined}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined}], _}, 1000
 
       assert length(Group.members(name, key)) == 1
 
       :ok = Group.leave(name, key)
 
       # Should receive :left event
-      assert_receive %Group.Event{type: :left} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :left} = event], _}, 1000
       assert event.key == key
       assert event.pid == self()
       assert event.reason != nil
@@ -98,14 +98,14 @@ defmodule GroupTest do
         1000 -> flunk("Process didn't join in time")
       end
 
-      assert_receive %Group.Event{type: :joined, pid: ^pid}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, pid: ^pid}], _}, 1000
       assert length(Group.members(name, key)) == 1
 
       # Kill the process
       Process.exit(pid, :kill)
 
       # Should receive :left event
-      assert_receive %Group.Event{type: :left} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :left} = event], _}, 1000
       assert event.pid == pid
       assert event.key == key
 
@@ -125,13 +125,16 @@ defmodule GroupTest do
 
       # First join succeeds
       assert :ok = Group.join(name, key, %{v: 1})
-      assert_receive %Group.Event{type: :joined, previous_meta: nil, meta: %{v: 1}}, 1000
+
+      assert_receive {:group, [%Group.Event{type: :joined, previous_meta: nil, meta: %{v: 1}}],
+                      _},
+                     1000
 
       # Second join also succeeds and updates metadata
       assert :ok = Group.join(name, key, %{v: 2})
 
       # Should receive :joined event with previous_meta
-      assert_receive %Group.Event{type: :joined} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :joined} = event], _}, 1000
       assert event.meta == %{v: 2}
       assert event.previous_meta == %{v: 1}
 
@@ -157,7 +160,7 @@ defmodule GroupTest do
       :ok = Group.monitor(name, key)
       :ok = Group.register(name, key, %{module: :test})
 
-      assert_receive %Group.Event{type: :registered} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :registered} = event], _}, 1000
       assert event.key == key
       assert event.pid == self()
       assert event.meta == %{module: :test}
@@ -185,10 +188,14 @@ defmodule GroupTest do
 
       :ok = Group.monitor(name, key)
       :ok = Group.register(name, key, %{v: 1})
-      assert_receive %Group.Event{type: :registered, previous_meta: nil}, 1000
+      assert_receive {:group, [%Group.Event{type: :registered, previous_meta: nil}], _}, 1000
 
       :ok = Group.register(name, key, %{v: 2})
-      assert_receive %Group.Event{type: :registered, meta: %{v: 2}, previous_meta: %{v: 1}}, 1000
+
+      assert_receive {:group,
+                      [%Group.Event{type: :registered, meta: %{v: 2}, previous_meta: %{v: 1}}],
+                      _},
+                     1000
 
       {_pid, %{v: 2}} = Group.lookup(name, key)
     end
@@ -198,10 +205,10 @@ defmodule GroupTest do
 
       :ok = Group.monitor(name, key)
       :ok = Group.register(name, key, %{module: :test})
-      assert_receive %Group.Event{type: :registered}, 1000
+      assert_receive {:group, [%Group.Event{type: :registered}], _}, 1000
 
       :ok = Group.unregister(name, key)
-      assert_receive %Group.Event{type: :unregistered} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :unregistered} = event], _}, 1000
       assert event.key == key
       assert event.reason == :unregister
 
@@ -228,12 +235,12 @@ defmodule GroupTest do
         1000 -> flunk("Process didn't register in time")
       end
 
-      assert_receive %Group.Event{type: :registered, pid: ^pid}, 1000
+      assert_receive {:group, [%Group.Event{type: :registered, pid: ^pid}], _}, 1000
       assert Group.lookup(name, key) != nil
 
       Process.exit(pid, :kill)
 
-      assert_receive %Group.Event{type: :unregistered, pid: ^pid}, 1000
+      assert_receive {:group, [%Group.Event{type: :unregistered, pid: ^pid}], _}, 1000
       assert Group.lookup(name, key) == nil
     end
   end
@@ -292,7 +299,7 @@ defmodule GroupTest do
       :ok = Group.join(name, key, %{self: true})
 
       # Should receive our own :joined event
-      assert_receive %Group.Event{type: :joined} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :joined} = event], _}, 1000
       assert event.pid == self()
       assert event.meta == %{self: true}
       assert event.previous_meta == nil
@@ -323,8 +330,8 @@ defmodule GroupTest do
       end
 
       # Should only receive one event (not duplicated)
-      assert_receive %Group.Event{type: :joined, pid: ^pid}, 1000
-      refute_receive %Group.Event{type: :joined, pid: ^pid}, 100
+      assert_receive {:group, [%Group.Event{type: :joined, pid: ^pid}], _}, 1000
+      refute_receive {:group, _, _}, 100
     end
 
     test "demonitor stops events", %{name: name} do
@@ -346,7 +353,7 @@ defmodule GroupTest do
         1000 -> flunk("First process didn't join in time")
       end
 
-      assert_receive %Group.Event{type: :joined, key: "user/first"}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, key: "user/first"}], _}, 1000
 
       # Unsubscribe
       :ok = Group.demonitor(name, key)
@@ -364,7 +371,7 @@ defmodule GroupTest do
       end
 
       # Should NOT receive the second event
-      refute_receive %Group.Event{type: :joined, key: "user/second"}, 200
+      refute_receive {:group, _, _}, 200
     end
   end
 
@@ -436,10 +443,11 @@ defmodule GroupTest do
       end
 
       # Should receive event from cluster1
-      assert_receive %Group.Event{type: :joined, pid: ^pid1, cluster: ^cluster1}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, pid: ^pid1, cluster: ^cluster1}], _},
+                     1000
 
       # Spawn process to join cluster2
-      pid2 =
+      _pid2 =
         spawn(fn ->
           :ok = Group.join(name, key, %{cluster: 2}, cluster: cluster2)
           send(test_pid, {:joined, 2})
@@ -453,7 +461,7 @@ defmodule GroupTest do
       end
 
       # Should NOT receive event from cluster2
-      refute_receive %Group.Event{type: :joined, pid: ^pid2, cluster: ^cluster2}, 200
+      refute_receive {:group, _, _}, 200
 
       # Now subscribe to cluster2 and verify we can receive events
       :ok = Group.monitor(name, :all, cluster: cluster2)
@@ -471,7 +479,8 @@ defmodule GroupTest do
         1000 -> flunk("Process didn't join cluster2 in time")
       end
 
-      assert_receive %Group.Event{type: :joined, pid: ^pid3, cluster: ^cluster2}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, pid: ^pid3, cluster: ^cluster2}], _},
+                     1000
     end
 
     test "members/3 returns only members from specified cluster", %{name: name} do
@@ -521,7 +530,7 @@ defmodule GroupTest do
       :ok = Group.join(name, key, %{v: 1})
 
       # Should receive event with cluster: nil
-      assert_receive %Group.Event{type: :joined} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :joined} = event], _}, 1000
       assert event.cluster == nil
       assert event.meta == %{v: 1}
       assert event.previous_meta == nil
@@ -599,7 +608,7 @@ defmodule GroupTest do
         1000 -> flunk("Process didn't join in time")
       end
 
-      assert_receive %Group.Event{type: :joined, cluster: ^cluster}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, cluster: ^cluster}], _}, 1000
 
       # Unsubscribe from named cluster
       :ok = Group.demonitor(name, key, cluster: cluster)
@@ -618,7 +627,7 @@ defmodule GroupTest do
       end
 
       # Should NOT receive event after unsubscribe
-      refute_receive %Group.Event{type: :joined}, 200
+      refute_receive {:group, _, _}, 200
     end
   end
 

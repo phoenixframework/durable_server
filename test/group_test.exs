@@ -57,7 +57,7 @@ defmodule GroupTest do
       {:ok, {pid, _meta}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
       # Should receive :registered event with extracted user meta
-      assert_receive %Group.Event{type: :registered} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :registered} = event], _}, 1000
       assert event.supervisor == sup
       assert event.key == key
       assert event.pid == pid
@@ -81,24 +81,30 @@ defmodule GroupTest do
       {:ok, {_pid3, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key3}})
 
       # Should receive events for chat/ keys with extracted user meta
-      assert_receive %Group.Event{
-                       type: :registered,
-                       key: ^key1,
-                       pid: ^pid1,
-                       meta: %{module: TestServer}
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          key: ^key1,
+                          pid: ^pid1,
+                          meta: %{module: TestServer}
+                        }
+                      ], _},
                      1000
 
-      assert_receive %Group.Event{
-                       type: :registered,
-                       key: ^key2,
-                       pid: ^pid2,
-                       meta: %{module: TestServer}
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          key: ^key2,
+                          pid: ^pid2,
+                          meta: %{module: TestServer}
+                        }
+                      ], _},
                      1000
 
       # Should NOT receive event for other/ keys
-      refute_receive %Group.Event{type: :registered, key: ^key3}, 100
+      refute_receive {:group, _, _}, 100
     end
 
     test "subscribes to :all and receives all events", %{supervisor_name: sup} do
@@ -114,13 +120,37 @@ defmodule GroupTest do
 
       server_meta = %{module: TestServer}
 
-      assert_receive %Group.Event{type: :registered, key: ^key1, pid: ^pid1, meta: ^server_meta},
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          key: ^key1,
+                          pid: ^pid1,
+                          meta: ^server_meta
+                        }
+                      ], _},
                      1000
 
-      assert_receive %Group.Event{type: :registered, key: ^key2, pid: ^pid2, meta: ^server_meta},
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          key: ^key2,
+                          pid: ^pid2,
+                          meta: ^server_meta
+                        }
+                      ], _},
                      1000
 
-      assert_receive %Group.Event{type: :registered, key: ^key3, pid: ^pid3, meta: ^server_meta},
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          key: ^key3,
+                          pid: ^pid3,
+                          meta: ^server_meta
+                        }
+                      ], _},
                      1000
     end
 
@@ -130,7 +160,9 @@ defmodule GroupTest do
       :ok = Group.monitor(sup, key)
 
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
-      assert_receive %Group.Event{type: :registered, meta: %{module: TestServer}}, 1000
+
+      assert_receive {:group, [%Group.Event{type: :registered, meta: %{module: TestServer}}], _},
+                     1000
 
       # Stop the server
       ref = Process.monitor(pid)
@@ -138,7 +170,7 @@ defmodule GroupTest do
       assert_receive {:DOWN, ^ref, :process, ^pid, _}, 1000
 
       # Should receive :unregistered event with extracted user meta
-      assert_receive %Group.Event{type: :unregistered} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :unregistered} = event], _}, 1000
       assert event.supervisor == sup
       assert event.key == key
       assert event.pid == pid
@@ -156,19 +188,22 @@ defmodule GroupTest do
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
       # Initial registration
-      assert_receive %Group.Event{
-                       type: :registered,
-                       pid: ^pid,
-                       meta: %{module: TestServer},
-                       previous_meta: nil
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          pid: ^pid,
+                          meta: %{module: TestServer},
+                          previous_meta: nil
+                        }
+                      ], _},
                      1000
 
       # Update meta
       :ok = GenServer.call(pid, {:update_meta, %{module: TestServer, status: :active}})
 
       # Should receive :registered event with previous_meta showing the old extracted meta
-      assert_receive %Group.Event{type: :registered} = event, 1000
+      assert_receive {:group, [%Group.Event{type: :registered} = event], _}, 1000
       assert event.pid == pid
       assert event.meta == %{module: TestServer, status: :active}
       assert event.previous_meta == %{module: TestServer}
@@ -183,8 +218,12 @@ defmodule GroupTest do
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
       # Should only receive one event (not duplicated), with extracted user meta
-      assert_receive %Group.Event{type: :registered, pid: ^pid, meta: %{module: TestServer}}, 1000
-      refute_receive %Group.Event{type: :registered, pid: ^pid}, 100
+      assert_receive {:group,
+                      [%Group.Event{type: :registered, pid: ^pid, meta: %{module: TestServer}}],
+                      _},
+                     1000
+
+      refute_receive {:group, _, _}, 100
     end
   end
 
@@ -197,12 +236,15 @@ defmodule GroupTest do
 
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key1}})
 
-      assert_receive %Group.Event{
-                       type: :registered,
-                       key: ^key1,
-                       pid: ^pid1,
-                       meta: %{module: TestServer}
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          key: ^key1,
+                          pid: ^pid1,
+                          meta: %{module: TestServer}
+                        }
+                      ], _},
                      1000
 
       # Unsubscribe
@@ -212,7 +254,7 @@ defmodule GroupTest do
       {:ok, {_pid2, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key2}})
 
       # Should NOT receive the second event
-      refute_receive %Group.Event{type: :registered, key: ^key2}, 200
+      refute_receive {:group, _, _}, 200
     end
 
     test "unsubscribe from non-existent subscription is ok", %{supervisor_name: sup} do
@@ -265,12 +307,15 @@ defmodule GroupTest do
       {:ok, {server_pid, _}} =
         DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
-      assert_receive %Group.Event{
-                       type: :registered,
-                       pid: ^server_pid,
-                       meta: %{module: TestServer},
-                       previous_meta: nil
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          pid: ^server_pid,
+                          meta: %{module: TestServer},
+                          previous_meta: nil
+                        }
+                      ], _},
                      1000
 
       # 3. Verify members shows DurableServer with extracted meta
@@ -278,7 +323,7 @@ defmodule GroupTest do
 
       # 4. Join as listener
       :ok = Group.join(sup, key, %{role: :listener})
-      assert_receive %Group.Event{type: :joined, pid: self_pid}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, pid: self_pid}], _}, 1000
       assert self_pid == self()
 
       # 5. Verify members shows both
@@ -290,11 +335,14 @@ defmodule GroupTest do
       :ok = DurableServer.Supervisor.terminate_child(sup, server_pid)
       assert_receive {:DOWN, ^ref, :process, ^server_pid, _}, 1000
 
-      assert_receive %Group.Event{
-                       type: :unregistered,
-                       pid: ^server_pid,
-                       meta: %{module: TestServer}
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :unregistered,
+                          pid: ^server_pid,
+                          meta: %{module: TestServer}
+                        }
+                      ], _},
                      1000
 
       # 7. Verify members shows only joined process
@@ -303,7 +351,7 @@ defmodule GroupTest do
 
       # 8. Leave
       :ok = Group.leave(sup, key)
-      assert_receive %Group.Event{type: :left, pid: self_pid}, 1000
+      assert_receive {:group, [%Group.Event{type: :left, pid: self_pid}], _}, 1000
       assert self_pid == self()
 
       # 9. Verify empty members
@@ -316,7 +364,7 @@ defmodule GroupTest do
       {:ok, {_new_pid, _}} =
         DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key <> "/new"}})
 
-      refute_receive %Group.Event{type: :registered}, 200
+      refute_receive {:group, _, _}, 200
     end
   end
 
@@ -346,12 +394,15 @@ defmodule GroupTest do
         DurableServer.Supervisor.start_child(supervisor_name_2, {TestServer, %{key: key}})
 
       # Should receive event from sup2 with extracted user meta
-      assert_receive %Group.Event{
-                       type: :registered,
-                       supervisor: ^supervisor_name_2,
-                       pid: ^pid2,
-                       meta: %{module: TestServer}
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          supervisor: ^supervisor_name_2,
+                          pid: ^pid2,
+                          meta: %{module: TestServer}
+                        }
+                      ], _},
                      1000
 
       # Now unsubscribe from sup2 and subscribe to sup1 (from setup)
@@ -382,28 +433,31 @@ defmodule GroupTest do
       # Start a DurableServer on sup1 - should receive event with extracted meta
       {:ok, {pid1, _}} = DurableServer.Supervisor.start_child(sup1, {TestServer, %{key: key}})
 
-      assert_receive %Group.Event{
-                       type: :registered,
-                       supervisor: ^sup1,
-                       pid: ^pid1,
-                       meta: %{module: TestServer}
-                     },
+      assert_receive {:group,
+                      [
+                        %Group.Event{
+                          type: :registered,
+                          supervisor: ^sup1,
+                          pid: ^pid1,
+                          meta: %{module: TestServer}
+                        }
+                      ], _},
                      1000
 
       # Start a DurableServer on sup2 - should NOT receive event
       {:ok, {pid2, _}} = DurableServer.Supervisor.start_child(sup2, {TestServer, %{key: key}})
-      refute_receive %Group.Event{type: :registered, supervisor: ^sup2, pid: ^pid2}, 200
+      refute_receive {:group, [%Group.Event{supervisor: ^sup2} | _], _}, 200
 
       # Now subscribe to sup2 as well
       :ok = Group.monitor(sup2, :all)
 
       # Join on sup2 - should receive event now
       :ok = Group.join(sup2, key, %{role: :test})
-      assert_receive %Group.Event{type: :joined, supervisor: ^sup2}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, supervisor: ^sup2}], _}, 1000
 
       # Join on sup1 - should also receive (we're subscribed to both now)
       :ok = Group.join(sup1, key, %{role: :test})
-      assert_receive %Group.Event{type: :joined, supervisor: ^sup1}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, supervisor: ^sup1}], _}, 1000
 
       # Members are isolated per supervisor with correct metadata shapes
       sup1_members = Group.members(sup1, key) |> Map.new()

@@ -50,18 +50,20 @@ defmodule Group do
 
   ## Event Types
 
-  Events are delivered as `%Group.Event{}` structs to monitoring processes:
+  Events are delivered as `{:group, events, info}` tuples:
 
-      %Group.Event{
-        type: event_type,
-        supervisor: name,
-        cluster: cluster_name,  # nil for default cluster
-        key: key,
-        pid: pid,
-        meta: meta,             # always user-provided meta (internal keys stripped)
-        previous_meta: ...,     # nil for new, old meta for re-register/re-join
-        reason: ...             # set on :unregistered/:left events
-      }
+      {:group, [
+        %Group.Event{
+          type: event_type,
+          supervisor: name,
+          cluster: cluster_name,  # nil for default cluster
+          key: key,
+          pid: pid,
+          meta: meta,             # always user-provided meta (internal keys stripped)
+          previous_meta: ...,     # nil for new, old meta for re-register/re-join
+          reason: ...             # set on :unregistered/:left events
+        }
+      ], %{name: name}}
 
   | Event           | Trigger                           | Extra Fields     |
   |-----------------|-----------------------------------|------------------|
@@ -90,8 +92,13 @@ defmodule Group do
   its own `:joined` event. Similarly for `:left` when leaving. Filter these in your
   handler if needed:
 
-      def handle_info(%Group.Event{type: :joined, pid: pid}, state) when pid == self() do
-        # Ignore our own join event
+      def handle_info({:group, events, _info}, state) do
+        Enum.each(events, fn
+          %Group.Event{type: :joined, pid: pid} when pid != self() ->
+            # Handle other processes' join events
+            :ok
+          _ -> :ok
+        end)
         {:noreply, state}
       end
 
@@ -109,13 +116,14 @@ defmodule Group do
       :ok = Group.monitor(MySup, :all)
 
       # Handle events in a GenServer
-      def handle_info(%Group.Event{type: :registered, key: key, pid: pid}, state) do
-        IO.puts("DurableServer started: \#{key}")
-        {:noreply, state}
-      end
-
-      def handle_info(%Group.Event{type: :unregistered, key: key, reason: reason}, state) do
-        IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
+      def handle_info({:group, events, _info}, state) do
+        Enum.each(events, fn
+          %Group.Event{type: :registered, key: key} ->
+            IO.puts("DurableServer started: \#{key}")
+          %Group.Event{type: :unregistered, key: key, reason: reason} ->
+            IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
+          _ -> :ok
+        end)
         {:noreply, state}
       end
 
@@ -444,9 +452,9 @@ defmodule Group do
   @doc """
   Monitor lifecycle events matching the given pattern.
 
-  The calling process will receive `%Group.Event{}` structs for matching keys:
+  The calling process will receive `{:group, events, info}` tuples containing matching events:
 
-      %Group.Event{type: :registered, supervisor: sup, key: "user/123", pid: pid, meta: meta, ...}
+      {:group, [%Group.Event{type: :registered, ...}], %{name: name}}
 
   ## Patterns
 
@@ -829,43 +837,8 @@ defmodule Group do
   end
 
   @doc false
-  def __dispatch__(name, event_type, key, pid, meta, extra \\ %{}) do
-    cluster = Map.get(extra, :cluster)
-    subscribers = get_subscribers_for_key(name, cluster, key)
-
-    if subscribers != [] do
-      extract_meta_fn = resolve_extract_meta(name, [])
-
-      event = %Group.Event{
-        type: event_type,
-        supervisor: name,
-        cluster: cluster,
-        key: key,
-        pid: pid,
-        meta: extract_meta_fn.(meta),
-        previous_meta:
-          case Map.get(extra, :previous_meta) do
-            nil -> nil
-            prev -> extract_meta_fn.(prev)
-          end,
-        reason: Map.get(extra, :reason)
-      }
-
-      for subscriber_pid <- subscribers do
-        send(subscriber_pid, event)
-      end
-    end
-
-    :ok
-  end
-
-  @doc false
   def registry_name(name) when is_atom(name), do: :"#{name}_group_registry"
 
-  # Parse a pattern into an internal pattern representation
-  # - :all matches all keys
-  # - "prefix/" matches all keys starting with "prefix/"
-  # - "exact/key" matches only that exact key
   defp parse_pattern(:all), do: :all
 
   defp parse_pattern(pattern) when is_binary(pattern) do
@@ -874,31 +847,6 @@ defmodule Group do
     else
       {:exact, pattern}
     end
-  end
-
-  # Check if a pattern matches a key
-  defp matches_pattern?(:all, _key), do: true
-  defp matches_pattern?({:exact, pattern}, key), do: pattern == key
-  defp matches_pattern?({:prefix, prefix}, key), do: String.starts_with?(key, prefix)
-
-  # Get all local subscriber pids whose patterns match the given key and cluster
-  defp get_subscribers_for_key(name, cluster, key) do
-    # Get all registrations and filter by pattern match
-    # Registry keys are {name, cluster, pattern}
-    registry_name(name)
-    |> Registry.select([
-      {
-        {{:"$1", :"$2", :"$3"}, :"$4", :_},
-        [{:andalso, {:==, :"$1", name}, {:==, :"$2", cluster}}],
-        [{{:"$3", :"$4"}}]
-      }
-    ])
-    |> Enum.filter(fn {pattern, _pid} -> matches_pattern?(pattern, key) end)
-    |> Enum.map(fn {_pattern, pid} -> pid end)
-    |> Enum.uniq()
-  rescue
-    # Registry doesn't exist yet during startup
-    ArgumentError -> []
   end
 
   # Resolve the extract_meta function: per-call override > persistent_term config > identity

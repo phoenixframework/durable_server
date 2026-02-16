@@ -77,29 +77,30 @@ Subscribe to lifecycle events matching a pattern:
 :ok = Group.monitor(:my_app, :all)
 ```
 
-Events arrive as `%Group.Event{}` structs in the monitoring process's mailbox:
+Events arrive as `{:group, events, info}` tuples in the monitoring process's mailbox:
 
 ```elixir
-def handle_info(%Group.Event{type: :registered, key: key, pid: pid, meta: meta}, state) do
-  # a process registered at `key`
-  {:noreply, state}
-end
-
-def handle_info(%Group.Event{type: :unregistered, key: key, meta: meta, reason: reason}, state) do
-  # a registered process died or unregistered
-  {:noreply, state}
-end
-
-def handle_info(%Group.Event{type: :joined, key: key, pid: pid, meta: meta}, state) do
-  # a process joined the group at `key`
-  {:noreply, state}
-end
-
-def handle_info(%Group.Event{type: :left, key: key, pid: pid, meta: meta, reason: reason}, state) do
-  # a process left or died
+def handle_info({:group, events, _info}, state) do
+  Enum.each(events, fn
+    %Group.Event{type: :registered, key: key, pid: pid, meta: meta} ->
+      # a process registered at `key`
+      :ok
+    %Group.Event{type: :unregistered, key: key, meta: meta, reason: reason} ->
+      # a registered process died or unregistered
+      :ok
+    %Group.Event{type: :joined, key: key, pid: pid, meta: meta} ->
+      # a process joined the group at `key`
+      :ok
+    %Group.Event{type: :left, key: key, pid: pid, meta: meta, reason: reason} ->
+      # a process left or died
+      :ok
+  end)
   {:noreply, state}
 end
 ```
+
+Single operations (register, join) produce one event per tuple. Bulk operations
+(nodedown, process death) batch all events from that operation into one tuple.
 
 ### Dispatch
 
@@ -146,7 +147,8 @@ Group.log_level(:my_app, false)     # silence all Group logs
 
 ## Events
 
-Events are `%Group.Event{}` structs with these fields:
+Events are delivered as `{:group, events, %{name: name}}` tuples containing
+`%Group.Event{}` structs:
 
 ```elixir
 %Group.Event{
