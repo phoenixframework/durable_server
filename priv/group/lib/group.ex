@@ -757,6 +757,43 @@ defmodule Group do
     :ok
   end
 
+  @doc """
+  Like `dispatch/4`, but only sends to members on the local node.
+
+  Skips all cross-node messaging. Useful when you know remote nodes will
+  handle their own local dispatch (e.g., a broadcast originating on each node).
+
+  ## Options
+
+  - `:cluster` - Dispatch to a named cluster instead of the default cluster
+
+  ## Returns
+
+  - `:ok` always
+  """
+  def dispatch_local(name, key, message, opts \\ [])
+
+  def dispatch_local(name, key, message, opts)
+      when is_atom(name) and is_binary(key) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    num_shards = get_config(name).num_shards
+    shard = Replica.shard_index_for(cluster, key, num_shards)
+    local = node()
+
+    # Registry entry — only if local
+    case Data.registry_lookup(name, shard, cluster, key) do
+      {pid, _meta, _time, ^local} -> send(pid, message)
+      _ -> :ok
+    end
+
+    # PG members — local only, filtered in the match spec
+    for pid <- Data.pg_members_local(name, shard, cluster, key) do
+      send(pid, message)
+    end
+
+    :ok
+  end
+
   # ===========================================================================
   # Public Helpers
   # ===========================================================================

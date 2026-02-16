@@ -552,6 +552,29 @@ defmodule GroupTest do
       refute_receive {:test_message, :from_default}, 200
     end
 
+    test "dispatch_local only sends to local members", %{name: name} do
+      key = "dispatch_local/#{System.unique_integer([:positive])}"
+
+      # Join from self (local)
+      :ok = Group.join(name, key, %{})
+
+      :ok = Group.dispatch_local(name, key, {:local_msg, 1})
+      assert_receive {:local_msg, 1}, 1000
+
+      # Also works with cluster: option
+      cluster = "dispatch_local_cluster"
+      :ok = Group.connect(name, cluster)
+      :ok = Group.join(name, key, %{}, cluster: cluster)
+
+      :ok = Group.dispatch_local(name, key, {:local_msg, 2}, cluster: cluster)
+      assert_receive {:local_msg, 2}, 1000
+
+      # Default cluster dispatch_local should not deliver cluster message
+      :ok = Group.dispatch_local(name, key, {:local_msg, 3})
+      assert_receive {:local_msg, 3}, 1000
+      refute_receive {:local_msg, _}, 200
+    end
+
     test "monitor/demonitor work with cluster: option", %{name: name} do
       cluster = "sub_cluster"
       key = "sub/test/#{System.unique_integer([:positive])}"

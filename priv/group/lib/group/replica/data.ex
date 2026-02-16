@@ -224,6 +224,17 @@ defmodule Group.Replica.Data do
     :ets.select(table, match_spec)
   end
 
+  def pg_members_local(name, shard, cluster, key) do
+    local_node = node()
+    table = pg_by_key_table(name, shard)
+
+    match_spec = [
+      {{{cluster, key, :"$1"}, :_, :_, :"$2"}, [{:==, :"$2", local_node}], [:"$1"]}
+    ]
+
+    :ets.select(table, match_spec)
+  end
+
   @doc """
   Delete all entries for a pid from this shard. Used on process DOWN.
   Deletes from by_key tables individually (need the key), but batch-deletes
