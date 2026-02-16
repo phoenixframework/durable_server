@@ -1,7 +1,7 @@
 # Group
 
 Eventually Consistent distributed process registry, process groups,
-lifecycle monitoring, and solated subclusters for Elixir. No external dependencies.
+lifecycle monitoring, and isolated subclusters for Elixir. No external dependencies.
 
 ## Features
 
