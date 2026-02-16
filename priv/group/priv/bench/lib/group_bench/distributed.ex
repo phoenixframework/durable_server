@@ -10,12 +10,15 @@ defmodule GroupBench.Distributed do
   import GroupBench.Helpers
 
   @name :bench
-  @shards System.schedulers_online()
   @replicas [:"replica1@127.0.0.1", :"replica2@127.0.0.1"]
 
-  def run do
+  def run(opts \\ []) do
+    shards = Keyword.get(opts, :shards, 8)
+    Process.put(:bench_shards, shards)
+
     header("Distributed Benchmarks")
     IO.puts("  coordinator: #{node()}")
+    IO.puts("  shards:      #{shards}")
     IO.puts("  schedulers:  #{System.schedulers_online()}")
 
     connect_replicas()
@@ -61,7 +64,8 @@ defmodule GroupBench.Distributed do
   # ── Group lifecycle helpers (all MFA) ─────────────────────────────────
 
   defp start_group_on(node, opts \\ []) do
-    opts = Keyword.merge([name: @name, shards: @shards, log: false], opts)
+    shards = Process.get(:bench_shards, 8)
+    opts = Keyword.merge([name: @name, shards: shards, log: false], opts)
     :erpc.call(node, GroupBench.Replica, :start_group, [opts])
   end
 

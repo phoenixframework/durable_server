@@ -168,7 +168,7 @@ All operations are **eventually consistent**:
 ```elixir
 {Group,
   name: :my_app,
-  shards: System.schedulers_online(),          # number of write shards (default)
+  shards: 8,                                   # number of write shards (default)
   log: :info,                                  # :info | :verbose | false
   resolve_registry_conflict: &MyResolver.resolve/4,  # partition conflict resolver
   extract_meta: {MyApp, :extract_meta, []}     # transform meta on read
@@ -179,8 +179,8 @@ All operations are **eventually consistent**:
 
 - **`name`** (required) — atom identifying this Group instance. Passed as the
   first argument to all API functions.
-- **`shards`** — number of GenServer shards for write operations. Defaults to
-  `System.schedulers_online()`. Must match across all nodes.
+- **`shards`** — number of GenServer shards for write operations. Defaults to 8.
+  Must match across all nodes.
 - **`log`** — logging level. `:info` (default) logs peer discovery, node
   connects/disconnects, and cluster membership changes. `:verbose` additionally
   logs per-shard replication messages (register, join, leave, process deaths).

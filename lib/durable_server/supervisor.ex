@@ -98,7 +98,7 @@ defmodule DurableServer.Supervisor do
     managed by this supervisor. The map is merged with built-in keys (`:supervisor`,
     `:task_supervisor`, `:dynamic_supervisor`). Example: `init_info: %{api_client: MyApp.API}`
   - `:group` - Options to pass to `Group`
-    - `:shards` - The number of group shards. Defaults `System.schedulers_online()`
+    - `:shards` - The number of group shards. Defaults to 8
 
   ## Examples
 

@@ -171,7 +171,7 @@ defmodule Group do
   ## Options
 
   - `:name` (required) — atom identifying this Group instance
-  - `:shards` — number of GenServer shards (default: `System.schedulers_online()`)
+  - `:shards` — number of GenServer shards (default: 8). Must match across all nodes
   - `:log` — logging level. `:info` (default) logs peer discovery, node events,
     and cluster membership changes. `:verbose` additionally logs per-shard
     replication messages. `false` disables all Group log output.
