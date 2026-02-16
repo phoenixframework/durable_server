@@ -716,8 +716,42 @@ defmodule Group do
 
   def dispatch(name, key, message, opts)
       when is_atom(name) and is_binary(key) and is_list(opts) do
-    for {pid, _meta} <- members(name, key, opts) do
-      send(pid, message)
+    cluster = Keyword.get(opts, :cluster)
+    num_shards = get_config(name).num_shards
+    shard = Replica.shard_index_for(cluster, key, num_shards)
+    local = node()
+
+    # Registry entry (one or none) — always direct send, even cross-node
+    case Data.registry_lookup(name, shard, cluster, key) do
+      {pid, _meta, _time, _node} -> send(pid, message)
+      nil -> :ok
+    end
+
+    # PG members — group remote pids by node for batched fan-out
+    case Data.pg_members_with_node(name, shard, cluster, key) do
+      [] ->
+        :ok
+
+      members ->
+        {local_pids, remote_by_node} =
+          Enum.reduce(members, {[], %{}}, fn {pid, _meta, node}, {locals, remotes} ->
+            if node == local do
+              {[pid | locals], remotes}
+            else
+              {locals, Map.update(remotes, node, [pid], &[pid | &1])}
+            end
+          end)
+
+        for pid <- local_pids, do: send(pid, message)
+
+        # Hash caller pid to pick a shard — same caller always hits the same
+        # shard, preserving per-sender message ordering across dispatches.
+        dispatch_shard = :erlang.phash2(self(), num_shards)
+        shard_name = Replica.shard_name(name, dispatch_shard)
+
+        for {target_node, pids} <- remote_by_node do
+          send({shard_name, target_node}, {:group_dispatch, pids, message})
+        end
     end
 
     :ok

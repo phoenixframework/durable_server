@@ -23,6 +23,7 @@ defmodule Group.Replica do
   | `{:cluster_connect_ack, clusters, pid, cluster_data}`      | S→remote S     | Ack + bundled shard data         |
   | `{:cluster_disconnect, clusters, pid}`                     | shard 0→remote | Node leaving named clusters      |
   | `{:send_cluster_data, clusters, target_node}`              | local fan-out  | Notify siblings: send shard data |
+  | `{:group_dispatch, pids, message}`                         | caller→remote  | Per-node fan-out for dispatch    |
 
   ## Protocol Flows
 
@@ -92,6 +93,22 @@ defmodule Group.Replica do
            │                                       │── insert (no overwrite
            │                                       │   conflict for PG)
            │                                       │
+      Group.dispatch(name, group, msg)               │
+           │── send directly to local pids           │
+           │── group remote pids by node             │
+           │── hash self() to pick shard j           │
+           │                                         │
+           │  {:group_dispatch, pids, msg}    Node B shard j
+           │────────────────────────────────────────>│
+           │                                         │── send msg to each local pid
+           │                                         │
+
+  Dispatch groups remote PG members by node and sends one
+  `:group_dispatch` message per remote node, reducing cross-node
+  messages from O(members) to O(nodes). The target shard is chosen
+  by hashing the caller's pid (`phash2(self(), num_shards)`), so
+  back-to-back dispatches from the same caller always route through
+  the same shard, preserving per-sender message ordering.
 
   ### 3. Named Cluster Connect (random shard S + fan-out)
 
@@ -1110,6 +1127,11 @@ defmodule Group.Replica do
       send_cluster_states(state, active, target_node)
     end
 
+    {:noreply, state}
+  end
+
+  def handle_info({:group_dispatch, pids, message}, state) do
+    for pid <- pids, do: send(pid, message)
     {:noreply, state}
   end
 
