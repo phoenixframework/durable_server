@@ -9,7 +9,7 @@ lifecycle monitoring, and isolated subclusters for Elixir. No external dependenc
   key, enforced across all nodes.
 - **Process groups** — many processes per key with join/leave. Discoverable via
   `members/2`.
-- **Lifecycle monitoring** — pattern-matched event subscriptions. Get notified
+- **Lifecycle monitoring** — pattern-based event subscriptions. Get notified
   when processes register, unregister, join, or leave anywhere in the cluster.
 - **Named subclusters** — isolate registries and groups into named clusters
   where only connected nodes participate.
@@ -85,17 +85,17 @@ def handle_info(%Group.Event{type: :registered, key: key, pid: pid, meta: meta},
   {:noreply, state}
 end
 
-def handle_info(%Group.Event{type: :unregistered, key: key, reason: reason}, state) do
+def handle_info(%Group.Event{type: :unregistered, key: key, meta: meta, reason: reason}, state) do
   # a registered process died or unregistered
   {:noreply, state}
 end
 
-def handle_info(%Group.Event{type: :joined, key: key, pid: pid}, state) do
+def handle_info(%Group.Event{type: :joined, key: key, pid: pid, meta: meta}, state) do
   # a process joined the group at `key`
   {:noreply, state}
 end
 
-def handle_info(%Group.Event{type: :left, key: key, pid: pid, reason: reason}, state) do
+def handle_info(%Group.Event{type: :left, key: key, pid: pid, meta: meta, reason: reason}, state) do
   # a process left or died
   {:noreply, state}
 end
@@ -122,6 +122,26 @@ called `connect/2` for a cluster participate in that cluster's replication.
 :ok = Group.join(:my_app, "room/1", %{}, cluster: "game_servers")
 members = Group.members(:my_app, "room/1", cluster: "game_servers")
 :ok = Group.monitor(:my_app, :all, cluster: "game_servers")
+```
+
+### Nodes
+
+```elixir
+# All Group peers (nodes that completed peer discovery), excluding self
+Group.nodes(:my_app)
+
+# All nodes in a named cluster
+Group.nodes(:my_app, "game_servers")
+```
+
+### Runtime Log Level
+
+Toggle verbose logging at runtime without restart:
+
+```elixir
+Group.log_level(:my_app, :verbose)  # turn on verbose
+Group.log_level(:my_app, :info)     # back to normal
+Group.log_level(:my_app, false)     # silence all Group logs
 ```
 
 ## Events
@@ -170,7 +190,7 @@ All operations are **eventually consistent**:
   name: :my_app,
   shards: 8,                                   # number of write shards (default)
   log: :info,                                  # :info | :verbose | false
-  resolve_registry_conflict: &MyResolver.resolve/4,  # partition conflict resolver
+  resolve_registry_conflict: {MyResolver, :resolve, []},  # partition conflict resolver
   extract_meta: {MyApp, :extract_meta, []}     # transform meta on read
 }
 ```
@@ -183,10 +203,14 @@ All operations are **eventually consistent**:
   Must match across all nodes.
 - **`log`** — logging level. `:info` (default) logs peer discovery, node
   connects/disconnects, and cluster membership changes. `:verbose` additionally
-  logs per-shard replication messages (register, join, leave, process deaths).
+  logs per-shard operations (register, join, leave, process deaths, replication).
   `false` disables all Group log output. All log output uses `Logger.info`.
-- **`resolve_registry_conflict`** — `fun(name, key, {pid1, meta1, time1}, {pid2, meta2, time2})` called when partition healing finds the same key
-  registered on two nodes. Must return the winning pid.
+  Can be changed at runtime with `Group.log_level/2`.
+- **`resolve_registry_conflict`** — `{module, function, extra_args}` callback
+  invoked as `apply(mod, fun, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
+  Called when partition healing or concurrent registration finds the same key
+  registered on two nodes. Must return the winning pid. Runs synchronously
+  inside the shard GenServer — must return quickly and never block.
 - **`extract_meta`** — `{module, function, args}` or `fun(meta)` applied to
   metadata on reads (`lookup`, `members`). Useful for stripping internal fields.
 
@@ -222,12 +246,13 @@ Each shard owns 4 ETS tables:
 | Table | Type | Key | Purpose |
 |---|---|---|---|
 | `reg_by_key` | `:set` | `{cluster, key}` | Registry lookup — O(1) |
-| `reg_by_pid` | `:bag` | `pid` | Reverse index for death cleanup |
+| `reg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
 | `pg_by_key` | `:ordered_set` | `{cluster, key, pid}` | Group membership lookup |
 | `pg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
 
-Plus 1 shared `cluster_nodes` table (`:bag`, keyed by cluster name) tracking
-which nodes are in which clusters.
+Plus 2 shared tables: `cluster_nodes` (`:bag`, cluster→nodes) and
+`node_clusters` (`:bag`, node→clusters) providing dual-index cluster membership
+lookups.
 
 `Group.Replica.Data` owns all tables and is supervised with `rest_for_one` so
 tables survive shard crashes.
@@ -283,6 +308,7 @@ cd priv/bench
 
 # Distributed (3 separate BEAM VMs)
 ./run_distributed.sh
+./run_distributed.sh --shards 4
 ```
 
 See [`priv/bench/README.md`](priv/bench/README.md) for scenario descriptions.

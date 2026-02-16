@@ -555,7 +555,7 @@ defmodule Group.Replica do
   def handle_call({:cluster_connect, clusters}, _from, state) do
     %{name: name} = state
 
-    log_once(state, fn ->
+    log(state, fn ->
       "#{log_prefix(state)} cluster_connect #{inspect(clusters)}"
     end)
 
