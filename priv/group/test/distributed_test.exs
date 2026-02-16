@@ -2883,6 +2883,200 @@ defmodule Group.DistributedTest do
     end
   end
 
+  describe "event batching" do
+    test "nodedown batches all same-shard events into one message" do
+      peers = TestCluster.start_peers(2)
+      [{_peer_a, node_a}, {peer_b, node_b}] = peers
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+      num_shards = 4
+      name = :"batch_nodedown_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: num_shards]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      # Find 3 keys that hash to the same shard (shard 0)
+      keys =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(fn i -> "nodedown_batch/key_#{i}" end)
+        |> Stream.filter(fn key -> :erlang.phash2({nil, key}, num_shards) == 0 end)
+        |> Enum.take(3)
+
+      # Register all 3 from node_b
+      for key <- keys do
+        TestCluster.spawn_register(node_b, name, key, %{k: key})
+      end
+
+      # Wait for replication to node_a
+      for key <- keys do
+        TestCluster.assert_eventually(fn ->
+          TestCluster.rpc!(node_a, Group, :lookup, [name, key]) != nil
+        end)
+      end
+
+      # Set up batch-aware monitor on node_a
+      forwarder = TestCluster.spawn_batch_forwarder(node_a, name, :all, self())
+      assert_receive {:monitor_ready, ^forwarder}, 1000
+
+      # Kill node_b — nodedown triggers bulk purge
+      :peer.stop(peer_b)
+
+      # All 3 :unregistered events should arrive in a single batch
+      # (they're on the same shard, processed in one nodedown handler turn)
+      assert_receive {:got_batch, events}, 5000
+      unreg_events = Enum.filter(events, &(&1.type == :unregistered))
+      assert length(unreg_events) == 3
+      assert Enum.map(unreg_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
+    end
+
+    test "cluster disconnect batches purged events into one message per shard" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      num_shards = 4
+      name = :"batch_disconnect_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: num_shards]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        length(TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])) >= 2
+      end)
+
+      # Find 3 keys that hash to the same shard for the "game" cluster
+      keys =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(fn i -> "disc_batch/key_#{i}" end)
+        |> Stream.filter(fn key -> :erlang.phash2({"game", key}, num_shards) == 0 end)
+        |> Enum.take(3)
+
+      # A joins all 3 in "game" cluster
+      for key <- keys do
+        TestCluster.spawn_join(node_a, name, key, %{k: key}, cluster: "game")
+      end
+
+      # Wait for replication to B
+      for key <- keys do
+        TestCluster.assert_eventually(fn ->
+          TestCluster.rpc!(node_b, Group, :members, [name, key, [cluster: "game"]]) != []
+        end)
+      end
+
+      # Set up batch-aware monitor on B for "game" cluster
+      forwarder = TestCluster.spawn_batch_forwarder(node_b, name, :all, self(), cluster: "game")
+      assert_receive {:monitor_ready, ^forwarder}, 1000
+
+      # A disconnects from "game" — triggers bulk purge on B
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+
+      # All 3 :left events should arrive in one batch
+      assert_receive {:got_batch, events}, 5000
+      left_events = Enum.filter(events, &(&1.type == :left))
+      assert length(left_events) == 3
+      assert Enum.all?(left_events, &(&1.reason == :cluster_disconnect))
+      assert Enum.map(left_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
+    end
+
+    test "partition heal (cluster_state merge) batches new entries into one message" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      num_shards = 4
+      name = :"batch_heal_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: num_shards]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      # Partition
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Find 3 keys that hash to the same shard
+      keys =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(fn i -> "heal_batch/key_#{i}" end)
+        |> Stream.filter(fn key -> :erlang.phash2({nil, key}, num_shards) == 0 end)
+        |> Enum.take(3)
+
+      # Register all 3 on A during partition
+      for key <- keys do
+        TestCluster.spawn_register(node_a, name, key, %{k: key})
+      end
+
+      # Set up batch monitor on B during partition (before data arrives)
+      forwarder = TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, ^forwarder}, 1000
+
+      # Reconnect — cluster_state exchange merges all 3 entries in one handler turn
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # All 3 :registered events should arrive in a single batch
+      assert_receive {:got_batch, events}, 5000
+      reg_events = Enum.filter(events, &(&1.type == :registered))
+      assert length(reg_events) == 3
+      assert Enum.map(reg_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
+    end
+
+    test "Group.connect on existing cluster batches incoming data" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      num_shards = 4
+      name = :"batch_connect_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: num_shards]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      # B connects to "game" and joins 3 same-shard keys
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      keys =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(fn i -> "connect_batch/key_#{i}" end)
+        |> Stream.filter(fn key -> :erlang.phash2({"game", key}, num_shards) == 0 end)
+        |> Enum.take(3)
+
+      for key <- keys do
+        TestCluster.spawn_join(node_b, name, key, %{k: key}, cluster: "game")
+      end
+
+      # Set up batch monitor on A for "game" BEFORE connecting
+      forwarder =
+        TestCluster.spawn_batch_forwarder(node_a, name, :all, self(), cluster: "game")
+
+      assert_receive {:monitor_ready, ^forwarder}, 1000
+
+      # A connects — receives cluster_state with all 3 entries from B
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+
+      # All 3 :joined events should arrive in a single batch
+      assert_receive {:got_batch, events}, 5000
+      join_events = Enum.filter(events, &(&1.type == :joined))
+      assert length(join_events) == 3
+      assert Enum.map(join_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
+    end
+  end
+
   # Helpers for event assertion tests
 
   defp flush_events do

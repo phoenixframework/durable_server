@@ -887,4 +887,87 @@ defmodule GroupTest do
       assert length(error_results) == 4
     end
   end
+
+  describe "event batching" do
+    test "process death batches :unregistered and :left into one message", %{name: name} do
+      key = "batch/reg_and_join/#{System.unique_integer([:positive])}"
+      :ok = Group.monitor(name, :all)
+
+      test_pid = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, key, %{r: 1})
+          :ok = Group.join(name, key, %{j: 1})
+          send(test_pid, :ready)
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive :ready, 1000
+
+      # Drain the individual :registered and :joined events
+      assert_receive {:group, [%Group.Event{type: :registered}], _}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined}], _}, 1000
+
+      # Kill the process — DOWN handler should batch both cleanup events
+      Process.exit(pid, :kill)
+
+      assert_receive {:group, events, _}, 1000
+      types = events |> Enum.map(& &1.type) |> Enum.sort()
+      assert types == [:left, :unregistered]
+      assert Enum.all?(events, &(&1.key == key))
+      assert Enum.all?(events, &(&1.pid == pid))
+    end
+
+    test "process death batches multiple :left events for same-shard keys", %{name: name} do
+      num_shards = Group.get_config(name).num_shards
+
+      # Find 3 keys that hash to the same shard
+      keys =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(fn i -> "batch/multi_#{i}" end)
+        |> Stream.filter(fn key -> :erlang.phash2({nil, key}, num_shards) == 0 end)
+        |> Enum.take(3)
+
+      :ok = Group.monitor(name, :all)
+      test_pid = self()
+
+      pid =
+        spawn(fn ->
+          for key <- keys, do: :ok = Group.join(name, key, %{k: key})
+          send(test_pid, :ready)
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive :ready, 1000
+
+      # Drain individual :joined events
+      for _key <- keys do
+        assert_receive {:group, [%Group.Event{type: :joined}], _}, 1000
+      end
+
+      # Kill — all 3 :left events should arrive in one batch
+      Process.exit(pid, :kill)
+
+      assert_receive {:group, events, _}, 1000
+      assert length(events) == 3
+      assert Enum.all?(events, &(&1.type == :left))
+      assert Enum.map(events, & &1.key) |> Enum.sort() == Enum.sort(keys)
+    end
+
+    test "single operations send single-event messages, not empty batches", %{name: name} do
+      key = "batch/single/#{System.unique_integer([:positive])}"
+      :ok = Group.monitor(name, :all)
+
+      :ok = Group.register(name, key, %{})
+
+      assert_receive {:group, events, _}, 1000
+      assert [%Group.Event{type: :registered}] = events
+
+      :ok = Group.unregister(name, key)
+
+      assert_receive {:group, events, _}, 1000
+      assert [%Group.Event{type: :unregistered}] = events
+    end
+  end
 end

@@ -21,7 +21,13 @@ defmodule Group.TestCluster do
 
   def stop_peers(peers) do
     Enum.each(peers, fn {pid, _node} ->
-      if pid, do: :peer.stop(pid)
+      if pid do
+        try do
+          :peer.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end
     end)
   end
 
@@ -156,6 +162,28 @@ defmodule Group.TestCluster do
       {:group, events, _info} ->
         for event <- events, do: send(target_pid, {:got_event, event})
         forward_events(target_pid)
+    after
+      30_000 -> :ok
+    end
+  end
+
+  @doc "Like spawn_monitor_forwarder, but preserves batch structure.
+  Sends `{:got_batch, events}` per received `{:group, events, info}` message."
+  def spawn_batch_forwarder(node, name, pattern, target_pid, opts \\ []) do
+    :erpc.call(node, fn ->
+      spawn(fn ->
+        :ok = Group.monitor(name, pattern, opts)
+        send(target_pid, {:monitor_ready, self()})
+        forward_batches(target_pid)
+      end)
+    end)
+  end
+
+  defp forward_batches(target_pid) do
+    receive do
+      {:group, events, _info} ->
+        send(target_pid, {:got_batch, events})
+        forward_batches(target_pid)
     after
       30_000 -> :ok
     end

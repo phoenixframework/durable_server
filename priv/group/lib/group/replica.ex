@@ -315,8 +315,8 @@ defmodule Group.Replica do
   ## Monitor Event Delivery
 
   Lifecycle events (`:registered`, `:unregistered`, `:joined`, `:left`) are delivered
-  to `Group.monitor/3` subscribers as `{:group, events, info}` tuples. Each
-  GenServer handler invocation is a natural batch boundary:
+  to `Group.monitor/3` subscribers in a batched diff of `{:group, events, info}` tuples.
+  Each GenServer handler invocation is a natural batch boundary:
 
   - **Single operations** (register, join, leave, unregister, replicate_*): build one
     event, deliver one tuple with one event per matching subscriber.
@@ -332,8 +332,11 @@ defmodule Group.Replica do
 
   `resolve_conflict/5` returns `{state, event_or_nil}` so callers can accumulate
   the event. `merge_remote_cluster_data/5` threads `{state, events}` through its
-  reduce so conflict events accumulate across the merge. `build_purged_events/5`
-  takes an events accumulator and prepends purged-entry events to it.
+  reduce, generating `:registered`/`:joined` events for new entries and conflict
+  events for existing ones. This means `cluster_state` merges (peer discovery,
+  partition heal, `Group.connect`) produce batched diffs with all new entries.
+  `build_purged_events/5` takes an events accumulator and prepends purged-entry
+  events to it.
   """
 
   require Logger
@@ -1255,6 +1258,12 @@ defmodule Group.Replica do
     node() in Data.cluster_nodes(name, cluster)
   end
 
+  # Additive merge: inserts new entries and resolves conflicts, but does not
+  # delete local entries missing from the incoming snapshot. This is safe because
+  # Erlang dist uses TCP — either all replicate_* messages arrive in order (no
+  # stale entries) or the connection dies and nodedown purges everything before
+  # cluster_state can arrive. There is no case where stale entries survive into
+  # the merge.
   defp merge_remote_cluster_data(state, cluster, reg_data, pg_data, events \\ []) do
     %{name: name, shard_index: shard, num_shards: num_shards} = state
 
@@ -1269,7 +1278,8 @@ defmodule Group.Replica do
           case Data.registry_lookup(name, shard, cluster, key) do
             nil ->
               Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              {acc_state, acc_events}
+              event = build_event(name, :registered, key, pid, meta, %{cluster: cluster})
+              {acc_state, [event | acc_events]}
 
             {^pid, _meta, existing_time, _node} ->
               # Same pid (bounceback or metadata update) — apply if newer
@@ -1310,19 +1320,25 @@ defmodule Group.Replica do
         end
       end)
 
-    for {key, pid, meta, time} <- pg_data,
-        shard_index_for(cluster, key, num_shards) == shard do
-      case Data.pg_lookup(name, shard, cluster, key, pid) do
-        nil ->
-          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+    events =
+      Enum.reduce(pg_data, events, fn {key, pid, meta, time}, acc_events ->
+        if shard_index_for(cluster, key, num_shards) != shard do
+          acc_events
+        else
+          case Data.pg_lookup(name, shard, cluster, key, pid) do
+            nil ->
+              Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+              [build_event(name, :joined, key, pid, meta, %{cluster: cluster}) | acc_events]
 
-        {_meta, existing_time, _node} when time > existing_time ->
-          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+            {_meta, existing_time, _node} when time > existing_time ->
+              Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+              acc_events
 
-        _ ->
-          :ok
-      end
-    end
+            _ ->
+              acc_events
+          end
+        end
+      end)
 
     {state, events}
   end
