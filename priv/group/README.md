@@ -116,12 +116,12 @@ called `connect/2` for a cluster participate in that cluster's replication.
 
 ```elixir
 # Connect this node to a named cluster
-:ok = Group.connect(:my_app, "game_servers")
+:ok = Group.connect(:my_app, "game_servers_123")
 
 # All operations accept a :cluster option
-:ok = Group.join(:my_app, "room/1", %{}, cluster: "game_servers")
-members = Group.members(:my_app, "room/1", cluster: "game_servers")
-:ok = Group.monitor(:my_app, :all, cluster: "game_servers")
+:ok = Group.join(:my_app, "room/1", %{}, cluster: "game_servers_123")
+members = Group.members(:my_app, "room/1", cluster: "game_servers_123")
+:ok = Group.monitor(:my_app, :all, cluster: "game_servers_123")
 ```
 
 ### Nodes
@@ -131,7 +131,7 @@ members = Group.members(:my_app, "room/1", cluster: "game_servers")
 Group.nodes(:my_app)
 
 # All nodes in a named cluster
-Group.nodes(:my_app, "game_servers")
+Group.nodes(:my_app, "game_servers_123")
 ```
 
 ### Runtime Log Level
