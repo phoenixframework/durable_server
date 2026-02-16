@@ -2664,4 +2664,261 @@ defmodule Group.DistributedTest do
       on_exit(fn -> :peer.stop(peer_a_pid) end)
     end
   end
+
+  describe "Jepsen-style: deterministic conflict tiebreaker" do
+    @tag timeout: 60_000
+    test "conflict resolution converges even with near-simultaneous registrations" do
+      # Verifies that both nodes agree on the same winner after partition heal.
+      # With the old broken `>=` tiebreaker, equal timestamps would cause mutual
+      # kill (both processes die). The deterministic pid-based tiebreaker prevents this.
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_tiebreak_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      # Verify connectivity
+      pid_init = TestCluster.spawn_register(node_a, name, "init", %{})
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) == nil
+      end)
+
+      # Partition
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Register same key on both sides with minimal delay (near-simultaneous)
+      pid_a = TestCluster.spawn_register(node_a, name, "user/race", %{side: :a})
+      pid_b = TestCluster.spawn_register(node_b, name, "user/race", %{side: :b})
+
+      # Heal
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # Both nodes must agree on exactly one winner
+      TestCluster.assert_eventually(
+        fn ->
+          lookup_a = TestCluster.rpc!(node_a, Group, :lookup, [name, "user/race"])
+          lookup_b = TestCluster.rpc!(node_b, Group, :lookup, [name, "user/race"])
+
+          case {lookup_a, lookup_b} do
+            {{pid, _}, {pid, _}} when is_pid(pid) -> true
+            _ -> false
+          end
+        end,
+        timeout: 10_000
+      )
+
+      # The winner must be alive (mutual kill bug would leave key unregistered
+      # or registered to a dead pid)
+      {winner_pid, _} = TestCluster.rpc!(node_a, Group, :lookup, [name, "user/race"])
+      assert TestCluster.rpc!(node(winner_pid), Process, :alive?, [winner_pid])
+
+      # Exactly one of {pid_a, pid_b} should be alive
+      a_alive = TestCluster.rpc!(node_a, Process, :alive?, [pid_a])
+      b_alive = TestCluster.rpc!(node_b, Process, :alive?, [pid_b])
+      assert a_alive != b_alive, "Expected exactly one survivor, got a=#{a_alive} b=#{b_alive}"
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+      assert :ok = TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+      assert :ok = TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+  end
+
+  describe "Jepsen-style: nodedown cleans cluster_nodes on all shards" do
+    @tag timeout: 60_000
+    test "dead node removed from cluster_nodes even with many shards" do
+      # Exercises the race where a non-zero shard processes a late peer_connect
+      # from a dead node after shard 0 already cleaned cluster_nodes. With many
+      # shards, the window for this race is wider.
+      peers = TestCluster.start_peers(2)
+
+      [{peer_a_pid, node_a}, {peer_b_pid, node_b}] = peers
+      name = :"dist_stale_cn_#{System.unique_integer([:positive])}"
+      # Many shards increases the chance of cross-shard timing issues
+      opts = [name: name, shards: 8]
+
+      start_group_on_peers(peers, opts)
+
+      # Both connect to a named cluster
+      TestCluster.rpc!(node_a, Group, :connect, [name, "ephemeral"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "ephemeral"])
+
+      # B registers some data
+      TestCluster.spawn_register_in_cluster(node_b, name, "eph/key", %{}, "ephemeral")
+      TestCluster.spawn_register(node_b, name, "nil/key", %{})
+
+      # Wait for replication
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "nil/key"]) != nil
+      end)
+
+      # Kill B
+      :peer.stop(peer_b_pid)
+
+      # A should not have B in any cluster_nodes — nil or named
+      TestCluster.assert_eventually(
+        fn ->
+          nil_nodes = TestCluster.rpc!(node_a, Group, :nodes, [name])
+          named_nodes = TestCluster.rpc!(node_a, Group, :nodes, [name, "ephemeral"])
+          nil_nodes == [] and named_nodes == [node_a]
+        end,
+        timeout: 10_000
+      )
+
+      # Verify the raw ETS tables have no trace of B
+      cn_table = Group.Replica.Data.cluster_nodes_table(name)
+      nc_table = Group.Replica.Data.node_clusters_table(name)
+
+      cn_entries = TestCluster.rpc!(node_a, :ets, :tab2list, [cn_table])
+      nc_entries = TestCluster.rpc!(node_a, :ets, :tab2list, [nc_table])
+
+      for {cluster, nd} <- cn_entries do
+        assert nd != node_b,
+               "Dead node #{node_b} still in cluster_nodes for cluster #{inspect(cluster)}"
+      end
+
+      for {nd, cluster} <- nc_entries do
+        assert nd != node_b,
+               "Dead node #{node_b} still in node_clusters for cluster #{inspect(cluster)}"
+      end
+
+      # All shards should be clean
+      TestCluster.flush_shards(node_a, name)
+      assert :ok = TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+
+      on_exit(fn -> :peer.stop(peer_a_pid) end)
+    end
+  end
+
+  describe "Jepsen-style: conflict resolution lifecycle events" do
+    @tag timeout: 60_000
+    test "monitor receives :unregistered for evicted pid on partition heal" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_evict_event_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      # Set up monitors on both nodes to capture events
+      monitor_a = TestCluster.spawn_monitor_forwarder(node_a, name, :all, self())
+      monitor_b = TestCluster.spawn_monitor_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, ^monitor_a}, 5000
+      assert_receive {:monitor_ready, ^monitor_b}, 5000
+
+      # Verify connectivity
+      pid_init = TestCluster.spawn_register(node_a, name, "init", %{})
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) != nil
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [pid_init, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "init"]) == nil
+      end)
+
+      # Drain any events from the init phase
+      flush_events()
+
+      # Partition
+      TestCluster.monitor_nodes_on(node_a, self())
+      TestCluster.monitor_nodes_on(node_b, self())
+      TestCluster.disconnect_nodes(node_a, node_b)
+      assert_receive {:nodedown_on_remote, ^node_b}, 5000
+      assert_receive {:nodedown_on_remote, ^node_a}, 5000
+
+      # Register same key on both sides. A first, B second (B gets higher timestamp).
+      pid_a = TestCluster.spawn_register(node_a, name, "user/evict", %{side: :a})
+      Process.sleep(50)
+      pid_b = TestCluster.spawn_register(node_b, name, "user/evict", %{side: :b})
+
+      # Drain partition-side registration events
+      flush_events()
+
+      # Heal
+      TestCluster.reconnect_nodes(node_a, node_b)
+
+      # Wait for convergence — pid_b should win (higher timestamp)
+      TestCluster.assert_eventually(
+        fn ->
+          lookup_a = TestCluster.rpc!(node_a, Group, :lookup, [name, "user/evict"])
+          lookup_b = TestCluster.rpc!(node_b, Group, :lookup, [name, "user/evict"])
+
+          match?({^pid_b, _}, lookup_a) and match?({^pid_b, _}, lookup_b)
+        end,
+        timeout: 10_000
+      )
+
+      # Node A should have dispatched :unregistered for pid_a (the evicted local entry)
+      # when resolve_conflict picked pid_b as winner
+      assert_received_event(:unregistered, "user/evict", pid_a, :resolve_conflict)
+
+      # pid_b should eventually have a :registered event on node A
+      # (from the winner's re-broadcast replicate_register)
+      assert_received_event(:registered, "user/evict", pid_b)
+
+      # ETS consistency
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+      assert :ok = TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
+      assert :ok = TestCluster.rpc!(node_b, Group.TestCluster, :assert_ets_consistent, [name])
+    end
+  end
+
+  # Helpers for event assertion tests
+
+  defp flush_events do
+    receive do
+      {:got_event, %Group.Event{}} -> flush_events()
+    after
+      100 -> :ok
+    end
+  end
+
+  defp assert_received_event(type, key, pid, reason) do
+    assert_received_event_loop(type, key, pid, reason, 5000)
+  end
+
+  defp assert_received_event(type, key, pid) do
+    assert_received_event_loop(type, key, pid, nil, 5000)
+  end
+
+  defp assert_received_event_loop(type, key, pid, reason, timeout) do
+    receive do
+      {:got_event, %Group.Event{type: ^type, key: ^key, pid: ^pid, reason: ^reason}} ->
+        :ok
+
+      {:got_event, %Group.Event{type: ^type, key: ^key, pid: ^pid}} when reason == nil ->
+        :ok
+
+      {:got_event, %Group.Event{}} ->
+        # Not the event we're looking for, keep draining
+        assert_received_event_loop(type, key, pid, reason, timeout)
+    after
+      timeout ->
+        flunk(
+          "Expected #{type} event for key=#{inspect(key)} pid=#{inspect(pid)}" <>
+            if(reason, do: " reason=#{inspect(reason)}", else: "") <>
+            " but didn't receive it within #{timeout}ms"
+        )
+    end
+  end
 end

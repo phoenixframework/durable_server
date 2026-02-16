@@ -169,6 +169,13 @@ defmodule Group.Replica do
   existing entry is local go through `resolve_conflict` — the same path used
   for live contention. The default resolver kills the loser process.
 
+  The tiebreaker must be deterministic regardless of which node is resolving.
+  The default uses timestamp comparison, with pid ordering as a tiebreaker
+  when timestamps are equal (`pid2 > pid1`). Erlang pids have a total order
+  (by node name then id), so this produces the same winner on all nodes.
+  Using a perspective-dependent tiebreaker (e.g. "remote wins on ties") would
+  cause mutual kill — both nodes pick the other's pid, both processes die.
+
       Node A                                  Node B
       ──────                                  ──────
       (partition: A and B both register key K)
@@ -195,8 +202,8 @@ defmodule Group.Replica do
         ├─ kill pid_a                           ├─ kill pid_a (cross-node, idempotent)
         ├─ delete pid_a entry                   ├─ re-insert pid_b with new timestamp
         ├─ insert pid_b                         └─ re-broadcast pid_b
-        └─ demonitor pid_a                         {:replicate_register, ...}
-           │                                       │──────────────────────────>│
+        ├─ demonitor pid_a                         {:replicate_register, ...}
+        ├─ dispatch :unregistered(pid_a)         │──────────────────────────>│
            │                                       │  (arrives as same-pid     │
            │                                       │   update — harmless)      │
 
@@ -210,12 +217,12 @@ defmodule Group.Replica do
            │                                       X
       {:nodedown, B}                               │
            │                                       │
-      Shard 0:                                     │
+      All shards (each independently):             │
         │── purge_cluster_node(B)                  │
         │   (remove B from all cluster_nodes       │
-        │    and node_clusters ETS entries)         │
+        │    and node_clusters — idempotent,        │
+        │    guards against late peer_connect)     │
            │                                       │
-      All shards:                                  │
         │── purge_node(shard, B)                   │
         │   (scan by_key for node==B,              │
         │    delete from both by_key + by_pid)     │
@@ -270,6 +277,23 @@ defmodule Group.Replica do
   handshake validates `num_shards` and raises on mismatch, since a disagreement
   would route the same key to different shards on different nodes, breaking
   replication consistency.
+
+  ## Conflict Resolution is Synchronous
+
+  The `:resolve_registry_conflict` callback runs synchronously inside the shard
+  GenServer's `handle_info` (during `replicate_register` or `merge_remote_cluster_data`).
+  This is intentional: the resolver's return value determines ETS mutations (delete
+  loser entry, insert winner, demonitor evicted local pid, re-broadcast winner) that
+  must happen atomically within a single `handle_info` turn. Making the resolver async
+  would open a window where another `replicate_register`, `DOWN`, or `cluster_state`
+  for the same key could race with the pending resolution, corrupting the dual-index
+  ETS tables.
+
+  Consequence: a blocking resolver stalls the **entire shard** — no registrations,
+  joins, replication, or cleanup can proceed on that shard until the callback returns.
+  Callers must ensure their resolver returns quickly. Any information needed for the
+  decision (e.g. priority, version, creation time) should be carried in the
+  registration metadata, not fetched at resolution time.
   """
 
   require Logger
@@ -943,8 +967,12 @@ defmodule Group.Replica do
   def handle_info({:nodedown, dead_node}, state) do
     %{name: name, shard_index: shard} = state
 
-    # Remove cluster memberships once (shared table, same work on every shard)
-    if shard == 0, do: Data.purge_cluster_node(name, dead_node)
+    # Remove cluster memberships from shared tables. Every shard calls this
+    # unconditionally (not just shard 0) to handle the race where a non-zero
+    # shard processes a late peer_connect from the dead node (re-adding it to
+    # cluster_nodes) AFTER shard 0's nodedown already cleaned it. Since :bag
+    # delete_object is idempotent, redundant calls from multiple shards are safe.
+    Data.purge_cluster_node(name, dead_node)
 
     # Purge all data from the dead node
     {purged_reg, purged_pg} = Data.purge_node(name, shard, dead_node)
@@ -982,8 +1010,9 @@ defmodule Group.Replica do
     remote_node = node(pid)
 
     if remote_node != node() and Map.get(state.remote_shards, remote_node) == pid do
-      # Remote shard process died — purge its cluster memberships and node data
-      if shard == 0, do: Data.purge_cluster_node(name, remote_node)
+      # Remote shard process died — purge its cluster memberships and node data.
+      # Unconditional (not gated on shard 0) — same reasoning as nodedown handler.
+      Data.purge_cluster_node(name, remote_node)
       {purged_reg, purged_pg} = Data.purge_node(name, shard, remote_node)
 
       log_verbose(state, fn ->
@@ -1298,6 +1327,14 @@ defmodule Group.Replica do
           node(remote_pid)
         )
 
+        # Dispatch lifecycle events so monitors see the eviction.
+        # The :registered event for remote_pid will arrive via the winner's
+        # re-broadcast (replicate_register), so we only dispatch :unregistered here.
+        Group.__dispatch__(name, :unregistered, key, local_pid, local_meta, %{
+          reason: :resolve_conflict,
+          cluster: cluster
+        })
+
         state
 
       winner_pid == local_pid ->
@@ -1344,8 +1381,13 @@ defmodule Group.Replica do
   end
 
   defp default_resolve_conflict(_name, _cluster, key, {pid1, _meta1, time1}, {pid2, meta2, time2}) do
+    # Tiebreaker must be deterministic regardless of which node is resolving.
+    # Using `>=` would pick the remote on BOTH nodes when timestamps are equal,
+    # causing mutual kill (both processes die, key becomes unregistered).
+    # Erlang pids have a total order (by node name then id), so pid comparison
+    # gives a consistent tiebreaker across all nodes.
     {winner_pid, loser_pid} =
-      if time2 >= time1, do: {pid2, pid1}, else: {pid1, pid2}
+      if time2 > time1 or (time2 == time1 and pid2 > pid1), do: {pid2, pid1}, else: {pid1, pid2}
 
     Logger.error(fn ->
       "#{inspect(__MODULE__)}: registry conflict detected: key=#{inspect(key)}, " <>

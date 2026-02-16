@@ -421,14 +421,13 @@ defmodule GroupTest do
   end
 
   describe "GroupConflictResolver" do
-    test "conflict resolver is configured and callable", %{supervisor_name: sup} do
+    test "conflict resolver kills both processes for clean restart", %{supervisor_name: sup} do
       key = "conflict/test/#{DurableServer.UUID.uuid4()}"
 
       {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
       # Get the raw internal metadata (bypassing extract_meta)
       {^pid, meta} = Group.lookup(sup, key, extract_meta: & &1)
-      assert is_binary(meta.etag)
 
       # Spawn a fake "conflicting" process
       fake_pid = spawn(fn -> Process.sleep(:infinity) end)
@@ -447,13 +446,13 @@ defmodule GroupTest do
           sup,
           key,
           {pid, meta, time},
-          {fake_pid, %{meta | etag: "stale_etag"}, time + 1} | extra_args
+          {fake_pid, %DurableServer.GroupMeta{}, time + 1} | extra_args
         ])
 
-      # Our resolver picks the pid with the matching storage etag
+      # Resolver returns first pid as nominal winner (both are killed anyway)
       assert winner == pid
 
-      # Our resolver kills both for clean restart
+      # Both processes are killed for clean restart
       assert_receive {:DOWN, ^ref_real, :process, ^pid, _}, 1000
       assert_receive {:DOWN, ^ref_fake, :process, ^fake_pid, _}, 1000
     end

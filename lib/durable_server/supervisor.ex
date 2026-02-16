@@ -1486,7 +1486,7 @@ defmodule DurableServer.Supervisor do
         Group.join(sup_name, Atom.to_string(sup_name), meta)
 
         # Also join module-specific group for per-module counting
-        if module = meta[:module] do
+        if module = Map.get(meta, :module) do
           [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
 
           if is_map(limits[:max_children]) and Map.has_key?(limits[:max_children], module) do

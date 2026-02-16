@@ -1269,7 +1269,7 @@ defmodule DurableServer do
     case DurableServer.Supervisor.__register_child__(
            state.supervisor,
            state.key,
-           %{
+           %DurableServer.GroupMeta{
              key: state.key,
              module: state.module,
              storage_key: storage_key(state),
@@ -2372,8 +2372,9 @@ defmodule DurableServer do
   end
 
   @doc false
-  def extract_user_meta(%{user_meta: user_meta}), do: user_meta
-  def extract_user_meta(meta) when is_map(meta), do: meta
+  # we allow users to piggy back on group registry so passhtru aribtrary meta
+  def extract_user_meta(%DurableServer.GroupMeta{user_meta: user_meta}), do: user_meta
+  def extract_user_meta(meta), do: meta
 
   @doc false
   def __fetch_stored_state_for_conflict_resolution__(supervisor_name, storage_key)

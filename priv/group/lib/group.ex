@@ -175,7 +175,13 @@ defmodule Group do
   - `:log` — logging level. `:info` (default) logs peer discovery, node events,
     and cluster membership changes. `:verbose` additionally logs per-shard
     replication messages. `false` disables all Group log output.
-  - `:resolve_registry_conflict` — `{module, function, extra_args}` for partition conflicts
+  - `:resolve_registry_conflict` — `{module, function, extra_args}` callback invoked when
+    two nodes hold the same registry key (partition heal or concurrent registration).
+    Called as `apply(module, function, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
+    Must return the winner pid. The loser is killed with `{:group_registry_conflict, key, meta}`.
+    **Important:** This callback runs synchronously inside the shard GenServer — it must
+    return quickly and never block. Any information needed for the decision should be
+    carried in the registration metadata, not fetched at resolution time.
   - `:extract_meta` — `{module, function, args}` to transform metadata on reads
   """
   def child_spec(opts) do
