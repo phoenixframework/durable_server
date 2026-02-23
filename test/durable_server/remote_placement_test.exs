@@ -441,4 +441,138 @@ defmodule DurableServer.RemotePlacementTest do
              )
     end
   end
+
+  describe "start_child with local_only: true" do
+    test "succeeds locally when capacity available", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{:total => 10}}
+      )
+
+      assert {:ok, {pid, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {RemotePlacementTestServer, %{key: "local_only_ok"}},
+                 local_only: true
+               )
+
+      assert is_pid(pid)
+      assert node(pid) == Node.self()
+    end
+
+    test "returns capacity error instead of trying remote placement", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{:total => 1}}
+      )
+
+      # Fill local capacity
+      {:ok, {_pid, _}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {RemotePlacementTestServer, %{key: "local_fill"}},
+          local_only: true
+        )
+
+      # Should fail with capacity error — NOT try remote placement
+      assert {:error, {:capacity_limit, :max_children_total}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {RemotePlacementTestServer, %{key: "local_only_fail"}},
+                 local_only: true
+               )
+    end
+  end
+
+  describe "ensure_started_child with local_only: true" do
+    test "starts locally when capacity available", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{:total => 10}}
+      )
+
+      assert {:ok, {pid, _meta}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {RemotePlacementTestServer, %{key: "ensure_local_ok"}},
+                 local_only: true
+               )
+
+      assert is_pid(pid)
+      assert node(pid) == Node.self()
+    end
+
+    test "returns existing process if already started", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()}
+      )
+
+      {:ok, {pid1, _}} =
+        DurableServer.Supervisor.ensure_started_child(
+          supervisor_name,
+          {RemotePlacementTestServer, %{key: "ensure_local_existing"}},
+          local_only: true
+        )
+
+      {:ok, {pid2, _}} =
+        DurableServer.Supervisor.ensure_started_child(
+          supervisor_name,
+          {RemotePlacementTestServer, %{key: "ensure_local_existing"}},
+          local_only: true
+        )
+
+      assert pid1 == pid2
+    end
+
+    test "returns capacity error instead of trying remote placement", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{:total => 1}}
+      )
+
+      # Fill local capacity
+      {:ok, {_pid, _}} =
+        DurableServer.Supervisor.ensure_started_child(
+          supervisor_name,
+          {RemotePlacementTestServer, %{key: "ensure_fill"}},
+          local_only: true
+        )
+
+      # Should fail with capacity error — NOT try remote placement
+      assert {:error, {:capacity_limit, _reason}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {RemotePlacementTestServer, %{key: "ensure_local_fail"}},
+                 local_only: true
+               )
+    end
+  end
 end

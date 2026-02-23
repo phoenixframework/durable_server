@@ -539,12 +539,27 @@ defmodule DurableServer.Supervisor do
   @doc """
   Starts a DurableServer child process under this supervisor.
 
+  ## Options
+
+  - `:local_only` - When `true`, the child will only be started on the local node.
+    If the local node is at capacity, returns `{:error, {:capacity_limit, reason}}`
+    instead of attempting remote placement. Default: `false`.
+  - `:max_placement_retries` - Maximum number of remote nodes to try when local
+    placement fails due to capacity limits. Default: `3`. Ignored when `local_only: true`.
+
   ## Examples
 
       # Start with init args
       {:ok, {pid, meta}} = DurableServer.Supervisor.start_child(
         MyApp.DurableSup,
         {MyServer, %{key: "server_1", initial_value: 42}}
+      )
+
+      # Start locally only — never attempt remote placement
+      {:ok, {pid, meta}} = DurableServer.Supervisor.start_child(
+        MyApp.DurableSup,
+        {MyServer, %{key: "server_1"}},
+        local_only: true
       )
 
       # The server module must use DurableServer
@@ -557,8 +572,11 @@ defmodule DurableServer.Supervisor do
       end
   """
   def start_child(supervisor, {module, init_arg} = child_spec, opts \\ []) do
-    opts = Keyword.validate!(opts, [:max_placement_retries])
-    max_placement_retries = Keyword.get(opts, :max_placement_retries, 3)
+    opts = Keyword.validate!(opts, [:max_placement_retries, :local_only])
+    local_only = Keyword.get(opts, :local_only, false)
+
+    max_placement_retries =
+      if local_only, do: 0, else: Keyword.get(opts, :max_placement_retries, 3)
 
     # When max_placement_retries is 0, this is a remote placement call from another node.
     # Wait for the supervisor to be ready to handle the race where RPC arrives before
@@ -952,6 +970,15 @@ defmodule DurableServer.Supervisor do
   process before attempting to start a new one. This is useful when you want to
   ensure a process exists but don't know if it's already running.
 
+  ## Options
+
+  - `:local_only` - When `true`, the child will only be started on the local node.
+    Skips sticky placement preferences and never attempts remote placement.
+    If the local node is at capacity, returns `{:error, {:capacity_limit, reason}}`.
+    Default: `false`.
+  - `:max_placement_retries` - Maximum number of remote nodes to try when local
+    placement fails due to capacity limits. Default: `3`. Ignored when `local_only: true`.
+
   ## Returns
 
   - `{:ok, {pid, meta}}` - Process is running (either found or newly started)
@@ -963,6 +990,13 @@ defmodule DurableServer.Supervisor do
       {:ok, {pid, meta}} = DurableServer.Supervisor.ensure_started_child(
         MyApp.DurableSup,
         {MyServer, %{key: "server_1", initial_value: 42}}
+      )
+
+      # Ensure locally only — never attempt remote placement
+      {:ok, {pid, meta}} = DurableServer.Supervisor.ensure_started_child(
+        MyApp.DurableSup,
+        {MyServer, %{key: "server_1"}},
+        local_only: true
       )
 
       # Calling again returns the same process
@@ -987,6 +1021,8 @@ defmodule DurableServer.Supervisor do
         {:ok, {pid, meta}}
 
       nil ->
+        local_only = Keyword.get(opts, :local_only, false)
+
         # Try to fetch stored object to check sticky placement before attempting local start
         config = __get_config__(supervisor)
         storage_key = config.prefix <> key
@@ -1007,53 +1043,58 @@ defmodule DurableServer.Supervisor do
         # Check if we should respect sticky placement and skip local start
         # Also track matching_level for time-gated fallback when remote placement fails
         # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
+        # When local_only: true, never skip local — ignore sticky placement preferences
         {should_skip_local, is_sticky_local, matching_level} =
-          case sticky_placement do
-            nil ->
-              # No sticky placement, proceed with normal local-first logic
-              {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
+          if local_only do
+            {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
+          else
+            case sticky_placement do
+              nil ->
+                # No sticky placement, proceed with normal local-first logic
+                {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
 
-            [%{env_var: :any, value: :any} | _] ->
-              # First level is :any, so local node is acceptable but we don't know
-              # if data is specifically here (could have been on any node)
-              {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
+              [%{env_var: :any, value: :any} | _] ->
+                # First level is :any, so local node is acceptable but we don't know
+                # if data is specifically here (could have been on any node)
+                {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
 
-            placement ->
-              # Have specific sticky placement (first element is not :any)
-              # Check if local node matches
-              env_var_names =
-                DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
+              placement ->
+                # Have specific sticky placement (first element is not :any)
+                # Check if local node matches
+                env_var_names =
+                  DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
 
-              my_env_vars =
-                env_var_names
-                |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
-                |> Enum.into(%{})
+                my_env_vars =
+                  env_var_names
+                  |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
+                  |> Enum.into(%{})
 
-              # Check if we match any level (0 = exact, 1 = less specific, etc.)
-              my_matching_level =
-                Enum.find_index(placement, fn preference ->
-                  case preference do
-                    %{env_var: :any, value: :any} ->
-                      true
+                # Check if we match any level (0 = exact, 1 = less specific, etc.)
+                my_matching_level =
+                  Enum.find_index(placement, fn preference ->
+                    case preference do
+                      %{env_var: :any, value: :any} ->
+                        true
 
-                    %{env_var: env_var, value: expected_value} ->
-                      Map.get(my_env_vars, env_var) == expected_value
+                      %{env_var: env_var, value: expected_value} ->
+                        Map.get(my_env_vars, env_var) == expected_value
 
-                    _ ->
-                      false
-                  end
-                end)
+                      _ ->
+                        false
+                    end
+                  end)
 
-              # Skip local start only if we don't match level 0 (exact match)
-              # This ensures servers stay on their sticky placement node for specific matches
-              if my_matching_level == 0 do
-                # Level 0 match with specific env var - use local, bypass disk check
-                # (we know it's specific because :any at level 0 is handled above)
-                {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
-              else
-                # Level > 0 match or nil (no match) - skip local to try remote first
-                {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
-              end
+                # Skip local start only if we don't match level 0 (exact match)
+                # This ensures servers stay on their sticky placement node for specific matches
+                if my_matching_level == 0 do
+                  # Level 0 match with specific env var - use local, bypass disk check
+                  # (we know it's specific because :any at level 0 is handled above)
+                  {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
+                else
+                  # Level > 0 match or nil (no match) - skip local to try remote first
+                  {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
+                end
+            end
           end
 
         # Use {:restart, ...} pattern if we have stored object, otherwise regular init
