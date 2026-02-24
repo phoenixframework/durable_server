@@ -354,7 +354,7 @@ defmodule DurableServer.LifecycleManager do
 
     expired =
       :ets.select_delete(state.discovery_skip_table, [
-        {{:_, :_, :"$1"}, [{:<, :"$1", expire_before}], [true]}
+        {{:_, :_, :_, :"$1"}, [{:<, :"$1", expire_before}], [true]}
       ])
 
     if expired > 0 do
@@ -932,8 +932,9 @@ defmodule DurableServer.LifecycleManager do
         match?({_, _}, DurableServer.Supervisor.lookup(state.supervisor_name, key)) ->
           []
 
-        # in skip set with matching etag — skip the GET
-        skip_table_match?(state.discovery_skip_table, key, etag) ->
+        # in skip set with matching etag — skip permanently non-restartable,
+        # re-evaluate temporarily non-restartable (time gates, circuit breaker)
+        discovery_skip?(state, key, etag) ->
           []
 
         true ->
@@ -969,10 +970,22 @@ defmodule DurableServer.LifecycleManager do
               %{} = obj ->
                 attempt_restart(state, obj)
 
-              nil ->
-                # non-restartable — cache with timestamp for TTL expiration
+              :skip ->
+                # permanently non-restartable — cache without meta
                 now = System.monotonic_time(:millisecond)
-                :ets.insert(state.discovery_skip_table, {key, etag, now})
+                :ets.insert(state.discovery_skip_table, {key, etag, :skip, now})
+                :noop
+
+              {:skip, %Meta{} = meta} ->
+                # temporarily non-restartable (circuit breaker, time-gated placement,
+                # health check) — cache trimmed meta for re-evaluation next round
+                now = System.monotonic_time(:millisecond)
+                trimmed = trim_meta_for_cache(meta)
+                :ets.insert(state.discovery_skip_table, {key, etag, trimmed, now})
+                :noop
+
+              nil ->
+                # fetch error — don't cache
                 :noop
             end
           end,
@@ -1004,24 +1017,23 @@ defmodule DurableServer.LifecycleManager do
             cond do
               # never restart permanently crashed servers
               Meta.permanently_crashed?(meta) ->
-                nil
+                :skip
 
               # only restart servers marked as permanent (default is false - user must opt-in)
               not meta.permanent ->
-                nil
+                :skip
 
               # never restart explicitly stopped servers
               Meta.stopped_permanently?(meta) ->
-                nil
+                :skip
 
               # do not attempt to start modules that no longer exist
-              # TODO cache undefined modules to avoid hitting disk for them over and over
               not Code.ensure_loaded?(meta.module) ->
                 Logger.warning(
                   "permanent durable server module #{inspect(meta.module)} not loaded"
                 )
 
-                nil
+                :skip
 
               true ->
                 # check module circuit breaker before proceeding
@@ -1033,6 +1045,8 @@ defmodule DurableServer.LifecycleManager do
                     # proceed with existing health checks
                     if appears_restartable?(state, meta) do
                       obj
+                    else
+                      {:skip, meta}
                     end
 
                   {:circuit_open, cooldown_ms} ->
@@ -1040,7 +1054,7 @@ defmodule DurableServer.LifecycleManager do
                       "Module #{inspect(meta.module)} circuit breaker open for #{cooldown_ms}ms, skipping restart checks"
                     end)
 
-                    nil
+                    {:skip, meta}
                 end
             end
 
@@ -1203,11 +1217,45 @@ defmodule DurableServer.LifecycleManager do
     |> Enum.into(%{})
   end
 
-  defp skip_table_match?(table, key, etag) do
-    case :ets.lookup(table, key) do
-      [{^key, ^etag, _inserted_at}] -> true
-      _ -> false
+  defp discovery_skip?(%LifecycleManager{} = state, key, etag) do
+    case :ets.lookup(state.discovery_skip_table, key) do
+      [{^key, ^etag, :skip, _ts}] ->
+        true
+
+      [{^key, ^etag, %Meta{} = meta, _ts}] ->
+        # Etag unchanged so stored state is identical, but time-dependent checks
+        # (placement gates, circuit breaker, node health) may have changed.
+        case CircuitBreaker.check_module_circuit_breaker(state.circuit_breaker, meta.module) do
+          {:circuit_open, _} ->
+            true
+
+          :ok ->
+            if appears_restartable?(state, meta) do
+              # Now restartable — remove from cache, let async task do fresh GET
+              :ets.delete(state.discovery_skip_table, key)
+              false
+            else
+              true
+            end
+        end
+
+      _ ->
+        false
     end
+  end
+
+  # Strip fields not needed for re-evaluation to reduce ETS memory.
+  # Drops sticky_placement_history (~2KB), crash_history, init_from_*, etc.
+  defp trim_meta_for_cache(%Meta{} = meta) do
+    %Meta{
+      meta
+      | sticky_placement_history: [],
+        crash_history: [],
+        init_from_ref: nil,
+        init_from_pid: nil,
+        restart_attempt_node: nil,
+        prefix: nil
+    }
   end
 
   defp try_restart_child(%LifecycleManager{} = state, {module, init_arg}) do
