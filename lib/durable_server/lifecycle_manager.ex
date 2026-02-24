@@ -1058,7 +1058,16 @@ defmodule DurableServer.LifecycleManager do
                 end
             end
 
+          {:error, {kind, _, _encoded}} when kind in [:error, :throw, :exit] ->
+            # decode/parse failure — deterministic for same body, safe to cache
+            log(state, :warning, fn ->
+              "Failed to decode stored state for key #{key}: #{inspect(kind)}"
+            end)
+
+            :skip
+
           {:error, reason} ->
+            # network/transient error — don't cache
             log(state, :warning, fn ->
               "Failed to get metadata for key #{key}: #{inspect(reason)}"
             end)
