@@ -2763,4 +2763,14 @@ defmodule DurableServer do
     Limit: #{details.limit}%
     """)
   end
+
+  defp log_capacity_limit(:max_disk, details, supervisor, module) do
+    Logger.info("""
+    DurableServer disk limit reached - Cannot start #{inspect(module)} on #{Node.self()}
+    Supervisor: #{supervisor}
+    Mount point: #{details.mount_point}
+    Current disk: #{details.current}%
+    Limit: #{details.limit}%
+    """)
+  end
 end
