@@ -132,9 +132,9 @@ defmodule Group do
       # Join a key to be discoverable by other processes
       :ok = Group.join(MySup, "game/room/42", %{role: :spectator})
 
-      # Query all members of a key (DurableServers + joined processes)
+      # Query all members of a key (joined processes only)
       members = Group.members(MySup, "game/room/42")
-      # => [{#PID<0.150.0>, %{module: GameRoom, ...}}, {#PID<0.200.0>, %{role: :spectator}}]
+      # => [{#PID<0.200.0>, %{role: :spectator}}]
 
       # Leave when done
       :ok = Group.leave(MySup, "game/room/42")
@@ -581,15 +581,19 @@ defmodule Group do
   # ===========================================================================
 
   @doc """
-  List all members of a group.
+  List all members of a group (process group entries only).
 
-  Returns both registered processes (via `register/5`) and
-  joined processes (via `join/5`).
+  Returns processes that have joined via `join/3`. Registry entries
+  (via `register/3`) are not included — use `lookup/3` for those.
+
+  Supports prefix matching: if `group` ends with `"/"`, returns all
+  members whose group key starts with that prefix. Prefix queries scan
+  all shards. Exact queries hit a single shard.
 
   ## Parameters
 
   - `name` - The Group name
-  - `group` - The group to query (string)
+  - `group` - The group to query (string). Trailing `"/"` triggers prefix match.
   - `opts` - Keyword list of options
 
   ## Options
@@ -608,21 +612,20 @@ defmodule Group do
     cluster = Keyword.get(opts, :cluster)
     extract_meta_fn = resolve_extract_meta(name, opts)
     num_shards = get_config(name).num_shards
-    shard = Replica.shard_index_for(cluster, group, num_shards)
 
-    # DurableServer from registry (one or none)
-    registry_result =
-      case Data.registry_lookup(name, shard, cluster, group) do
-        {pid, meta, _time, _node} -> [{pid, extract_meta_fn.(meta)}]
-        nil -> []
-      end
+    if String.ends_with?(group, "/") do
+      # Prefix query — scan all shards
+      Enum.flat_map(0..(num_shards - 1), fn shard ->
+        Data.pg_members_by_prefix(name, shard, cluster, group)
+        |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
+      end)
+    else
+      # Exact match — single shard
+      shard = Replica.shard_index_for(cluster, group, num_shards)
 
-    # Joined pids from process group (zero or more)
-    group_members =
       Data.pg_members(name, shard, cluster, group)
       |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
-
-    registry_result ++ group_members
+    end
   end
 
   @doc """

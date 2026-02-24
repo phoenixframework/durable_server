@@ -261,7 +261,7 @@ defmodule GroupTest do
       assert Group.members(name, "nonexistent/key") == []
     end
 
-    test "returns both registered and joined processes", %{name: name} do
+    test "does not include registered processes", %{name: name} do
       key = "both/#{System.unique_integer([:positive])}"
 
       :ok = Group.register(name, key, %{type: :server})
@@ -282,9 +282,73 @@ defmodule GroupTest do
       end
 
       members = Group.members(name, key)
+      assert length(members) == 1
+      assert {^joiner, %{type: :client}} = hd(members)
+    end
+
+    test "prefix query returns matching PG members across shards", %{name: name} do
+      test_pid = self()
+
+      pids =
+        for i <- 1..5 do
+          spawn(fn ->
+            :ok = Group.join(name, "room/1/user/#{i}", %{i: i})
+            send(test_pid, {:joined, self()})
+            Process.sleep(:infinity)
+          end)
+        end
+
+      for _ <- 1..5 do
+        receive do
+          {:joined, _} -> :ok
+        after
+          1000 -> flunk("timeout")
+        end
+      end
+
+      # Also join a non-matching key
+      spawn(fn ->
+        :ok = Group.join(name, "room/2/user/1", %{i: 99})
+        send(test_pid, {:joined, self()})
+        Process.sleep(:infinity)
+      end)
+
+      receive do
+        {:joined, _} -> :ok
+      after
+        1000 -> flunk("timeout")
+      end
+
+      members = Group.members(name, "room/1/")
+      assert length(members) == 5
+      member_pids = Enum.map(members, &elem(&1, 0)) |> Enum.sort()
+      assert member_pids == Enum.sort(pids)
+    end
+
+    test "prefix query returns empty list when no matches", %{name: name} do
+      assert Group.members(name, "no/match/") == []
+    end
+
+    test "prefix query works with cluster option", %{name: name} do
+      cluster = "prefix_cluster"
+      :ok = Group.connect(name, cluster)
+
+      :ok = Group.join(name, "ns/a", %{v: 1}, cluster: cluster)
+      :ok = Group.join(name, "ns/b", %{v: 2}, cluster: cluster)
+      # Join default cluster — should not appear
+      :ok = Group.join(name, "ns/c", %{v: 3})
+
+      members = Group.members(name, "ns/", cluster: cluster)
       assert length(members) == 2
-      assert {^test_pid, %{type: :server}} = Enum.find(members, fn {p, _} -> p == test_pid end)
-      assert {^joiner, %{type: :client}} = Enum.find(members, fn {p, _} -> p == joiner end)
+      metas = Enum.map(members, &elem(&1, 1)) |> Enum.sort_by(& &1.v)
+      assert metas == [%{v: 1}, %{v: 2}]
+    end
+
+    test "prefix query works with extract_meta option", %{name: name} do
+      :ok = Group.join(name, "em/a", %{secret: 1, public: :yes})
+
+      members = Group.members(name, "em/", extract_meta: &Map.take(&1, [:public]))
+      assert [{_, %{public: :yes}}] = members
     end
   end
 

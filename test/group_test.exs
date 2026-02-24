@@ -263,11 +263,11 @@ defmodule GroupTest do
   end
 
   describe "members/2" do
-    test "returns DurableServer and joined processes together", %{supervisor_name: sup} do
+    test "returns only joined processes, not registered DurableServer", %{supervisor_name: sup} do
       key = "combined/#{DurableServer.UUID.uuid4()}"
 
-      # Start a DurableServer
-      {:ok, {server_pid, _}} =
+      # Start a DurableServer (registers but does not join)
+      {:ok, {_server_pid, _}} =
         DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
       # Join as a listener
@@ -275,24 +275,18 @@ defmodule GroupTest do
       :ok = Group.join(sup, key, listener_meta)
 
       members = Group.members(sup, key)
-      assert length(members) == 2
+      assert length(members) == 1
 
-      # DurableServer member has extracted user meta
-      {^server_pid, %{module: TestServer}} =
-        Enum.find(members, fn {pid, _} -> pid == server_pid end)
-
-      # Joined member has raw meta
       my_pid = self()
-      {^my_pid, ^listener_meta} = Enum.find(members, fn {pid, _} -> pid == self() end)
+      assert [{^my_pid, ^listener_meta}] = members
     end
 
-    test "returns only DurableServer when no joined processes", %{supervisor_name: sup} do
+    test "returns empty list when only a DurableServer is registered", %{supervisor_name: sup} do
       key = "only/server/#{DurableServer.UUID.uuid4()}"
 
-      {:ok, {pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
+      {:ok, {_pid, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key}})
 
-      members = Group.members(sup, key)
-      assert [{^pid, %{module: TestServer}}] = members
+      assert Group.members(sup, key) == []
     end
   end
 
@@ -318,17 +312,18 @@ defmodule GroupTest do
                       ], _},
                      1000
 
-      # 3. Verify members shows DurableServer with extracted meta
-      assert [{^server_pid, %{module: TestServer}}] = Group.members(sup, key)
+      # 3. Verify DurableServer is discoverable via lookup (not members)
+      assert {^server_pid, %{module: TestServer}} = Group.lookup(sup, key)
+      assert Group.members(sup, key) == []
 
       # 4. Join as listener
       :ok = Group.join(sup, key, %{role: :listener})
       assert_receive {:group, [%Group.Event{type: :joined, pid: self_pid}], _}, 1000
       assert self_pid == self()
 
-      # 5. Verify members shows both
-      members = Group.members(sup, key)
-      assert length(members) == 2
+      # 5. Verify members shows only joined process
+      my_pid = self()
+      assert [{^my_pid, %{role: :listener}}] = Group.members(sup, key)
 
       # 6. Stop DurableServer
       ref = Process.monitor(server_pid)
@@ -345,8 +340,7 @@ defmodule GroupTest do
                       ], _},
                      1000
 
-      # 7. Verify members shows only joined process
-      my_pid = self()
+      # 7. Verify members still shows joined process (DurableServer was registry-only)
       assert [{^my_pid, %{role: :listener}}] = Group.members(sup, key)
 
       # 8. Leave
@@ -459,17 +453,19 @@ defmodule GroupTest do
       :ok = Group.join(sup1, key, %{role: :test})
       assert_receive {:group, [%Group.Event{type: :joined, supervisor: ^sup1}], _}, 1000
 
-      # Members are isolated per supervisor with correct metadata shapes
+      # Members are PG-only (joined processes), isolated per supervisor
       sup1_members = Group.members(sup1, key) |> Map.new()
       sup2_members = Group.members(sup2, key) |> Map.new()
 
       my_pid = self()
 
-      # DurableServer has extracted user meta, joined process has raw meta
-      assert sup1_members == %{pid1 => %{module: TestServer}, my_pid => %{role: :test}}
-      assert sup2_members == %{pid2 => %{module: TestServer}, my_pid => %{role: :test}}
+      # Only the joined process appears (DurableServers register, not join)
+      assert sup1_members == %{my_pid => %{role: :test}}
+      assert sup2_members == %{my_pid => %{role: :test}}
 
-      # DurableServer pids are different across supervisors
+      # DurableServers are still discoverable via lookup
+      assert {^pid1, %{module: TestServer}} = Group.lookup(sup1, key)
+      assert {^pid2, %{module: TestServer}} = Group.lookup(sup2, key)
       refute pid1 == pid2
     end
   end
