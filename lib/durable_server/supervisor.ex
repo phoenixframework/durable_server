@@ -820,6 +820,14 @@ defmodule DurableServer.Supervisor do
   # 1. Extracting from body if provided (avoids duplicate S3 lookup)
   # 2. Loading from storage if body not provided
   # 3. Augmenting with new module config levels (e.g. :any added after process started)
+  # Augments an already-extracted sticky_placement with module config (e.g. :any).
+  # Use this when meta.sticky_placement is already available to avoid a redundant S3 GET.
+  @doc false
+  def __augment_sticky_placement__(supervisor, module, persisted_sticky_placement) do
+    module_config = __get_sticky_placement_for_module__(supervisor, module)
+    augment_with_module_config(persisted_sticky_placement, module_config)
+  end
+
   @doc false
   def __get_augmented_sticky_placement__(supervisor, module, key, body \\ nil) do
     # Extract or load the persisted sticky placement
@@ -846,31 +854,35 @@ defmodule DurableServer.Supervisor do
     augment_with_module_config(persisted, module_config)
   end
 
-  # Augment persisted sticky_placement with any new levels added to module config
-  # This allows processes started before :any was added to still match nodes at the :any level
+  # Sync persisted sticky_placement's :any level with current module config.
+  # Adds :any if module config has it but persisted doesn't (server started before :any was added).
+  # Strips :any if persisted has it but module config doesn't (config removed :any).
   defp augment_with_module_config(nil, _module_config), do: nil
   defp augment_with_module_config(persisted, nil), do: persisted
   defp augment_with_module_config([], _module_config), do: []
 
   defp augment_with_module_config(persisted, module_config)
        when is_list(persisted) and is_list(module_config) do
-    # Check if persisted already has :any
     has_any? =
       Enum.any?(persisted, fn
         %{env_var: :any} -> true
         _ -> false
       end)
 
-    # Check if module config has :any
     module_has_any? = Keyword.has_key?(module_config, :any)
 
-    # If module config has :any but persisted doesn't, append it
-    # We only augment with :any since it's a wildcard that matches all nodes
-    # For other env vars, we can't add them without knowing their value
-    if module_has_any? and not has_any? do
-      persisted ++ [%{env_var: :any, value: :any}]
-    else
-      persisted
+    cond do
+      module_has_any? and not has_any? ->
+        persisted ++ [%{env_var: :any, value: :any}]
+
+      has_any? and not module_has_any? ->
+        Enum.reject(persisted, fn
+          %{env_var: :any} -> true
+          _ -> false
+        end)
+
+      true ->
+        persisted
     end
   end
 

@@ -121,7 +121,8 @@ defmodule DurableServer.LifecycleManager do
             last_successful_heartbeat_at: nil,
             heartbeat_deadline_timer: nil,
             # Last successful heartbeat timing for diagnostics
-            last_heartbeat_timing: nil
+            last_heartbeat_timing: nil,
+            discovery_skip_table: nil
 
   @max_heartbeat_retries 3
   # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold
@@ -139,6 +140,11 @@ defmodule DurableServer.LifecycleManager do
   # Threshold for considering a node unhealthy when finding eligible placement nodes
   @node_health_staleness_threshold_ms :timer.seconds(50)
   @resource_check_interval_ms :timer.seconds(60)
+  # Skip set entries expire after 10 minutes. Deleted objects won't appear
+  # in LIST anymore, so their entries would never self-invalidate via etag.
+  # TTL ensures churned objects don't accumulate unbounded memory.
+  @discovery_skip_ttl_ms :timer.minutes(10)
+  @discovery_skip_sweep_interval_ms :timer.minutes(5)
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
@@ -202,6 +208,9 @@ defmodule DurableServer.LifecycleManager do
     hearbeat_tab = heartbeat_table_name(supervisor_name)
     :ets.new(hearbeat_tab, [:set, :public, :named_table, read_concurrency: true])
 
+    skip_tab = :"durable_server_discovery_skip_#{supervisor_name}"
+    :ets.new(skip_tab, [:set, :public, :named_table])
+
     state = %LifecycleManager{
       supervisor_name: supervisor_name,
       task_sup: task_supervisor,
@@ -216,7 +225,8 @@ defmodule DurableServer.LifecycleManager do
       discovery_interval_ms: config.discovery_interval_ms,
       heartbeat_interval_ms: config.heartbeat_interval_ms,
       capacity_limits: capacity_limits,
-      heartbeat_meta: heartbeat_meta
+      heartbeat_meta: heartbeat_meta,
+      discovery_skip_table: skip_tab
     }
 
     # schedule periodic resource checks if limits configured
@@ -234,6 +244,7 @@ defmodule DurableServer.LifecycleManager do
     Process.send_after(self(), :discover_and_restart, discovery_delay)
 
     Process.send_after(self(), :heartbeat, config.heartbeat_interval_ms)
+    Process.send_after(self(), :sweep_discovery_skip_set, @discovery_skip_sweep_interval_ms)
 
     # we MUST start with a populated node heartbeat cache
     # perform_heartbeat writes our heartbeat and refreshes the node health cache
@@ -338,6 +349,24 @@ defmodule DurableServer.LifecycleManager do
     {:noreply, new_state}
   end
 
+  def handle_info(:sweep_discovery_skip_set, %LifecycleManager{} = state) do
+    expire_before = System.monotonic_time(:millisecond) - @discovery_skip_ttl_ms
+
+    expired =
+      :ets.select_delete(state.discovery_skip_table, [
+        {{:_, :_, :"$1"}, [{:<, :"$1", expire_before}], [true]}
+      ])
+
+    if expired > 0 do
+      log(state, :debug, fn ->
+        "Swept #{expired} expired entries from discovery skip set"
+      end)
+    end
+
+    Process.send_after(self(), :sweep_discovery_skip_set, @discovery_skip_sweep_interval_ms)
+    {:noreply, state}
+  end
+
   def handle_info(:discover_and_restart, %LifecycleManager{} = state) do
     with %Task{ref: ref} <- state.current_discovery_task do
       Process.demonitor(ref, [:flush])
@@ -402,6 +431,7 @@ defmodule DurableServer.LifecycleManager do
       ) do
     # discovery task crashed or failed, still schedule next run but log the error
     log(state, :error, fn -> "discovery task failed: #{inspect(reason)}" end)
+    :ets.delete_all_objects(state.discovery_skip_table)
     Process.send_after(self(), :discover_and_restart, state.discovery_interval_ms)
     {:noreply, %{state | current_discovery_task: nil}}
   end
@@ -878,6 +908,14 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp discover_and_restart_servers(%LifecycleManager{} = state) do
+    skip_count = :ets.info(state.discovery_skip_table, :size)
+
+    if skip_count > 0 do
+      log(state, :info, fn ->
+        "Discovery skip set: #{skip_count} cached non-restartable objects"
+      end)
+    end
+
     # list all keys with this supervisor's prefix, but exclude __nodes/ heartbeat objects
     ObjectStore.list_all_objects_stream(state.object_store, state.prefix,
       error_handler: fn reason ->
@@ -886,20 +924,28 @@ defmodule DurableServer.LifecycleManager do
       end
     )
     |> Stream.reject(&String.starts_with?(&1.key, "#{state.prefix}__nodes/"))
-    |> Stream.flat_map(fn %{key: storage_key} ->
+    |> Stream.flat_map(fn %{key: storage_key, etag: etag} ->
       key = String.trim_leading(storage_key, state.prefix)
-      # first see if server exists in registry, and skip it if so
-      case DurableServer.Supervisor.lookup(state.supervisor_name, key) do
-        {_pid, _meta} -> []
-        nil -> [key]
+
+      cond do
+        # already running — skip
+        match?({_, _}, DurableServer.Supervisor.lookup(state.supervisor_name, key)) ->
+          []
+
+        # in skip set with matching etag — skip the GET
+        skip_table_match?(state.discovery_skip_table, key, etag) ->
+          []
+
+        true ->
+          [{key, etag}]
       end
     end)
     # accumulate large batches of keys, then shuffle for randomized restart order
     # this prevents all servers from being restarted in storage enumeration order
     # which would cause the first node up during a cold deploy to claim everything
     |> Stream.chunk_every(@shuffle_batch_size)
-    |> Stream.flat_map(fn keys ->
-      shuffled = Enum.shuffle(keys)
+    |> Stream.flat_map(fn items ->
+      shuffled = Enum.shuffle(items)
 
       log(state, :info, fn ->
         "Shuffled batch of #{length(shuffled)} keys for distributed restart"
@@ -918,10 +964,16 @@ defmodule DurableServer.LifecycleManager do
         # process each item in parallel and block on results (Stream.run blocks)
         batch
         |> Task.async_stream(
-          fn key ->
+          fn {key, etag} ->
             case get_restartable_object(state, key) do
-              %{} = obj -> attempt_restart(state, obj)
-              nil -> :noop
+              %{} = obj ->
+                attempt_restart(state, obj)
+
+              nil ->
+                # non-restartable — cache with timestamp for TTL expiration
+                now = System.monotonic_time(:millisecond)
+                :ets.insert(state.discovery_skip_table, {key, etag, now})
+                :noop
             end
           end,
           timeout: 60_000,
@@ -1027,13 +1079,14 @@ defmodule DurableServer.LifecycleManager do
     # Get my env vars for sticky placement matching from supervisor config
     my_env_vars = get_my_env_vars(meta.supervisor)
 
-    # Get augmented sticky placement (merges persisted with module config's :any)
+    # Augment already-fetched sticky_placement with module config (e.g. :any added after process started).
+    # We use meta.sticky_placement directly instead of doing another S3 GET — a failed GET would
+    # return nil, causing find_my_matching_level(nil, _) to return 0, bypassing sticky placement entirely.
     augmented_sticky_placement =
-      DurableServer.Supervisor.__get_augmented_sticky_placement__(
+      DurableServer.Supervisor.__augment_sticky_placement__(
         meta.supervisor,
         meta.module,
-        meta.key,
-        nil
+        meta.sticky_placement
       )
 
     # Find which sticky placement level I match (if any)
@@ -1148,6 +1201,13 @@ defmodule DurableServer.LifecycleManager do
     env_var_names
     |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
     |> Enum.into(%{})
+  end
+
+  defp skip_table_match?(table, key, etag) do
+    case :ets.lookup(table, key) do
+      [{^key, ^etag, _inserted_at}] -> true
+      _ -> false
+    end
   end
 
   defp try_restart_child(%LifecycleManager{} = state, {module, init_arg}) do
