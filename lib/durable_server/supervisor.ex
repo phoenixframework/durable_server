@@ -956,6 +956,10 @@ defmodule DurableServer.Supervisor do
           Logger.info("Successfully placed #{inspect(module)} on #{inspect(node)}")
           {:ok, {pid, meta}}
 
+        {:error, {:already_started, {pid, meta}}} ->
+          Logger.info("Found already started #{inspect(module)} on #{inspect(node)}")
+          {:ok, {pid, meta}}
+
         {:error, {:capacity_limit, reason}} ->
           Logger.info(
             "Node #{inspect(node)} also at capacity: #{inspect(reason)}, trying next node"
@@ -964,17 +968,9 @@ defmodule DurableServer.Supervisor do
           try_nodes(supervisor, child_spec, rest, shutdown_retries)
 
         {:error, other} ->
-          case other do
-            {:already_started, _} ->
-              Logger.warning(
-                "Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node"
-              )
-
-            _ ->
-              Logger.error(
-                "Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node"
-              )
-          end
+          Logger.error(
+            "Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node"
+          )
 
           try_nodes(supervisor, child_spec, rest, shutdown_retries)
       end
@@ -1182,30 +1178,15 @@ defmodule DurableServer.Supervisor do
                 do: System.monotonic_time(:millisecond) + placement_timeout,
                 else: nil
 
-            case try_remote_placement_with_retry(supervisor, child_spec_with_restart, 3, deadline) do
-              {:ok, result} ->
-                {:ok, result}
-
-              {:error, {:capacity_limit, reason}}
-              when reason in [:no_available_nodes, :all_placement_attempts_failed] ->
-                # Remote placement failed, but we skipped local due to sticky mismatch.
-                # Only fall back to local if our sticky level's time gate has elapsed —
-                # this prevents stealing a server from a node that's just restarting
-                # (e.g., during rolling deploy) while still allowing fallback once
-                # enough time has passed that the preferred node isn't coming back.
-                maybe_fallback_to_local_with_sticky_gate(
-                  supervisor,
-                  module,
-                  key,
-                  stored_object,
-                  child_spec_with_restart,
-                  matching_level,
-                  reason
-                )
-
-              {:error, reason} ->
-                {:error, reason}
-            end
+            await_sticky_placement(
+              supervisor,
+              module,
+              key,
+              stored_object,
+              child_spec_with_restart,
+              matching_level,
+              deadline
+            )
 
           true ->
             # Normal flow: try local first, then remote if capacity exceeded
@@ -1221,6 +1202,63 @@ defmodule DurableServer.Supervisor do
                 {:error, reason}
             end
         end
+    end
+  end
+
+  # When the local node doesn't match sticky placement, poll Group.lookup and attempt
+  # remote placement in a loop until the deadline. The server may be restarted on its
+  # preferred node by LM discovery — we just need to wait for it to appear in Group.
+  # If deadline passes, fall back to the sticky time gate logic.
+  defp await_sticky_placement(
+         supervisor,
+         module,
+         key,
+         stored_object,
+         child_spec,
+         matching_level,
+         deadline
+       ) do
+    # First attempt remote placement (single round, no retry loop — we handle retry here)
+    case try_remote_placement(supervisor, child_spec, 3) do
+      {:ok, result} ->
+        {:ok, result}
+
+      {:error, {:capacity_limit, reason}}
+      when reason in [:no_available_nodes, :all_placement_attempts_failed] ->
+        if deadline != nil and System.monotonic_time(:millisecond) + @placement_retry_interval < deadline do
+          Process.sleep(@placement_retry_interval)
+
+          # Re-check Group — the server may have been restarted on its preferred node
+          case lookup(supervisor, key) do
+            {pid, meta} ->
+              {:ok, {pid, meta}}
+
+            nil ->
+              await_sticky_placement(
+                supervisor,
+                module,
+                key,
+                stored_object,
+                child_spec,
+                matching_level,
+                deadline
+              )
+          end
+        else
+          # Deadline exhausted — fall back to sticky time gate
+          maybe_fallback_to_local_with_sticky_gate(
+            supervisor,
+            module,
+            key,
+            stored_object,
+            child_spec,
+            matching_level,
+            reason
+          )
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
