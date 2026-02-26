@@ -275,7 +275,8 @@ defmodule DurableServer.WatermarkTest do
       assert {:error, {:capacity_limit, :no_available_nodes}} =
                DurableServer.Supervisor.start_child(
                  supervisor_name,
-                 {WatermarkTestServer, %{key: "key1"}}
+                 {WatermarkTestServer, %{key: "key1"}},
+                 placement_timeout: 0
                )
     end
   end

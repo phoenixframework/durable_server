@@ -187,7 +187,8 @@ defmodule DurableServer.RemotePlacementTest do
                DurableServer.Supervisor.start_child(
                  supervisor_name,
                  {RemotePlacementTestServer, %{key: "key2"}},
-                 max_placement_retries: 3
+                 max_placement_retries: 3,
+                 placement_timeout: 0
                )
     end
   end
