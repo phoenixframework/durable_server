@@ -1776,10 +1776,15 @@ defmodule DurableServer.LifecycleManager do
         end)
         |> Enum.reject(&is_nil/1)
         |> Enum.filter(fn {node, health, matching_level, _timestamp} ->
-          # always exclude local node - we only look up eligible nodes after local placement fails
-          # pass matching_level so sticky nodes bypass disk check (child's data is on that node's disk)
+          # Always exclude local node - we only look up eligible nodes after local placement fails.
+          # Pass matching_level so sticky nodes bypass disk check (child's data is on that node's disk).
+          # When sticky_placement is configured, exclude nodes that don't match ANY level.
+          # Without this, non-matching nodes (e.g. Singapore) are merely deprioritized (sort order 999)
+          # but still eligible — and win when preferred nodes are busy. This is consistent with
+          # orphan_claimable? which returns false for nil matching_level.
           node != my_node and
-            can_node_accept_module?(health, module, matching_level: matching_level)
+            can_node_accept_module?(health, module, matching_level: matching_level) and
+            (sticky_placement in [nil, []] or matching_level != nil)
         end)
         # sort: prefer exact sticky placement matches first, then by least busy, then by most recent heartbeat
         |> Enum.sort_by(fn {_node, health, matching_level, timestamp} ->
