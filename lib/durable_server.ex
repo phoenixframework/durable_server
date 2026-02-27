@@ -2614,7 +2614,7 @@ defmodule DurableServer do
   defp erpc_call(node, mod, func, args, timeout \\ 5_000)
        when is_atom(mod) and is_atom(func) and is_list(args) and is_integer(timeout) do
     try do
-      :erpc.call(node, mod, func, args, timeout)
+      DurableServer.Supervisor.safe_erpc_call(node, mod, func, args, timeout)
     catch
       :throw, value -> {:error, {:throw, value}}
       :exit, reason -> {:error, {:exit, reason}}

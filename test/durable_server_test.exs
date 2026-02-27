@@ -414,6 +414,110 @@ defmodule DurableServerTest do
     end
   end
 
+  describe "existing: true" do
+    test "start_child returns {:error, :not_found} when no persisted state exists", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "nonexistent-#{DurableServer.UUID.uuid4()}"
+
+      assert {:error, :not_found} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, %{key: key}},
+                 existing: true
+               )
+    end
+
+    test "start_child starts server when persisted state exists", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "existing-start-#{DurableServer.UUID.uuid4()}"
+
+      # Start, sync, and stop to create valid persisted state
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(supervisor_name, {TestServer, %{key: key}})
+
+      GenServer.call(pid, :increment_and_sync)
+      ref = Process.monitor(pid)
+      GenServer.call(pid, :stop_normal)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+      # Now start_child with existing: true should succeed
+      assert {:ok, {pid2, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, %{key: key}},
+                 existing: true
+               )
+
+      assert Process.alive?(pid2)
+      assert pid2 != pid
+    end
+
+    test "ensure_started_child returns {:error, :not_found} when no persisted state exists", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "nonexistent-ensure-#{DurableServer.UUID.uuid4()}"
+
+      assert {:error, :not_found} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, %{key: key}},
+                 existing: true
+               )
+    end
+
+    test "ensure_started_child starts server when persisted state exists", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "existing-ensure-#{DurableServer.UUID.uuid4()}"
+
+      # Start, sync, and stop to create valid persisted state
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(supervisor_name, {TestServer, %{key: key}})
+
+      GenServer.call(pid, :increment_and_sync)
+      ref = Process.monitor(pid)
+      GenServer.call(pid, :stop_normal)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+      # Now ensure_started_child with existing: true should succeed
+      assert {:ok, {pid2, _meta}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, %{key: key}},
+                 existing: true
+               )
+
+      assert Process.alive?(pid2)
+      assert pid2 != pid
+    end
+
+    test "ensure_started_child returns already-running process even without persisted state", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "already-running-#{DurableServer.UUID.uuid4()}"
+
+      # Start a process first (creates persisted state)
+      {:ok, {pid1, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, %{key: key}}
+        )
+
+      # ensure_started_child with existing: true should find it via lookup
+      # (before reaching the S3 check)
+      {:ok, {pid2, _meta}} =
+        DurableServer.Supervisor.ensure_started_child(
+          supervisor_name,
+          {TestServer, %{key: key}},
+          existing: true
+        )
+
+      assert pid1 == pid2
+    end
+  end
+
   describe "init/2 with info map" do
     test "receives built-in supervisor info", %{supervisor_name: supervisor_name} do
       key = "init-info-test-#{DurableServer.UUID.uuid4()}"

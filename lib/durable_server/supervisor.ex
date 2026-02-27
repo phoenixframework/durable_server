@@ -585,57 +585,83 @@ defmodule DurableServer.Supervisor do
       end
   """
   def start_child(supervisor, {module, init_arg} = child_spec, opts \\ []) do
-    opts = Keyword.validate!(opts, [:max_placement_retries, :local_only, :placement_timeout])
-    local_only = Keyword.get(opts, :local_only, false)
+    opts =
+      Keyword.validate!(opts, [:max_placement_retries, :local_only, :placement_timeout, :existing])
 
-    max_placement_retries =
-      if local_only, do: 0, else: Keyword.get(opts, :max_placement_retries, 3)
+    with :ok <- check_existing(supervisor, init_arg, Keyword.get(opts, :existing, false)) do
+      local_only = Keyword.get(opts, :local_only, false)
 
-    placement_timeout = Keyword.get(opts, :placement_timeout, @default_placement_timeout)
+      max_placement_retries =
+        if local_only, do: 0, else: Keyword.get(opts, :max_placement_retries, 3)
 
-    # When max_placement_retries is 0, this is a remote placement call from another node.
-    # Wait for the supervisor to be ready to handle the race where RPC arrives before
-    # ETS tables are created during node startup/rolling deploys.
-    if max_placement_retries == 0 do
-      case wait_until_ready(supervisor) do
-        :ok ->
-          :ok
+      placement_timeout = Keyword.get(opts, :placement_timeout, @default_placement_timeout)
 
-        {:error, :timeout} ->
-          Logger.warning(
-            "DurableServer.Supervisor #{inspect(supervisor)} not ready after #{@default_ready_timeout}ms on remote placement"
+      # When max_placement_retries is 0, this is a remote placement call from another node.
+      # Wait for the supervisor to be ready to handle the race where RPC arrives before
+      # ETS tables are created during node startup/rolling deploys.
+      if max_placement_retries == 0 do
+        case wait_until_ready(supervisor) do
+          :ok ->
+            :ok
+
+          {:error, :timeout} ->
+            Logger.warning(
+              "DurableServer.Supervisor #{inspect(supervisor)} not ready after #{@default_ready_timeout}ms on remote placement"
+            )
+
+            # Return error so caller can try another node
+            throw({:error, :not_ready})
+        end
+      end
+
+      case do_start_child(supervisor, {module, init_arg}, 0) do
+        {:ok, result} ->
+          {:ok, result}
+
+        {:error, {:capacity_limit, reason}} when max_placement_retries > 0 ->
+          Logger.info("""
+          DurableServer local capacity exceeded for #{inspect(module)} on #{Node.self()}
+          Reason: #{inspect(reason)}
+          Attempting remote placement (max retries: #{max_placement_retries})
+          """)
+
+          deadline =
+            if placement_timeout,
+              do: System.monotonic_time(:millisecond) + placement_timeout,
+              else: nil
+
+          try_remote_placement_with_retry(
+            supervisor,
+            child_spec,
+            max_placement_retries,
+            deadline
           )
 
-          # Return error so caller can try another node
-          throw({:error, :not_ready})
+        error ->
+          error
       end
     end
+  end
 
-    case do_start_child(supervisor, {module, init_arg}, 0) do
-      {:ok, result} ->
-        {:ok, result}
+  defp check_existing(_supervisor, _init_arg, false), do: :ok
 
-      {:error, {:capacity_limit, reason}} when max_placement_retries > 0 ->
-        Logger.info("""
-        DurableServer local capacity exceeded for #{inspect(module)} on #{Node.self()}
-        Reason: #{inspect(reason)}
-        Attempting remote placement (max retries: #{max_placement_retries})
-        """)
+  defp check_existing(supervisor, init_arg, true) do
+    key =
+      case init_arg do
+        %{key: key} ->
+          key
 
-        deadline =
-          if placement_timeout,
-            do: System.monotonic_time(:millisecond) + placement_timeout,
-            else: nil
+        _ ->
+          raise ArgumentError,
+                "existing: true requires init_arg to be a map with :key field, got: #{inspect(init_arg)}"
+      end
 
-        try_remote_placement_with_retry(
-          supervisor,
-          child_spec,
-          max_placement_retries,
-          deadline
-        )
+    config = __get_config__(supervisor)
+    storage_key = config.prefix <> key
 
-      error ->
-        error
+    case ObjectStore.get_object(config.object_store, storage_key) do
+      {:ok, _} -> :ok
+      {:error, _} -> {:error, :not_found}
     end
   end
 
@@ -746,7 +772,7 @@ defmodule DurableServer.Supervisor do
                      }) do
                   {:healthy, _node_ref} ->
                     try do
-                      case :erpc.call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
+                      case safe_erpc_call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
                         {pid, meta} when is_pid(pid) ->
                           {:error, {:already_started, {pid, meta}}}
 
@@ -824,7 +850,10 @@ defmodule DurableServer.Supervisor do
         {:error, {:capacity_limit, :no_available_nodes}}
 
       nodes ->
-        try_nodes(supervisor, child_spec, nodes)
+        try_nodes(supervisor, child_spec, nodes,
+          key: key,
+          sticky_placement: sticky_placement
+        )
     end
   end
 
@@ -931,21 +960,20 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp try_nodes(supervisor, child_spec, nodes) do
-    try_nodes(supervisor, child_spec, nodes, _shutdown_retries = 0)
-  end
+  defp try_nodes(supervisor, child_spec, nodes, placement_opts \\ [])
 
-  defp try_nodes(_supervisor, _child_spec, [], _shutdown_retries) do
+  defp try_nodes(_supervisor, _child_spec, [], _placement_opts) do
     {:error, {:capacity_limit, :all_placement_attempts_failed}}
   end
 
-  defp try_nodes(supervisor, {module, _init_arg} = child_spec, [node | rest], shutdown_retries) do
+  defp try_nodes(supervisor, {module, _init_arg} = child_spec, [node | rest], placement_opts) do
     Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
+    shutdown_retries = Keyword.get(placement_opts, :shutdown_retries, 0)
 
     # NOTE: we MUST pass max_placement_retries: 0 to prevent recursive retry on the other side
     try do
       result =
-        :erpc.call(node, __MODULE__, :start_child, [
+        safe_erpc_call(node, __MODULE__, :start_child, [
           supervisor,
           child_spec,
           [max_placement_retries: 0]
@@ -965,27 +993,25 @@ defmodule DurableServer.Supervisor do
             "Node #{inspect(node)} also at capacity: #{inspect(reason)}, trying next node"
           )
 
-          try_nodes(supervisor, child_spec, rest, shutdown_retries)
+          try_nodes(supervisor, child_spec, rest, placement_opts)
 
         {:error, other} ->
-          Logger.error(
-            "Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node"
-          )
+          Logger.error("Failed to start on #{inspect(node)}: #{inspect(other)}, trying next node")
 
-          try_nodes(supervisor, child_spec, rest, shutdown_retries)
+          try_nodes(supervisor, child_spec, rest, placement_opts)
       end
     catch
       :throw, {:error, :not_ready} ->
         Logger.warning("Node #{inspect(node)} not ready (still starting up), trying next node")
 
-        try_nodes(supervisor, child_spec, rest, shutdown_retries)
+        try_nodes(supervisor, child_spec, rest, placement_opts)
 
       :error, {:erpc, erpc_reason} ->
         Logger.warning(
           "ERPC to #{inspect(node)} failed: #{inspect(erpc_reason)}, trying next node"
         )
 
-        try_nodes(supervisor, child_spec, rest, shutdown_retries)
+        try_nodes(supervisor, child_spec, rest, placement_opts)
 
       :exit, {:exception, {:shutdown, _}} when rest == [] and shutdown_retries < 1 ->
         # All nodes exhausted due to shutdown - wait briefly and retry with fresh node list
@@ -998,7 +1024,8 @@ defmodule DurableServer.Supervisor do
         fresh_nodes =
           LifecycleManager.find_eligible_nodes(supervisor, module,
             limit: 3,
-            exclude_nodes: [node]
+            key: Keyword.get(placement_opts, :key),
+            sticky_placement: Keyword.get(placement_opts, :sticky_placement)
           )
 
         case fresh_nodes do
@@ -1006,13 +1033,28 @@ defmodule DurableServer.Supervisor do
             {:error, {:capacity_limit, :all_placement_attempts_failed}}
 
           nodes ->
-            try_nodes(supervisor, child_spec, nodes, shutdown_retries + 1)
+            try_nodes(
+              supervisor,
+              child_spec,
+              nodes,
+              Keyword.put(placement_opts, :shutdown_retries, shutdown_retries + 1)
+            )
         end
 
       :exit, {:exception, {:shutdown, _}} ->
         Logger.warning("Node #{inspect(node)} is shutting down, trying next node")
 
-        try_nodes(supervisor, child_spec, rest, shutdown_retries)
+        try_nodes(supervisor, child_spec, rest, placement_opts)
+
+      kind, reason ->
+        # Catch-all for unexpected remote errors (e.g., ArgumentError from missing ETS
+        # tables during shutdown). Treat as node failure and try next node instead of
+        # crashing the caller.
+        Logger.warning(
+          "Unexpected #{kind} from #{inspect(node)}: #{inspect(reason)}, trying next node"
+        )
+
+        try_nodes(supervisor, child_spec, rest, placement_opts)
     end
   end
 
@@ -1084,6 +1126,8 @@ defmodule DurableServer.Supervisor do
         config = __get_config__(supervisor)
         storage_key = config.prefix <> key
 
+        existing = Keyword.get(opts, :existing, false)
+
         {stored_object, sticky_placement} =
           case ObjectStore.get_object(config.object_store, storage_key) do
             {:ok, %{body: body, etag: etag}} ->
@@ -1097,110 +1141,118 @@ defmodule DurableServer.Supervisor do
               {nil, nil}
           end
 
-        # Check if we should respect sticky placement and skip local start
-        # Also track matching_level for time-gated fallback when remote placement fails
-        # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
-        # When local_only: true, never skip local — ignore sticky placement preferences
-        {should_skip_local, is_sticky_local, matching_level} =
-          if local_only do
-            {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
-          else
-            case sticky_placement do
+        if existing and stored_object == nil do
+          {:error, :not_found}
+        else
+          # Check if we should respect sticky placement and skip local start
+          # Also track matching_level for time-gated fallback when remote placement fails
+          # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
+          # When local_only: true, never skip local — ignore sticky placement preferences
+          {should_skip_local, is_sticky_local, matching_level} =
+            if local_only do
+              {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
+            else
+              case sticky_placement do
+                nil ->
+                  # No sticky placement, proceed with normal local-first logic
+                  {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
+
+                [%{env_var: :any, value: :any} | _] ->
+                  # First level is :any, so local node is acceptable but we don't know
+                  # if data is specifically here (could have been on any node)
+                  {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
+
+                placement ->
+                  # Have specific sticky placement (first element is not :any)
+                  # Check if local node matches
+                  env_var_names =
+                    DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
+
+                  my_env_vars =
+                    env_var_names
+                    |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
+                    |> Enum.into(%{})
+
+                  # Check if we match any level (0 = exact, 1 = less specific, etc.)
+                  my_matching_level =
+                    Enum.find_index(placement, fn preference ->
+                      case preference do
+                        %{env_var: :any, value: :any} ->
+                          true
+
+                        %{env_var: env_var, value: expected_value} ->
+                          Map.get(my_env_vars, env_var) == expected_value
+
+                        _ ->
+                          false
+                      end
+                    end)
+
+                  # Skip local start only if we don't match level 0 (exact match)
+                  # This ensures servers stay on their sticky placement node for specific matches
+                  if my_matching_level == 0 do
+                    # Level 0 match with specific env var - use local, bypass disk check
+                    # (we know it's specific because :any at level 0 is handled above)
+                    {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
+                  else
+                    # Level > 0 match or nil (no match) - skip local to try remote first
+                    {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
+                  end
+              end
+            end
+
+          # Use {:restart, ...} pattern if we have stored object, otherwise regular init
+          # Include is_sticky_local flag for disk check bypass when restarting on sticky node
+          child_spec_with_restart =
+            case stored_object do
+              {:ok, %{body: body, etag: etag}} ->
+                {module,
+                 {:restart, %{key: key, body: body, etag: etag, is_sticky_local: is_sticky_local}}}
+
               nil ->
-                # No sticky placement, proceed with normal local-first logic
-                {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
-
-              [%{env_var: :any, value: :any} | _] ->
-                # First level is :any, so local node is acceptable but we don't know
-                # if data is specifically here (could have been on any node)
-                {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
-
-              placement ->
-                # Have specific sticky placement (first element is not :any)
-                # Check if local node matches
-                env_var_names =
-                  DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
-
-                my_env_vars =
-                  env_var_names
-                  |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
-                  |> Enum.into(%{})
-
-                # Check if we match any level (0 = exact, 1 = less specific, etc.)
-                my_matching_level =
-                  Enum.find_index(placement, fn preference ->
-                    case preference do
-                      %{env_var: :any, value: :any} ->
-                        true
-
-                      %{env_var: env_var, value: expected_value} ->
-                        Map.get(my_env_vars, env_var) == expected_value
-
-                      _ ->
-                        false
-                    end
-                  end)
-
-                # Skip local start only if we don't match level 0 (exact match)
-                # This ensures servers stay on their sticky placement node for specific matches
-                if my_matching_level == 0 do
-                  # Level 0 match with specific env var - use local, bypass disk check
-                  # (we know it's specific because :any at level 0 is handled above)
-                  {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
-                else
-                  # Level > 0 match or nil (no match) - skip local to try remote first
-                  {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
-                end
+                child_spec
             end
+
+          # If we should skip local due to sticky placement, go straight to remote placement
+          cond do
+            should_skip_local ->
+              Logger.info(
+                "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
+              )
+
+              deadline =
+                if placement_timeout,
+                  do: System.monotonic_time(:millisecond) + placement_timeout,
+                  else: nil
+
+              await_sticky_placement(
+                supervisor,
+                module,
+                key,
+                stored_object,
+                child_spec_with_restart,
+                matching_level,
+                deadline
+              )
+
+            true ->
+              # Normal flow: try local first, then remote if capacity exceeded
+              case start_child(
+                     supervisor,
+                     child_spec_with_restart,
+                     Keyword.delete(opts, :existing)
+                   ) do
+                {:ok, {pid, meta}} ->
+                  {:ok, {pid, meta}}
+
+                {:error, {:already_started, other}} ->
+                  {other_pid, other_meta} = other
+                  {:ok, {other_pid, other_meta}}
+
+                {:error, reason} ->
+                  {:error, reason}
+              end
           end
-
-        # Use {:restart, ...} pattern if we have stored object, otherwise regular init
-        # Include is_sticky_local flag for disk check bypass when restarting on sticky node
-        child_spec_with_restart =
-          case stored_object do
-            {:ok, %{body: body, etag: etag}} ->
-              {module,
-               {:restart, %{key: key, body: body, etag: etag, is_sticky_local: is_sticky_local}}}
-
-            nil ->
-              child_spec
-          end
-
-        # If we should skip local due to sticky placement, go straight to remote placement
-        cond do
-          should_skip_local ->
-            Logger.info(
-              "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
-            )
-
-            deadline =
-              if placement_timeout,
-                do: System.monotonic_time(:millisecond) + placement_timeout,
-                else: nil
-
-            await_sticky_placement(
-              supervisor,
-              module,
-              key,
-              stored_object,
-              child_spec_with_restart,
-              matching_level,
-              deadline
-            )
-
-          true ->
-            # Normal flow: try local first, then remote if capacity exceeded
-            case start_child(supervisor, child_spec_with_restart, opts) do
-              {:ok, {pid, meta}} ->
-                {:ok, {pid, meta}}
-
-              {:error, {:already_started, other}} ->
-                {other_pid, other_meta} = other
-                {:ok, {other_pid, other_meta}}
-
-              {:error, reason} ->
-                {:error, reason}
-            end
         end
     end
   end
@@ -1225,7 +1277,8 @@ defmodule DurableServer.Supervisor do
 
       {:error, {:capacity_limit, reason}}
       when reason in [:no_available_nodes, :all_placement_attempts_failed] ->
-        if deadline != nil and System.monotonic_time(:millisecond) + @placement_retry_interval < deadline do
+        if deadline != nil and
+             System.monotonic_time(:millisecond) + @placement_retry_interval < deadline do
           Process.sleep(@placement_retry_interval)
 
           # Re-check Group — the server may have been restarted on its preferred node
@@ -1465,7 +1518,7 @@ defmodule DurableServer.Supervisor do
 
         try do
           result =
-            :erpc.call(target_node, __MODULE__, :start_child, [
+            safe_erpc_call(target_node, __MODULE__, :start_child, [
               supervisor,
               child_spec,
               [max_placement_retries: 0]
@@ -1833,6 +1886,25 @@ defmodule DurableServer.Supervisor do
     ]
 
     Supervisor.init(children, strategy: :one_for_all)
+  end
+
+  @doc false
+  def safe_erpc_call(node, mod, func, args, timeout \\ 5_000) do
+    :erpc.call(node, __MODULE__, :__safe_apply__, [mod, func, args], timeout)
+  catch
+    # __safe_apply__ raises {:erpc, :noconnection} when the remote node is stopping,
+    # but erpc wraps remote exceptions as {:exception, reason, stacktrace}.
+    # Re-raise as the native erpc error so callers' catch patterns match.
+    :error, {:exception, {:erpc, :noconnection}, _stacktrace} ->
+      :erlang.error({:erpc, :noconnection})
+  end
+
+  @doc false
+  def __safe_apply__(mod, func, args) do
+    case :init.get_status() do
+      {:stopping, _} -> :erlang.error({:erpc, :noconnection})
+      _ -> apply(mod, func, args)
+    end
   end
 
   @doc false

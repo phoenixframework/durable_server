@@ -145,6 +145,7 @@ defmodule DurableServer.LifecycleManager do
   # TTL ensures churned objects don't accumulate unbounded memory.
   @discovery_skip_ttl_ms :timer.minutes(10)
   @discovery_skip_sweep_interval_ms :timer.minutes(5)
+  @heartbeat_group_key "__heartbeat"
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
@@ -248,7 +249,11 @@ defmodule DurableServer.LifecycleManager do
 
     # we MUST start with a populated node heartbeat cache
     # perform_heartbeat writes our heartbeat and refreshes the node health cache
-    timing = perform_heartbeat(state)
+    {timing, heartbeat_entry} = perform_heartbeat(state)
+
+    # Join Group with heartbeat data so other nodes see us instantly via peer_connect.
+    # S3 is the source of truth for liveness; Group is the fast path for discovery.
+    join_group_heartbeat(state, heartbeat_entry)
 
     {:ok,
      %{
@@ -298,11 +303,12 @@ defmodule DurableServer.LifecycleManager do
     case state.current_heartbeat_task do
       %Task{ref: ref} ->
         receive do
-          {^ref, {:heartbeat, timing}} ->
+          {^ref, {:heartbeat, {timing, heartbeat_entry}}} ->
             # Heartbeat actually succeeded! Don't crash, but log the close call.
             Process.demonitor(ref, [:flush])
             now = System.system_time(:millisecond)
             Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
+            join_group_heartbeat(state, heartbeat_entry)
 
             log(state, :warning, fn ->
               "heartbeat narrowly beat deadline: #{timing.total_ms}ms (put: #{timing.put_ms}ms, cache: #{timing.cache_ms}ms), deadline was #{deadline_ms}ms"
@@ -397,7 +403,7 @@ defmodule DurableServer.LifecycleManager do
   end
 
   def handle_info(
-        {ref, {:heartbeat, timing}},
+        {ref, {:heartbeat, {timing, heartbeat_entry}}},
         %LifecycleManager{current_heartbeat_task: %Task{ref: ref}} = state
       ) do
     # heartbeat task completed successfully, cancel deadline timer and schedule next run
@@ -407,6 +413,10 @@ defmodule DurableServer.LifecycleManager do
 
     Process.demonitor(ref, [:flush])
     Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
+
+    # Update Group PG membership with fresh heartbeat data.
+    # This must run in the LM process (not the task) so the PG entry is owned by the LM pid.
+    join_group_heartbeat(state, heartbeat_entry)
 
     # Log timing at info level if heartbeat took longer than expected (>5s)
     if timing.total_ms > 5000 do
@@ -485,22 +495,27 @@ defmodule DurableServer.LifecycleManager do
     # Do the critical heartbeat PUT inline
     put_start = System.monotonic_time(:millisecond)
 
-    case write_node_heartbeat(state) do
-      :ok ->
-        put_duration = System.monotonic_time(:millisecond) - put_start
-        log(state, :debug, fn -> "Node heartbeat written successfully in #{put_duration}ms" end)
+    heartbeat_entry =
+      case write_node_heartbeat(state) do
+        {:ok, entry} ->
+          log(state, :debug, fn ->
+            put_duration = System.monotonic_time(:millisecond) - put_start
+            "Node heartbeat written successfully in #{put_duration}ms"
+          end)
 
-      {:error, reason} ->
-        put_duration = System.monotonic_time(:millisecond) - put_start
+          entry
 
-        # Kill the cache task since we're going to crash anyway
-        Task.shutdown(cache_task, :brutal_kill)
+        {:error, reason} ->
+          put_duration = System.monotonic_time(:millisecond) - put_start
 
-        # we must fail the DurableSupervisor tree (one_for_all) if we fail to heartbeat because our
-        # children will become orphan claimable and if we can't reach object storage we are in a failed state
-        raise RuntimeError,
-              "failed to write node heartbeat after #{@max_heartbeat_retries} attempts (#{put_duration}ms): #{inspect(reason)}"
-    end
+          # Kill the cache task since we're going to crash anyway
+          Task.shutdown(cache_task, :brutal_kill)
+
+          # we must fail the DurableSupervisor tree (one_for_all) if we fail to heartbeat because our
+          # children will become orphan claimable and if we can't reach object storage we are in a failed state
+          raise RuntimeError,
+                "failed to write node heartbeat after #{@max_heartbeat_retries} attempts (#{put_duration}ms): #{inspect(reason)}"
+      end
 
     put_duration = System.monotonic_time(:millisecond) - put_start
 
@@ -528,7 +543,8 @@ defmodule DurableServer.LifecycleManager do
     :ok = CircuitBreaker.prune_stale_entries(state.circuit_breaker)
 
     total_duration = System.monotonic_time(:millisecond) - start_time
-    %{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration}
+
+    {%{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration}, heartbeat_entry}
   end
 
   defp log(%LifecycleManager{} = state, level, func)
@@ -591,15 +607,14 @@ defmodule DurableServer.LifecycleManager do
           [max_retries: @max_heartbeat_retries, timeout: remaining_ms]
       end
 
+    entry = {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
+
     case ObjectStore.put_object(state.object_store, key, json_data, put_opts) do
       {:ok, _} ->
         # update local ets cache with full capacity info
-        :ets.insert(
-          state.heartbeat_table,
-          {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
-        )
+        :ets.insert(state.heartbeat_table, entry)
 
-        :ok
+        {:ok, entry}
 
       {:error, reason} ->
         {:error, reason}
@@ -741,6 +756,29 @@ defmodule DurableServer.LifecycleManager do
 
   defp heartbeat_table_name(supervisor_name) when is_atom(supervisor_name) do
     :"durable_server_heartbeats_#{supervisor_name}"
+  end
+
+  # Join the Group heartbeat PG key with our heartbeat metadata so other nodes
+  # discover us instantly via peer_connect (instead of waiting for S3 cache refresh).
+  # Must be called from the LM process so the PG entry is owned by the LM pid.
+  # Gracefully handles Group not being available (e.g., standalone LM tests).
+  defp join_group_heartbeat(
+         %LifecycleManager{supervisor_name: sup} = _state,
+         {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
+       ) do
+    meta = %{
+      node: node_str,
+      node_ref: node_ref,
+      timestamp: timestamp,
+      capacity: capacity,
+      resources: resources,
+      env_vars: env_vars,
+      heartbeat_meta: heartbeat_meta
+    }
+
+    Group.join(sup, @heartbeat_group_key, meta)
+  rescue
+    _ -> :ok
   end
 
   @doc """
@@ -1746,15 +1784,18 @@ defmodule DurableServer.LifecycleManager do
 
         now = System.system_time(:millisecond)
 
-        # scan ETS cache for all live nodes
-        :ets.tab2list(heartbeat_table)
+        # Merge two data sources per node, picking whichever has the more recent timestamp:
+        # 1. S3 heartbeat ETS cache — source of truth for "can this node reach S3?"
+        # 2. Group PG members — fast path, gives instant discovery via peer_connect
+        # Liveness is ALWAYS computed from timestamp, never from mere Group presence.
+        merged_nodes = merge_heartbeat_sources(supervisor_name, heartbeat_table, now)
+
+        merged_nodes
         |> Enum.map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars,
                         _heartbeat_meta} ->
           try do
             node = String.to_existing_atom(node_str)
 
-            # Check if heartbeat is fresh enough to consider the node healthy
-            # Use same threshold as orphan claiming to determine node staleness
             heartbeat_age_ms = now - timestamp
 
             health =
@@ -1764,41 +1805,77 @@ defmodule DurableServer.LifecycleManager do
                 :stale
               end
 
-            # Calculate sticky placement matching level for this node
             matching_level = find_matching_level(sticky_placement, env_vars)
 
             {node, health, matching_level, timestamp}
           rescue
             ArgumentError ->
-              # String.to_existing_atom failed - node atom doesn't exist yet
               nil
           end
         end)
         |> Enum.reject(&is_nil/1)
         |> Enum.filter(fn {node, health, matching_level, _timestamp} ->
-          # Always exclude local node - we only look up eligible nodes after local placement fails.
-          # Pass matching_level so sticky nodes bypass disk check (child's data is on that node's disk).
-          # When sticky_placement is configured, exclude nodes that don't match ANY level.
-          # Without this, non-matching nodes (e.g. Singapore) are merely deprioritized (sort order 999)
-          # but still eligible — and win when preferred nodes are busy. This is consistent with
-          # orphan_claimable? which returns false for nil matching_level.
           node != my_node and
             can_node_accept_module?(health, module, matching_level: matching_level) and
             (sticky_placement in [nil, []] or matching_level != nil)
         end)
-        # sort: prefer exact sticky placement matches first, then by least busy, then by most recent heartbeat
         |> Enum.sort_by(fn {_node, health, matching_level, timestamp} ->
-          # Lower matching_level is better (0 = exact match, 1 = less specific, etc.)
-          # nil means no match, treat as worst
           level_priority = if matching_level == nil, do: 999, else: matching_level
           busyness = calculate_node_busyness(health, module)
-          # Negate timestamp so more recent (higher timestamp) comes first
           staleness = -timestamp
           {level_priority, busyness, staleness}
         end)
         |> Enum.take(limit)
         |> Enum.map(fn {node, _health, _matching_level, _timestamp} -> node end)
     end
+  end
+
+  # Merge heartbeat data from S3 ETS cache and Group PG members.
+  # For each node present in both sources, pick the entry with the more recent timestamp.
+  # Returns a list of heartbeat tuples in the same shape as the ETS entries.
+  defp merge_heartbeat_sources(supervisor_name, heartbeat_table, _now) do
+    # Start with ETS cache as the base (keyed by node_str)
+    ets_entries = :ets.tab2list(heartbeat_table)
+
+    ets_map =
+      Map.new(ets_entries, fn {node_str, _node_ref, _ts, _cap, _res, _env, _meta} = entry ->
+        {node_str, entry}
+      end)
+
+    # Overlay Group PG members — each member is {pid, meta} where meta contains heartbeat data
+    group_entries =
+      try do
+        Group.members(supervisor_name, @heartbeat_group_key)
+      rescue
+        # Group not started yet, or supervisor name not registered
+        _ -> []
+      end
+
+    merged =
+      Enum.reduce(group_entries, ets_map, fn {_pid, meta}, acc ->
+        node_str = meta.node
+        group_ts = meta.timestamp
+
+        group_entry =
+          {node_str, meta.node_ref, group_ts, meta.capacity, meta.resources, meta.env_vars,
+           meta.heartbeat_meta}
+
+        case Map.get(acc, node_str) do
+          nil ->
+            # Node only in Group (new node, not yet in S3 cache) — use Group data
+            Map.put(acc, node_str, group_entry)
+
+          {_ns, _nr, ets_ts, _c, _r, _e, _m} when group_ts > ets_ts ->
+            # Group data is more recent — use it
+            Map.put(acc, node_str, group_entry)
+
+          _ets_entry ->
+            # ETS data is same age or more recent — keep it
+            acc
+        end
+      end)
+
+    Map.values(merged)
   end
 
   # Find which sticky placement level matches the given env_vars from a node's heartbeat
