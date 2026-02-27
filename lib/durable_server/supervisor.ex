@@ -76,7 +76,8 @@ defmodule DurableServer.Supervisor do
   - `:module_circuit_breaker_cooldown_ms` - Cooldown period when module circuit breaker opens
     (default: 600_000 = 10 minutes)
   - `:object_store` - The configured `DurableServer.ObjectStore`. Defaults to preconfigured store.
-  - `:max_cpu` - Maximum CPU usage percentage (1-100) before rejecting new children on this node.
+  - `:max_cpu` - Maximum CPU usage percentage before rejecting new children on this node.
+    Values above 100 are valid since CPU load can exceed 100% when the run queue is larger than the core count.
     When CPU usage reaches this threshold, new placements will be routed to other nodes.
   - `:max_memory` - Maximum memory usage percentage (1-100) before rejecting new children on this node.
     When memory usage reaches this threshold, new placements will be routed to other nodes.
@@ -1957,9 +1958,20 @@ defmodule DurableServer.Supervisor do
         raise ArgumentError,
               "max_children must be :infinity, integer, or map (%{:total => 123, MyModule => 456}), got: #{inspect(other)}"
     end
-    |> maybe_add_limit(:max_cpu, opts[:max_cpu])
+    |> maybe_add_cpu_limit(opts[:max_cpu])
     |> maybe_add_limit(:max_memory, opts[:max_memory])
     |> maybe_add_disk_limit(opts[:max_disk])
+  end
+
+  defp maybe_add_cpu_limit(limits, nil), do: limits
+
+  defp maybe_add_cpu_limit(limits, value) when is_integer(value) and value > 0 do
+    Map.put(limits, :max_cpu, value)
+  end
+
+  defp maybe_add_cpu_limit(_limits, value) do
+    raise ArgumentError,
+          "max_cpu must be a positive integer, got: #{inspect(value)}"
   end
 
   defp maybe_add_disk_limit(limits, nil), do: limits
