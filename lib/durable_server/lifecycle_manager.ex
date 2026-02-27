@@ -122,7 +122,8 @@ defmodule DurableServer.LifecycleManager do
             heartbeat_deadline_timer: nil,
             # Last successful heartbeat timing for diagnostics
             last_heartbeat_timing: nil,
-            discovery_skip_table: nil
+            discovery_skip_table: nil,
+            discovery_stopped: false
 
   @max_heartbeat_retries 3
   # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold
@@ -147,8 +148,11 @@ defmodule DurableServer.LifecycleManager do
   @discovery_skip_sweep_interval_ms :timer.minutes(5)
   @heartbeat_group_key "__heartbeat"
 
+  def name(supervisor_name), do: :"#{supervisor_name}_lifecycle_manager"
+
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts)
+    supervisor_name = Keyword.fetch!(opts, :supervisor_name)
+    GenServer.start_link(__MODULE__, opts, name: name(supervisor_name))
   end
 
   @doc """
@@ -162,17 +166,11 @@ defmodule DurableServer.LifecycleManager do
   This is used by the admin dashboard to monitor heartbeat health across the cluster.
   """
   def get_heartbeat_metrics(supervisor_name) when is_atom(supervisor_name) do
-    lifecycle_manager = get_lifecycle_manager_pid(supervisor_name)
-    GenServer.call(lifecycle_manager, :get_heartbeat_metrics)
+    GenServer.call(name(supervisor_name), :get_heartbeat_metrics)
   end
 
-  defp get_lifecycle_manager_pid(supervisor_name) do
-    children = Supervisor.which_children(supervisor_name)
-
-    Enum.find_value(children, fn
-      {DurableServer.LifecycleManager, pid, :worker, _} when is_pid(pid) -> pid
-      _ -> nil
-    end)
+  def stop_discovery(supervisor_name) do
+    GenServer.call(name(supervisor_name), :stop_discovery)
   end
 
   def init(opts) do
@@ -373,6 +371,10 @@ defmodule DurableServer.LifecycleManager do
     {:noreply, state}
   end
 
+  def handle_info(:discover_and_restart, %LifecycleManager{discovery_stopped: true} = state) do
+    {:noreply, state}
+  end
+
   def handle_info(:discover_and_restart, %LifecycleManager{} = state) do
     with %Task{ref: ref} <- state.current_discovery_task do
       Process.demonitor(ref, [:flush])
@@ -394,7 +396,11 @@ defmodule DurableServer.LifecycleManager do
     case state do
       %LifecycleManager{current_discovery_task: %Task{ref: ^ref}} ->
         Process.demonitor(ref, [:flush])
-        Process.send_after(self(), :discover_and_restart, state.discovery_interval_ms)
+
+        unless state.discovery_stopped do
+          Process.send_after(self(), :discover_and_restart, state.discovery_interval_ms)
+        end
+
         {:noreply, %{state | current_discovery_task: nil}}
 
       %LifecycleManager{} ->
@@ -459,6 +465,20 @@ defmodule DurableServer.LifecycleManager do
     end)
 
     {:stop, {:heartbeat_failed, reason}, state}
+  end
+
+  def handle_call(:stop_discovery, _from, %LifecycleManager{} = state) do
+    state =
+      case state.current_discovery_task do
+        %Task{} = task ->
+          Task.shutdown(task, :brutal_kill)
+          %{state | current_discovery_task: nil}
+
+        nil ->
+          state
+      end
+
+    {:reply, :ok, %{state | discovery_stopped: true}}
   end
 
   def handle_call(:get_heartbeat_metrics, _from, %LifecycleManager{} = state) do

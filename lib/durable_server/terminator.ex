@@ -75,6 +75,12 @@ defmodule DurableServer.Terminator do
       "Terminator initiating graceful shutdown for #{state.supervisor_name}: #{inspect(reason)}"
     )
 
+    try do
+      DurableServer.LifecycleManager.stop_discovery(state.supervisor_name)
+    catch
+      :exit, _ -> :ok
+    end
+
     perform_graceful_shutdown(state)
   end
 

@@ -584,11 +584,12 @@ defmodule DurableServer.Supervisor do
         end
       end
   """
-  def start_child(supervisor, {module, init_arg} = child_spec, opts \\ []) do
+  def start_child(supervisor, {module, init_arg}, opts \\ []) do
     opts =
       Keyword.validate!(opts, [:max_placement_retries, :local_only, :placement_timeout, :existing])
 
-    with :ok <- check_existing(supervisor, init_arg, Keyword.get(opts, :existing, false)) do
+    with {:ok, init_arg} <-
+           check_existing(supervisor, init_arg, Keyword.get(opts, :existing, false)) do
       local_only = Keyword.get(opts, :local_only, false)
 
       max_placement_retries =
@@ -614,7 +615,9 @@ defmodule DurableServer.Supervisor do
         end
       end
 
-      case do_start_child(supervisor, {module, init_arg}, 0) do
+      child_spec = {module, init_arg}
+
+      case do_start_child(supervisor, child_spec, 0) do
         {:ok, result} ->
           {:ok, result}
 
@@ -643,7 +646,7 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp check_existing(_supervisor, _init_arg, false), do: :ok
+  defp check_existing(_supervisor, init_arg, false), do: {:ok, init_arg}
 
   defp check_existing(supervisor, init_arg, true) do
     key =
@@ -660,8 +663,11 @@ defmodule DurableServer.Supervisor do
     storage_key = config.prefix <> key
 
     case ObjectStore.get_object(config.object_store, storage_key) do
-      {:ok, _} -> :ok
-      {:error, _} -> {:error, :not_found}
+      {:ok, %{body: body, etag: etag}} ->
+        {:ok, {:restart, %{key: key, body: body, etag: etag}}}
+
+      {:error, _} ->
+        {:error, :not_found}
     end
   end
 
