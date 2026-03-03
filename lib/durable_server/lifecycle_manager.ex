@@ -123,7 +123,8 @@ defmodule DurableServer.LifecycleManager do
             # Last successful heartbeat timing for diagnostics
             last_heartbeat_timing: nil,
             discovery_skip_table: nil,
-            discovery_stopped: false
+            discovery_stopped: false,
+            discovery_burst_remaining: 0
 
   @max_heartbeat_retries 3
   # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold
@@ -225,7 +226,8 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_interval_ms: config.heartbeat_interval_ms,
       capacity_limits: capacity_limits,
       heartbeat_meta: heartbeat_meta,
-      discovery_skip_table: skip_tab
+      discovery_skip_table: skip_tab,
+      discovery_burst_remaining: Map.get(config, :discovery_burst_count, 0)
     }
 
     # schedule periodic resource checks if limits configured
@@ -396,12 +398,18 @@ defmodule DurableServer.LifecycleManager do
     case state do
       %LifecycleManager{current_discovery_task: %Task{ref: ^ref}} ->
         Process.demonitor(ref, [:flush])
+        state = %{state | current_discovery_task: nil}
 
-        unless state.discovery_stopped do
-          Process.send_after(self(), :discover_and_restart, state.discovery_interval_ms)
-        end
+        state =
+          if state.discovery_stopped do
+            state
+          else
+            {delay, state} = next_discovery_delay(state)
+            Process.send_after(self(), :discover_and_restart, delay)
+            state
+          end
 
-        {:noreply, %{state | current_discovery_task: nil}}
+        {:noreply, state}
 
       %LifecycleManager{} ->
         {:noreply, state}
@@ -448,8 +456,10 @@ defmodule DurableServer.LifecycleManager do
     # discovery task crashed or failed, still schedule next run but log the error
     log(state, :error, fn -> "discovery task failed: #{inspect(reason)}" end)
     :ets.delete_all_objects(state.discovery_skip_table)
-    Process.send_after(self(), :discover_and_restart, state.discovery_interval_ms)
-    {:noreply, %{state | current_discovery_task: nil}}
+    state = %{state | current_discovery_task: nil}
+    {delay, state} = next_discovery_delay(state)
+    Process.send_after(self(), :discover_and_restart, delay)
+    {:noreply, state}
   end
 
   def handle_info(
@@ -478,7 +488,7 @@ defmodule DurableServer.LifecycleManager do
           state
       end
 
-    {:reply, :ok, %{state | discovery_stopped: true}}
+    {:reply, :ok, %{state | discovery_stopped: true, discovery_burst_remaining: 0}}
   end
 
   def handle_call(:get_heartbeat_metrics, _from, %LifecycleManager{} = state) do
@@ -963,6 +973,14 @@ defmodule DurableServer.LifecycleManager do
   rescue
     # ETS table might not exist if supervisor is shutting down
     ArgumentError -> :ok
+  end
+
+  defp next_discovery_delay(%LifecycleManager{discovery_burst_remaining: n} = state) when n > 0 do
+    {0, %{state | discovery_burst_remaining: n - 1}}
+  end
+
+  defp next_discovery_delay(%LifecycleManager{} = state) do
+    {state.discovery_interval_ms, state}
   end
 
   defp discover_and_restart_servers(%LifecycleManager{} = state) do

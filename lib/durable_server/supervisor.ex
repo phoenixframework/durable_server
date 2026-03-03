@@ -62,6 +62,8 @@ defmodule DurableServer.Supervisor do
   - `:prefix` - Required. Object storage prefix for scoping (should end with "/")
   - `:max_children` - Maximum concurrent DurableServer processes (default: :infinity)
   - `:discovery_interval_ms` - How often to scan for orphaned servers (default: 60_000)
+  - `:discovery_burst_count` - Number of initial discovery sweeps to run back-to-back
+    without waiting for the discovery interval (default: 3)
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
   - `:dead_node_threshold_ms` - How long before a node is considered permanently dead and cleaned up
     (default: 86_400_000 = 24 hours)
@@ -1730,6 +1732,7 @@ defmodule DurableServer.Supervisor do
         :max_memory,
         :max_disk,
         :discovery_interval_ms,
+        :discovery_burst_count,
         :heartbeat_interval_ms,
         :graceful_shutdown_timeout_ms,
         :graceful_shutdown_concurrency,
@@ -1833,6 +1836,7 @@ defmodule DurableServer.Supervisor do
       prefix: prefix,
       object_store: object_store,
       discovery_interval_ms: Keyword.get(opts, :discovery_interval_ms, 60_000),
+      discovery_burst_count: Keyword.get(opts, :discovery_burst_count, 3),
       heartbeat_interval_ms: Keyword.get(opts, :heartbeat_interval_ms, 10_000),
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),
       graceful_shutdown_concurrency: Keyword.get(opts, :graceful_shutdown_concurrency, 50),
