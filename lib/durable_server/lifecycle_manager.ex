@@ -488,6 +488,12 @@ defmodule DurableServer.LifecycleManager do
           state
       end
 
+    # Mark as shutting down in ETS so check_capacity rejects remote placements
+    %{ets_table: table_name} =
+      DurableServer.Supervisor.__get_config__(state.supervisor_name)
+
+    :ets.insert(table_name, {:shutting_down, true})
+
     {:reply, :ok, %{state | discovery_stopped: true, discovery_burst_remaining: 0}}
   end
 
@@ -1496,9 +1502,20 @@ defmodule DurableServer.LifecycleManager do
   def check_capacity(supervisor_name, module, opts \\ []) do
     opts = Keyword.validate!(opts, [:bypass_disk_check])
 
-    with :ok <- check_count_limits(supervisor_name, module),
+    with :ok <- check_shutting_down(supervisor_name),
+         :ok <- check_count_limits(supervisor_name, module),
          :ok <- check_resource_limits(supervisor_name, opts) do
       :ok
+    end
+  end
+
+  defp check_shutting_down(supervisor_name) do
+    %{ets_table: table_name} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    case :ets.lookup(table_name, :shutting_down) do
+      [{:shutting_down, true}] -> {:error, {:limit_reached, :node_shutting_down, %{}}}
+      _ -> :ok
     end
   end
 

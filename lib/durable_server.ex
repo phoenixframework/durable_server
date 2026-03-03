@@ -2764,6 +2764,13 @@ defmodule DurableServer do
     """)
   end
 
+  defp log_capacity_limit(:node_shutting_down, _details, supervisor, module) do
+    Logger.info("""
+    DurableServer node shutting down - Cannot start #{inspect(module)} on #{Node.self()}
+    Supervisor: #{supervisor}
+    """)
+  end
+
   defp log_capacity_limit(:max_disk, details, supervisor, module) do
     Logger.info("""
     DurableServer disk limit reached - Cannot start #{inspect(module)} on #{Node.self()}
