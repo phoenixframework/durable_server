@@ -976,6 +976,7 @@ defmodule DurableServer.LifecycleManager do
 
     # list all keys with this supervisor's prefix, but exclude __nodes/ heartbeat objects
     ObjectStore.list_all_objects_stream(state.object_store, state.prefix,
+      consistent: false,
       error_handler: fn reason ->
         log(state, :error, fn -> "Failed to list objects: #{inspect(reason)}" end)
         :continue

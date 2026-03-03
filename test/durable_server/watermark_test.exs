@@ -311,23 +311,27 @@ defmodule DurableServer.WatermarkTest do
       end
     end
 
-    test "rejects invalid max_cpu values", %{supervisor_name: supervisor_name, prefix: prefix} do
-      assert_raise RuntimeError, ~r/ArgumentError.*max_cpu must be an integer/, fn ->
+    test "accepts max_cpu values above 100", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      pid =
         start_supervised!(
           {DurableServer.Supervisor,
            name: supervisor_name,
            prefix: prefix,
            object_store: test_object_store_opts(),
-           max_cpu: 101}
+           max_cpu: 150}
         )
-      end
+
+      assert is_pid(pid)
     end
 
     test "rejects invalid max_cpu zero value" do
       supervisor_name = :"test_supervisor_cpu_#{:erlang.unique_integer([:positive])}"
       prefix = "watermark_test_cpu_#{:erlang.unique_integer([:positive])}/"
 
-      assert_raise RuntimeError, ~r/ArgumentError.*max_cpu must be an integer/, fn ->
+      assert_raise RuntimeError, ~r/ArgumentError.*max_cpu must be a positive integer/, fn ->
         start_supervised!(
           {DurableServer.Supervisor,
            name: supervisor_name,
