@@ -103,6 +103,7 @@ defmodule DurableServer.LifecycleManager do
   alias DurableServer
   alias DurableServer.{StoredState, Meta, CircuitBreaker}
   alias DurableServer.ObjectStore
+  alias DurableServer.StorageBackend
 
   defstruct supervisor_name: nil,
             task_sup: nil,
@@ -178,7 +179,19 @@ defmodule DurableServer.LifecycleManager do
     supervisor_name = Keyword.fetch!(opts, :supervisor_name)
     task_supervisor = Keyword.fetch!(opts, :task_supervisor)
     circuit_breaker = Keyword.fetch!(opts, :circuit_breaker)
-    object_store = Keyword.fetch!(opts, :object_store)
+
+    object_store =
+      case Keyword.get(opts, :storage_backend, Keyword.get(opts, :object_store)) do
+        %StorageBackend{} = backend ->
+          backend
+
+        %ObjectStore{} = store ->
+          StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+
+        nil ->
+          raise ArgumentError, "LifecycleManager requires :storage_backend or :object_store"
+      end
+
     capacity_limits = Keyword.get(opts, :capacity_limits, %{})
     heartbeat_meta = Keyword.get(opts, :heartbeat_meta)
 
@@ -645,7 +658,7 @@ defmodule DurableServer.LifecycleManager do
 
     entry = {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
 
-    case ObjectStore.put_object(state.object_store, key, json_data, put_opts) do
+    case StorageBackend.put_object(state.object_store, key, json_data, put_opts) do
       {:ok, _} ->
         # update local ets cache with full capacity info
         :ets.insert(state.heartbeat_table, entry)
@@ -678,7 +691,7 @@ defmodule DurableServer.LifecycleManager do
 
     # Collect keys first, then fetch in parallel
     keys =
-      ObjectStore.list_all_objects_stream(state.object_store, "#{state.prefix}__nodes/",
+      StorageBackend.list_all_objects_stream(state.object_store, "#{state.prefix}__nodes/",
         error_handler: fn reason ->
           log(state, :warning, fn -> "List stream error: #{inspect(reason)}" end)
           :continue
@@ -690,7 +703,7 @@ defmodule DurableServer.LifecycleManager do
       keys
       |> Task.async_stream(
         fn key ->
-          case ObjectStore.get_object(state.object_store, key) do
+          case StorageBackend.get_object(state.object_store, key) do
             {:ok, %{body: body}} ->
               case JSON.decode(body) do
                 {:ok, data} ->
@@ -769,7 +782,7 @@ defmodule DurableServer.LifecycleManager do
       |> Enum.map(fn {:dead, key, node, _node_ref, _timestamp} ->
         :ets.delete(state.heartbeat_table, node)
 
-        case ObjectStore.delete_object(state.object_store, key) do
+        case StorageBackend.delete_object(state.object_store, key) do
           :ok ->
             log(state, :info, fn -> "Cleaned up dead node heartbeat: #{node}" end)
             1
@@ -924,12 +937,12 @@ defmodule DurableServer.LifecycleManager do
     with %{
            prefix: prefix,
            heartbeat_interval_ms: heartbeat_interval_ms,
-           object_store: object_store
+           storage_backend: object_store
          } <-
            DurableServer.Supervisor.__get_config__(supervisor_name) do
       key = "#{prefix}__nodes/#{node_str}"
 
-      case DurableServer.ObjectStore.get_object(object_store, key) do
+      case StorageBackend.get_object(object_store, key) do
         {:ok, %{body: body}} ->
           case JSON.decode(body) do
             {:ok, data} ->
@@ -999,7 +1012,7 @@ defmodule DurableServer.LifecycleManager do
     end
 
     # list all keys with this supervisor's prefix, but exclude __nodes/ heartbeat objects
-    ObjectStore.list_all_objects_stream(state.object_store, state.prefix,
+    StorageBackend.list_all_objects_stream(state.object_store, state.prefix,
       consistent: false,
       error_handler: fn reason ->
         log(state, :error, fn -> "Failed to list objects: #{inspect(reason)}" end)

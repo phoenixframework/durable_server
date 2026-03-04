@@ -1,14 +1,14 @@
 defmodule DurableServer do
   @moduledoc ~S"""
-  DurableServer provides durable, distributed GenServer processes backed by object storage.
+  DurableServer provides durable, distributed GenServer processes backed by pluggable storage.
 
   DurableServer implements fault-tolerant, stateful processes that can survive node failures,
-  restarts, and deployments by automatically persisting state to object storage and
+  restarts, and deployments by automatically persisting state to storage and
   coordinating across a distributed cluster.
 
   ## Key Features
 
-  - **Durable state**: Automatically persists state to object storage with configurable sync intervals
+  - **Durable state**: Automatically persists state to storage with configurable sync intervals
   - **Cluster coordination**: Uses distributed registry for process discovery and health monitoring
   - **Capacity-aware placement**: Monitors CPU, memory, and disk usage to route new processes
     to nodes with available capacity
@@ -520,6 +520,7 @@ defmodule DurableServer do
   alias DurableServer
   alias DurableServer.{LifecycleManager, CircuitBreaker, StoredState, Meta}
   alias DurableServer.ObjectStore
+  alias DurableServer.StorageBackend
 
   @type init_option ::
           {:auto_sync, boolean()}
@@ -870,7 +871,7 @@ defmodule DurableServer do
       when is_atom(supervisor_name) and is_map(config) do
     prefix = Map.fetch!(config, :prefix)
     circuit_breaker = Map.fetch!(config, :circuit_breaker)
-    object_store = Map.fetch!(config, :object_store)
+    object_store = Map.fetch!(config, :storage_backend)
     sticky_placement_history_limit = Map.get(config, :sticky_placement_history_limit, 5)
     # trap exits to handle crashes and coordinate with Terminator
     Process.flag(:trap_exit, true)
@@ -1090,7 +1091,7 @@ defmodule DurableServer do
   # fetch existing raw object + metadata
   # or re-use already fetch data from init_state (such as LifecycleManager restarts)
   defp fetch_existing_state_raw(
-         %ObjectStore{} = store,
+         %StorageBackend{} = store,
          %{key: key, prefix: prefix},
          init_state \\ nil
        ) do
@@ -1176,7 +1177,7 @@ defmodule DurableServer do
     end
   end
 
-  defp acquire_delete_lock(%ObjectStore{} = store, %{key: key, prefix: prefix}) do
+  defp acquire_delete_lock(%StorageBackend{} = store, %{key: key, prefix: prefix}) do
     storage_key = prefix <> key
 
     Logger.info("delete: trying to aquire delete lock for #{storage_key}")
@@ -1197,20 +1198,20 @@ defmodule DurableServer do
 
     deleting_json = JSON.encode!(deleting_data)
 
-    case ObjectStore.list_objects(store, storage_key) do
+    case StorageBackend.get_object(store, storage_key) do
       # object already deleted, so we proceed as normal
-      {:ok, %{keys: []}} ->
+      {:error, :not_found} ->
         :ok
 
       {:error, reason} ->
         {:error, reason}
 
       # object still exists and we have its etag for writing our lock
-      {:ok, %{keys: [%{key: ^storage_key, etag: current_etag}]}} ->
+      {:ok, %{etag: current_etag}} ->
         Logger.info("delete: #{storage_key} exists, attempting to claim orphaned lock")
 
         result =
-          ObjectStore.update_object(
+          StorageBackend.update_object(
             store,
             storage_key,
             fn
@@ -1327,14 +1328,14 @@ defmodule DurableServer do
     # Attempts to atomically acquire a deletion lock on the object using the same
     # lock acquisition logic as init. If successful, marks as :deleting and deletes.
     # If the object is locked by an active process, sends a delete message to the process instead.
-    %{prefix: prefix, object_store: store} = config
+    %{prefix: prefix, storage_backend: store} = config
     storage_key = prefix <> key
 
     case acquire_delete_lock(store, %{key: key, prefix: prefix}) do
       # TODO have lifecycle manager handle cleaning up delete locks that failed at this point
       :ok ->
         # successfully acquired lock and marked as :deleting, now delete the object
-        case ObjectStore.delete_object(store, storage_key) do
+        case StorageBackend.delete_object(store, storage_key) do
           :ok ->
             Logger.info("Successfully deleted #{storage_key} after acquiring delete lock")
             :ok
@@ -1403,6 +1404,11 @@ defmodule DurableServer do
   Returns `:ok` if the claim succeeds, or `{:error, reason}` if it fails.
   """
   def claim_restart_attempt(%ObjectStore{} = store, %StoredState{} = stored_state, opts) do
+    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    claim_restart_attempt(backend, stored_state, opts)
+  end
+
+  def claim_restart_attempt(%StorageBackend{} = store, %StoredState{} = stored_state, opts) do
     opts = Keyword.validate!(opts, [:ttl])
     ttl_ms = Keyword.fetch!(opts, :ttl)
     %{meta: meta} = stored_state
@@ -1428,7 +1434,7 @@ defmodule DurableServer do
         updated_stored_state = %{stored_state | meta: Meta.encode_to_binary(updated_meta)}
         data = JSON.encode!(updated_stored_state)
 
-        case ObjectStore.put_object(store, storage_key, data, etag: stored_state.etag) do
+        case StorageBackend.put_object(store, storage_key, data, etag: stored_state.etag) do
           {:ok, %{body: _, etag: _} = obj} -> {:ok, obj}
           # someone raced us b/w list_objects and update
           {:error, :conflict} -> {:error, :not_eligible}
@@ -1440,7 +1446,12 @@ defmodule DurableServer do
   @doc """
   Clear restart attempt metadata from a server object.
   """
-  def clear_restart_attempt(%ObjectStore{} = store, %{
+  def clear_restart_attempt(%ObjectStore{} = store, data) do
+    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    clear_restart_attempt(backend, data)
+  end
+
+  def clear_restart_attempt(%StorageBackend{} = store, %{
         key: key,
         prefix: prefix,
         body: body,
@@ -1455,7 +1466,7 @@ defmodule DurableServer do
         updated = %{stored_state | meta: Meta.encode_to_binary(updated_meta)}
         new_data = JSON.encode!(updated)
 
-        case ObjectStore.put_object(store, storage_key, new_data, etag: etag) do
+        case StorageBackend.put_object(store, storage_key, new_data, etag: etag) do
           {:ok, _} -> :ok
           {:error, reason} -> {:error, reason}
         end
@@ -1468,7 +1479,12 @@ defmodule DurableServer do
   @doc """
   Get just the metadata for a server without the full object.
   """
-  def get_server_metadata(%ObjectStore{} = store, %{key: key, prefix: prefix}) do
+  def get_server_metadata(%ObjectStore{} = store, path) do
+    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    get_server_metadata(backend, path)
+  end
+
+  def get_server_metadata(%StorageBackend{} = store, %{key: key, prefix: prefix}) do
     case fetch_stored_state(store, %{key: key, prefix: prefix}) do
       {:ok, %{meta: %Meta{} = meta}} ->
         {:ok, meta}
@@ -1647,7 +1663,7 @@ defmodule DurableServer do
         # delete storage for :delete or {:shutdown, :delete}
         Logger.info("DurableServer #{state.key} terminating for deletion - removing from storage")
 
-        case ObjectStore.delete_object(state.object_store, storage_key(state)) do
+        case StorageBackend.delete_object(state.object_store, storage_key(state)) do
           :ok ->
             Logger.info("Successfully deleted storage for #{state.key}")
 
@@ -2354,12 +2370,17 @@ defmodule DurableServer do
   """
   def fetch_stored_state(supervisor_name, %{key: key, prefix: prefix})
       when is_atom(supervisor_name) do
-    %{object_store: object_store} = DurableServer.Supervisor.__get_config__(supervisor_name)
-    fetch_stored_state(object_store, %{key: key, prefix: prefix})
+    %{storage_backend: storage_backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    fetch_stored_state(storage_backend, %{key: key, prefix: prefix})
   end
 
   def fetch_stored_state(%ObjectStore{} = store, %{key: key, prefix: prefix}) do
-    case ObjectStore.get_object(store, prefix <> key) do
+    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    fetch_stored_state(backend, %{key: key, prefix: prefix})
+  end
+
+  def fetch_stored_state(%StorageBackend{} = store, %{key: key, prefix: prefix}) do
+    case StorageBackend.get_object(store, prefix <> key) do
       {:ok, %{body: _encoded, etag: _etag} = obj} ->
         case decode_stored_state(obj, %{key: key, prefix: prefix}) do
           {:ok, %StoredState{} = decoded} -> {:ok, decoded}
@@ -2382,9 +2403,9 @@ defmodule DurableServer do
     # Fetch the current etag from storage for conflict resolution
     # This is called during group conflict resolution
     try do
-      %{object_store: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
 
-      case ObjectStore.get_object(store, storage_key) do
+      case StorageBackend.get_object(store, storage_key) do
         {:ok, %{etag: etag}} -> {:ok, etag}
         {:error, _} = error -> error
       end
@@ -2561,7 +2582,7 @@ defmodule DurableServer do
     if state.etag do
       try_lock_object_json_via_update(state, json_data)
     else
-      case ObjectStore.try_claim(store, storage_key(state), json_data) do
+      case StorageBackend.try_claim(store, storage_key(state), json_data) do
         # we won the first ever insert for this key
         {:ok, {:claimed, new_etag}} ->
           Logger.info(
@@ -2588,7 +2609,7 @@ defmodule DurableServer do
          %DurableServer{key: key, object_store: store} = state,
          json_data
        ) do
-    case ObjectStore.put_object(store, storage_key(state), json_data, etag: state.etag) do
+    case StorageBackend.put_object(store, storage_key(state), json_data, etag: state.etag) do
       # obj still matched our etag, we got the claim
       {:ok, %{etag: new_etag}} ->
         Logger.info(
@@ -2648,12 +2669,7 @@ defmodule DurableServer do
     opts = [max_retries: @max_sync_retries]
     put_opts = if state.etag, do: Keyword.put(opts, :etag, state.etag), else: opts
 
-    case DurableServer.ObjectStore.put_object(
-           state.object_store,
-           storage_key,
-           json_data,
-           put_opts
-         ) do
+    case StorageBackend.put_object(state.object_store, storage_key, json_data, put_opts) do
       {:ok, %{etag: new_etag}} -> {:ok, %{state | etag: new_etag}}
       {:error, reason} -> {:error, reason}
     end
@@ -2665,7 +2681,7 @@ defmodule DurableServer do
     storage_key = storage_key(state)
     store = state.object_store
 
-    case DurableServer.ObjectStore.get_object(store, storage_key) do
+    case StorageBackend.get_object(store, storage_key) do
       {:ok, %{body: body, etag: etag}} ->
         case JSON.decode(body) do
           {:ok, data} ->

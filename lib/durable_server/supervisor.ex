@@ -77,7 +77,9 @@ defmodule DurableServer.Supervisor do
     (default: 300_000 = 5 minutes)
   - `:module_circuit_breaker_cooldown_ms` - Cooldown period when module circuit breaker opens
     (default: 600_000 = 10 minutes)
-  - `:object_store` - The configured `DurableServer.ObjectStore`. Defaults to preconfigured store.
+  - `:backend` - Optional storage backend spec:
+    `{:object_store, opts_or_store}`, `{:ekv, opts}`, or `{:migrating, opts}`
+  - `:object_store` - Legacy object storage config (used when `:backend` is not set)
   - `:max_cpu` - Maximum CPU usage percentage before rejecting new children on this node.
     Values above 100 are valid since CPU load can exceed 100% when the run queue is larger than the core count.
     When CPU usage reaches this threshold, new placements will be routed to other nodes.
@@ -148,6 +150,7 @@ defmodule DurableServer.Supervisor do
   alias DurableServer
   alias DurableServer.{LifecycleManager, Terminator, CircuitBreaker, Meta}
   alias DurableServer.ObjectStore
+  alias DurableServer.StorageBackend
 
   @max_start_child_tries 10
   @default_ready_timeout 5_000
@@ -324,9 +327,9 @@ defmodule DurableServer.Supervisor do
 
   """
   def get_server_info(sup_name, key) when is_atom(sup_name) and is_binary(key) do
-    %{object_store: object_store, prefix: prefix} = __get_config__(sup_name)
+    %{storage_backend: storage_backend, prefix: prefix} = __get_config__(sup_name)
 
-    case DurableServer.fetch_stored_state(object_store, %{key: key, prefix: prefix}) do
+    case DurableServer.fetch_stored_state(storage_backend, %{key: key, prefix: prefix}) do
       {:ok, %DurableServer.StoredState{meta: meta, state: user_state, vsn: vsn}} ->
         # Check if server is currently running
         {pid, running} =
@@ -380,26 +383,20 @@ defmodule DurableServer.Supervisor do
 
   """
   def stream_all_server_info(sup_name) when is_atom(sup_name) do
-    alias DurableServer.ObjectStore
-    %{object_store: object_store, prefix: prefix} = __get_config__(sup_name)
+    %{storage_backend: storage_backend, prefix: prefix} = __get_config__(sup_name)
 
-    case ObjectStore.list_objects(object_store, prefix) do
-      {:ok, %{keys: keys}} ->
-        keys
-        |> Stream.reject(fn %{key: key} -> String.contains?(key, "/__nodes/") end)
-        |> Stream.map(fn %{key: storage_key} ->
-          key = String.trim_leading(storage_key, prefix)
-          get_server_info(sup_name, key)
-        end)
-        |> Stream.filter(fn
-          {:ok, _info} -> true
-          _ -> false
-        end)
-        |> Stream.map(fn {:ok, info} -> info end)
-
-      {:error, _reason} ->
-        Stream.map([], & &1)
-    end
+    storage_backend
+    |> StorageBackend.list_all_objects_stream(prefix, error_handler: fn _reason -> :halt end)
+    |> Stream.reject(fn %{key: key} -> String.contains?(key, "/__nodes/") end)
+    |> Stream.map(fn %{key: storage_key} ->
+      key = String.trim_leading(storage_key, prefix)
+      get_server_info(sup_name, key)
+    end)
+    |> Stream.filter(fn
+      {:ok, _info} -> true
+      _ -> false
+    end)
+    |> Stream.map(fn {:ok, info} -> info end)
   end
 
   @doc """
@@ -511,7 +508,9 @@ defmodule DurableServer.Supervisor do
   - `:module_circuit_breaker_count` - Module crash limit (default: 50)
   - `:module_circuit_breaker_window_ms` - Module circuit breaker window (default: 300_000)
   - `:module_circuit_breaker_cooldown_ms` - Module circuit breaker cooldown (default: 600_000)
-  - `:object_store` - The configured `DurableServer.ObjectStore`. Defaults to preconfigured store.
+  - `:backend` - Optional storage backend spec:
+    `{:object_store, opts_or_store}`, `{:ekv, opts}`, or `{:migrating, opts}`
+  - `:object_store` - Legacy object storage config (used when `:backend` is not set)
   - `:init_info` - Map of user-defined data passed to each server's `init/2` callback (default: `%{}`)
   """
   def start_link(opts) do
@@ -665,7 +664,7 @@ defmodule DurableServer.Supervisor do
     config = __get_config__(supervisor)
     storage_key = config.prefix <> key
 
-    case ObjectStore.get_object(config.object_store, storage_key) do
+    case StorageBackend.get_object(config.storage_backend, storage_key) do
       {:ok, %{body: body, etag: etag}} ->
         {:ok, {:restart, %{key: key, body: body, etag: etag}}}
 
@@ -922,7 +921,7 @@ defmodule DurableServer.Supervisor do
         config = __get_config__(supervisor)
         storage_key = config.prefix <> key
 
-        case ObjectStore.get_object(config.object_store, storage_key) do
+        case StorageBackend.get_object(config.storage_backend, storage_key) do
           {:ok, %{body: body}} ->
             meta = extract_meta_from_body(key, supervisor, body)
             meta && meta.sticky_placement
@@ -1138,7 +1137,7 @@ defmodule DurableServer.Supervisor do
         existing = Keyword.get(opts, :existing, false)
 
         {stored_object, sticky_placement} =
-          case ObjectStore.get_object(config.object_store, storage_key) do
+          case StorageBackend.get_object(config.storage_backend, storage_key) do
             {:ok, %{body: body, etag: etag}} ->
               # Get augmented sticky placement (handles module config updates like :any)
               augmented_placement =
@@ -1724,6 +1723,7 @@ defmodule DurableServer.Supervisor do
         :name,
         :prefix,
         :group,
+        :backend,
         :object_store,
         :finch,
         :task_supervisor,
@@ -1760,22 +1760,9 @@ defmodule DurableServer.Supervisor do
     finch = Keyword.get(opts, :finch, DurableServer.Finch)
     task_sup = Keyword.get(opts, :task_supervisor, DurableServer.TaskSupervisor)
 
-    # Build ObjectStore from :object_store keyword list or use provided struct
-    object_store =
-      case Keyword.fetch!(opts, :object_store) do
-        %ObjectStore{} = store ->
-          store
-
-        object_store_opts when is_list(object_store_opts) ->
-          ObjectStore.new(
-            object_store_opts
-            |> Keyword.put_new(:finch, finch)
-            |> Keyword.put_new(:task_supervisor, task_sup)
-          )
-      end
-
-    # bucket must exist for any durable object storage to work
-    :ok = ObjectStore.ensure_bucket_exists(object_store)
+    # Build storage backend from :backend or legacy :object_store options.
+    {storage_backend, object_store} = build_storage_backend(opts, finch, task_sup)
+    :ok = StorageBackend.ensure_ready(storage_backend)
 
     # Extract and validate capacity limits
     capacity_limits = extract_capacity_limits(opts)
@@ -1834,6 +1821,7 @@ defmodule DurableServer.Supervisor do
     config = %{
       name: name,
       prefix: prefix,
+      storage_backend: storage_backend,
       object_store: object_store,
       discovery_interval_ms: Keyword.get(opts, :discovery_interval_ms, 60_000),
       discovery_burst_count: Keyword.get(opts, :discovery_burst_count, 3),
@@ -1888,6 +1876,7 @@ defmodule DurableServer.Supervisor do
        supervisor_name: name,
        task_supervisor: task_sup_name,
        object_store: object_store,
+       storage_backend: storage_backend,
        config: config,
        circuit_breaker: circuit_breaker,
        capacity_limits: capacity_limits,
@@ -1939,6 +1928,100 @@ defmodule DurableServer.Supervisor do
   defp ets_table_name(supervisor_name) do
     :"durable_supervisor_#{supervisor_name}"
   end
+
+  defp build_storage_backend(opts, finch, task_sup) do
+    if Keyword.has_key?(opts, :backend) do
+      backend_spec = Keyword.fetch!(opts, :backend)
+      backend = normalize_backend_spec(backend_spec, finch, task_sup)
+      object_store = maybe_extract_object_store(backend)
+      {backend, object_store}
+    else
+      object_store =
+        case Keyword.fetch!(opts, :object_store) do
+          %ObjectStore{} = store ->
+            store
+
+          object_store_opts when is_list(object_store_opts) ->
+            ObjectStore.new(
+              object_store_opts
+              |> Keyword.put_new(:finch, finch)
+              |> Keyword.put_new(:task_supervisor, task_sup)
+            )
+        end
+
+      backend =
+        StorageBackend.new(DurableServer.StorageBackend.ObjectStore, object_store)
+
+      {backend, object_store}
+    end
+  end
+
+  defp normalize_backend_spec(%StorageBackend{} = backend, _finch, _task_sup), do: backend
+
+  defp normalize_backend_spec({:object_store, %ObjectStore{} = store}, _finch, _task_sup) do
+    StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+  end
+
+  defp normalize_backend_spec({:object_store, object_store_opts}, finch, task_sup)
+       when is_list(object_store_opts) do
+    store =
+      ObjectStore.new(
+        object_store_opts
+        |> Keyword.put_new(:finch, finch)
+        |> Keyword.put_new(:task_supervisor, task_sup)
+      )
+
+    StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+  end
+
+  defp normalize_backend_spec({:ekv, ekv_opts}, _finch, task_sup) do
+    ekv_opts =
+      ekv_opts
+      |> normalize_backend_opts()
+      |> Keyword.put_new(:task_supervisor, task_sup)
+
+    state = DurableServer.StorageBackend.EKV.normalize_opts(ekv_opts)
+    StorageBackend.new(DurableServer.StorageBackend.EKV, state)
+  end
+
+  defp normalize_backend_spec({:migrating, migrating_opts}, finch, task_sup) do
+    migrating_opts = normalize_backend_opts(migrating_opts)
+
+    primary =
+      migrating_opts |> Keyword.fetch!(:primary) |> normalize_backend_spec(finch, task_sup)
+
+    secondary =
+      migrating_opts |> Keyword.fetch!(:secondary) |> normalize_backend_spec(finch, task_sup)
+
+    state =
+      migrating_opts
+      |> Keyword.put(:primary, primary)
+      |> Keyword.put(:secondary, secondary)
+      |> DurableServer.StorageBackend.Migrating.normalize_opts()
+
+    StorageBackend.new(DurableServer.StorageBackend.Migrating, state)
+  end
+
+  defp normalize_backend_spec(spec, _finch, _task_sup) do
+    raise ArgumentError,
+          "invalid :backend option #{inspect(spec)}. Expected {:object_store, ...}, {:ekv, ...}, {:migrating, ...}, or %DurableServer.StorageBackend{}"
+  end
+
+  defp normalize_backend_opts(opts) when is_list(opts), do: opts
+  defp normalize_backend_opts(opts) when is_map(opts), do: Map.to_list(opts)
+
+  defp normalize_backend_opts(other) do
+    raise ArgumentError, "expected backend options as keyword or map, got: #{inspect(other)}"
+  end
+
+  defp maybe_extract_object_store(%StorageBackend{
+         adapter: DurableServer.StorageBackend.ObjectStore,
+         state: %ObjectStore{} = store
+       }) do
+    store
+  end
+
+  defp maybe_extract_object_store(_), do: nil
 
   defp extract_capacity_limits(opts) do
     limits = %{}

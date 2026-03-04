@@ -1,18 +1,19 @@
 # DurableServer
 
-DurableServer provides durable, distributed GenServer processes backed by object storage.
+DurableServer provides durable, distributed GenServer processes backed by pluggable storage backends.
 
-It implements fault-tolerant, stateful processes that can survive node failures, restarts, and deployments by automatically persisting state to S3-compatible object storage (like [Tigris](https://www.tigrisdata.com/)) and coordinating across a distributed cluster.
+It implements fault-tolerant, stateful processes that can survive node failures, restarts, and deployments by automatically persisting state and coordinating across a distributed cluster.
 
 ## Key Features
 
-- **Durable state**: Automatically persists state to object storage with configurable sync intervals
+- **Durable state**: Automatically persists state to storage with configurable sync intervals
 - **Cluster coordination**: Uses distributed registry for process discovery and health monitoring
 - **Capacity-aware placement**: Monitors CPU, memory, and disk usage to route new processes to nodes with available capacity
 - **Sticky placement**: Environment variable-based placement preferences (e.g., same machine, same region, etc.) with time-gated fallback to ensure servers restart on preferred nodes when possible
 - **Automatic recovery**: Failed processes are detected and restarted across the cluster
 - **Graceful shutdown**: Ensures state is synchronized before termination
 - **Lifecycle monitoring & dispatch**: Monitor lifecycle events and dispatch messages between DurableServers and other processes
+- **Pluggable backends**: Run with object storage, EKV, or a dual-backend migration adapter
 
 ## Installation
 
@@ -91,6 +92,76 @@ GenServer.call(pid, :increment)  # => 1
 GenServer.call(pid, :increment)  # => 2
 GenServer.call(pid, :get_count)  # => 2
 ```
+
+## Storage Backends
+
+`DurableServer.Supervisor` supports two configuration styles:
+
+- Legacy (unchanged): `object_store: [...]` or `object_store: %DurableServer.ObjectStore{}`
+- New: `backend: ...`
+
+### Object Storage Backend
+
+```elixir
+{DurableServer.Supervisor,
+ name: MyDurableSup,
+ prefix: "my_app/",
+ backend: {:object_store,
+  [
+    bucket: "my-bucket",
+    access_key_id: "...",
+    secret_access_key: "...",
+    s3_endpoint: "...",
+    default_region: "..."
+  ]}}
+```
+
+### EKV Backend
+
+Start EKV in your application tree (CAS config is required for DurableServer lock semantics):
+
+```elixir
+children = [
+  {EKV,
+   name: :durable_ekv,
+   data_dir: "/data/ekv/durable",
+   cluster_size: 3,
+   node_id: System.fetch_env!("EKV_NODE_ID")},
+  {DurableServer.Supervisor,
+   name: MyDurableSup,
+   prefix: "my_app/",
+   backend: {:ekv, [name: :durable_ekv]}}
+]
+```
+
+If you use EKV backend, add EKV to your app's dependencies.
+
+### Live Migration Backend (Object Storage -> EKV)
+
+Use the migrating backend to dual-write while you cut over reads/writes in phases:
+
+```elixir
+backend:
+  {:migrating,
+   [
+     primary: {:object_store, object_store_opts},
+     secondary: {:ekv, [name: :durable_ekv]},
+     read_preference: :primary,
+     write_target: :primary,
+     mirror_writes: true,
+     fallback_reads: true,
+     promote_on_fallback: true
+   ]}
+```
+
+Recommended rollout:
+
+1. Shadow phase: `read_preference: :primary`, `write_target: :primary`, `mirror_writes: true`
+2. Read cutover: `read_preference: :secondary`, `write_target: :primary` (or switch both if validated)
+3. Full cutover: `read_preference: :secondary`, `write_target: :secondary`
+4. Finalize: replace migrating backend with pure `{:ekv, ...}`
+
+`promote_on_fallback: true` ensures fallback reads are copied into the active read backend so returned CAS etags remain backend-local and safe for subsequent lock updates.
 
 ## Configuration Options
 
@@ -234,4 +305,3 @@ Run integration tests (which hit t3.storage.dev directly):
 ```bash
 mix test --include integration
 ```
-
