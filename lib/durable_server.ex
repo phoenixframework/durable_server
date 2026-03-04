@@ -1177,7 +1177,7 @@ defmodule DurableServer do
   end
 
   defp acquire_delete_lock(%ObjectStore{} = store, %{key: key, prefix: prefix}) do
-    storage_key = key <> prefix
+    storage_key = prefix <> key
 
     Logger.info("delete: trying to aquire delete lock for #{storage_key}")
     # first try to claim (object doesn't exist)
