@@ -1484,19 +1484,9 @@ defmodule DurableServer do
         _from,
         %DurableServer{} = state
       ) do
-    # update status before stopping
-    new_state =
-      case sync_to_storage(state, meta: %{status: status}) do
-        {:ok, %DurableServer{} = new_state} ->
-          new_state
-
-        {:error, sync_reason} ->
-          Logger.error("Failed to update status before stop: #{inspect(sync_reason)}")
-          state
-      end
-
-    # mark that we've explicitly set the status
-    updated_state = %{new_state | final_status_set: status}
+    # Defer final status persistence to terminate/2 so user callback terminate/2
+    # has completed before lock visibility changes.
+    updated_state = %{state | final_status_set: status}
     {:stop, reason, :ok, updated_state}
   end
 
@@ -1561,26 +1551,13 @@ defmodule DurableServer do
       "DurableServer #{state.key} received graceful shutdown request: #{inspect(reason)}"
     )
 
-    # mark that terminator handled this shutdown
-    state = %{state | terminator_handled: true}
-
-    # sync state before stopping
-    synced_state =
-      case sync_to_storage(state, meta: %{status: :stopped_graceful}) do
-        {:ok, %DurableServer{} = new_state} ->
-          Logger.debug("Successfully synced state for #{state.key} before shutdown")
-          new_state
-
-        {:error, sync_reason} ->
-          Logger.error(
-            "Failed to sync state for #{state.key} during shutdown: #{inspect(sync_reason)}"
-          )
-
-          state
-      end
+    # Mark that Terminator handled this shutdown and defer status persistence to
+    # terminate/2 after user callback terminate/2 has run.
+    updated_state =
+      %{state | terminator_handled: true, final_status_set: :stopped_graceful}
 
     # stop normally so the terminator can track our shutdown
-    {:stop, :normal, synced_state}
+    {:stop, :normal, updated_state}
   end
 
   def handle_info({@durable, {:delete_request, ref, requester_pid}}, %__MODULE__{} = state) do
@@ -1591,12 +1568,12 @@ defmodule DurableServer do
     # notify the requester that we're starting deletion
     send(requester_pid, {:delete_in_progress, ref})
 
-    # sync state with :deleting status before stopping
-    state_with_reason = %{state | user_initiated_stop: {:shutdown, :delete}}
-    {:ok, synced_state} = sync_to_storage(state_with_reason, meta: %{status: :deleting})
+    # Defer status persistence to terminate/2 after user callback terminate/2 has run.
+    updated_state =
+      %{state | user_initiated_stop: {:shutdown, :delete}, final_status_set: :deleting}
 
     # stop with delete reason to trigger deletion in terminate/2
-    {:stop, {:shutdown, :delete}, synced_state}
+    {:stop, {:shutdown, :delete}, updated_state}
   end
 
   def handle_info(msg, %DurableServer{} = state) do
@@ -1620,32 +1597,26 @@ defmodule DurableServer do
   end
 
   def terminate(reason, %DurableServer{} = state) do
-    result =
-      case state do
-        %{terminator_handled: true} ->
-          Logger.debug(
-            "DurableServer #{state.key} terminate/2 called after terminator handling (reason: #{inspect(reason)})"
-          )
-
-          :ok
-
-        %{user_initiated_stop: nil} ->
-          handle_external_terminate(reason, state)
-
-        %{user_initiated_stop: user_stop} when user_stop != nil ->
-          handle_user_initiated_terminate(user_stop, reason, state)
-      end
-
+    # Ensure user callback terminate/2 finishes before we persist final status metadata.
     _ = state.module.terminate(reason, state.user_state)
-    result
+
+    case state.user_initiated_stop do
+      nil ->
+        handle_external_terminate(reason, state)
+
+      user_stop ->
+        handle_user_initiated_terminate(user_stop, reason, state)
+    end
   end
 
-  # user-initiated termination - status already synced in process_callback_result
+  # user-initiated termination
   defp handle_user_initiated_terminate(user_stop, _reason, %DurableServer{} = state) do
     case user_stop do
       user_stop when user_stop in [:delete, {:shutdown, :delete}] ->
         # delete storage for :delete or {:shutdown, :delete}
         Logger.info("DurableServer #{state.key} terminating for deletion - removing from storage")
+
+        maybe_sync_final_status(state, state.final_status_set || :deleting)
 
         case ObjectStore.delete_object(state.object_store, storage_key(state)) do
           :ok ->
@@ -1662,17 +1633,26 @@ defmodule DurableServer do
 
       user_stop
       when user_stop in [:normal, :permanent, {:shutdown, :permanent}, {:shutdown, :normal}] ->
-        # graceful stops - status already persisted in callback processing
+        final_status =
+          state.final_status_set ||
+            case user_stop do
+              stop when stop in [:permanent, {:shutdown, :permanent}] -> :stopped_permanent
+              _ -> :stopped_graceful
+            end
+
+        maybe_sync_final_status(state, final_status)
+
         Logger.info(
-          "DurableServer #{state.key} shutting down gracefully via user stop (#{inspect(user_stop)}) - status already persisted"
+          "DurableServer #{state.key} shutting down gracefully via user stop (#{inspect(user_stop)})"
         )
 
         :ok
 
       {:error, error_reason} ->
-        # error stop - status already synced as crashed in callback processing
+        maybe_sync_final_status(state, state.final_status_set || :crashed)
+
         Logger.info(
-          "DurableServer #{state.key} stopping with error (#{inspect(error_reason)}) - status already persisted"
+          "DurableServer #{state.key} stopping with error (#{inspect(error_reason)})"
         )
 
         :ok
@@ -1681,96 +1661,112 @@ defmodule DurableServer do
 
   # external termination - not user-initiated
   defp handle_external_terminate(reason, %DurableServer{} = state) do
-    case reason do
-      :shutdown ->
-        # external graceful shutdown (e.g., supervisor terminate_child)
-        Logger.info(
-          "DurableServer #{state.key} shutting down gracefully (reason: #{inspect(reason)})"
-        )
+    case state.final_status_set do
+      status when not is_nil(status) ->
+        maybe_sync_final_status(state, status)
 
-        case sync_to_storage(state, meta: %{status: :stopped_graceful}) do
-          {:ok, %DurableServer{} = new_state} ->
-            new_state
+      nil ->
+        case reason do
+          :shutdown ->
+            # external graceful shutdown (e.g., supervisor terminate_child)
+            Logger.info(
+              "DurableServer #{state.key} shutting down gracefully (reason: #{inspect(reason)})"
+            )
 
-          {:error, reason} ->
-            Logger.error("Failed sync on terminate: #{inspect(reason)}")
-            state
+            maybe_sync_final_status(state, :stopped_graceful)
+
+          {:shutdown, _} ->
+            # external graceful shutdown (e.g., supervisor terminate_child)
+            Logger.info(
+              "DurableServer #{state.key} shutting down gracefully (reason: #{inspect(reason)})"
+            )
+
+            maybe_sync_final_status(state, :stopped_graceful)
+
+          :normal ->
+            :ok
+
+          _crash_reason ->
+            # this is a crash - update status using crash tracking system
+            Logger.error(
+              "DurableServer #{state.key} crashed with reason: #{inspect(reason)} - updating crash status"
+            )
+
+            # create crash entry
+            crash_entry = %{
+              timestamp: System.system_time(:millisecond),
+              reason: String.slice(inspect(reason), 0, @max_crash_reason_length),
+              node_ref: state.node_ref
+            }
+
+            # update crash status with tracking
+            # if this server was previously permanently crashed and crashes again, restore that status
+            final_status =
+              if state.was_permanently_crashed do
+                # server was previously permanently crashed - if explicitly restarted and crashes again,
+                # it goes straight back to permanently crashed without going through crash counting
+                case update_server_status_directly(state, :permanently_crashed) do
+                  {:ok, %DurableServer{} = _new_state} -> :permanently_crashed
+                  {:error, _} -> :crashed
+                end
+              else
+                # normal crash tracking logic using CircuitBreaker
+                current_meta = dump_meta(state)
+
+                {status, updated_crash_history} =
+                  CircuitBreaker.check_object_crash_status(
+                    state.circuit_breaker,
+                    current_meta,
+                    crash_entry
+                  )
+
+                # update storage with both the new status and crash history
+                case update_server_status_and_crash_history(state, status, updated_crash_history) do
+                  {:ok, _new_state} -> status
+                  {:error, _} -> :crashed
+                end
+              end
+
+            case final_status do
+              :crashed ->
+                Logger.info("DurableServer #{state.key} marked as crashed")
+
+              :permanently_crashed ->
+                if state.was_permanently_crashed do
+                  Logger.warning(
+                    "DurableServer #{state.key} restored to permanently crashed after crashing again"
+                  )
+                else
+                  Logger.warning(
+                    "DurableServer #{state.key} marked as permanently crashed after repeated failures"
+                  )
+                end
+            end
+
+            :ok
+        end
+    end
+  end
+
+  defp maybe_sync_final_status(%DurableServer{} = state, status) when is_atom(status) do
+    report_sync_and_stop = state.terminator_handled and status == :stopped_graceful
+
+    case sync_to_storage(state, meta: %{status: status}) do
+      {:ok, %DurableServer{} = _new_state} ->
+        if report_sync_and_stop do
+          LifecycleManager.report_diagnostic(state.supervisor, :sync_and_stop_ok)
         end
 
-      {:shutdown, _} ->
-        # external graceful shutdown (e.g., supervisor terminate_child)
-        Logger.info(
-          "DurableServer #{state.key} shutting down gracefully (reason: #{inspect(reason)})"
-        )
-
-        case sync_to_storage(state, meta: %{status: :stopped_graceful}) do
-          {:ok, %DurableServer{} = new_state} ->
-            new_state
-
-          {:error, reason} ->
-            Logger.error("Failed sync on terminate: #{inspect(reason)}")
-            state
-        end
-
-      :normal ->
         :ok
 
-      _crash_reason ->
-        # this is a crash - update status using crash tracking system
-        Logger.error(
-          "DurableServer #{state.key} crashed with reason: #{inspect(reason)} - updating crash status"
-        )
-
-        # create crash entry
-        crash_entry = %{
-          timestamp: System.system_time(:millisecond),
-          reason: String.slice(inspect(reason), 0, @max_crash_reason_length),
-          node_ref: state.node_ref
-        }
-
-        # update crash status with tracking
-        # if this server was previously permanently crashed and crashes again, restore that status
-        final_status =
-          if state.was_permanently_crashed do
-            # server was previously permanently crashed - if explicitly restarted and crashes again,
-            # it goes straight back to permanently crashed without going through crash counting
-            case update_server_status_directly(state, :permanently_crashed) do
-              {:ok, %DurableServer{} = _new_state} -> :permanently_crashed
-              {:error, _} -> :crashed
-            end
-          else
-            # normal crash tracking logic using CircuitBreaker
-            current_meta = dump_meta(state)
-
-            {status, updated_crash_history} =
-              CircuitBreaker.check_object_crash_status(
-                state.circuit_breaker,
-                current_meta,
-                crash_entry
-              )
-
-            # update storage with both the new status and crash history
-            case update_server_status_and_crash_history(state, status, updated_crash_history) do
-              {:ok, _new_state} -> status
-              {:error, _} -> :crashed
-            end
-          end
-
-        case final_status do
-          :crashed ->
-            Logger.info("DurableServer #{state.key} marked as crashed")
-
-          :permanently_crashed ->
-            if state.was_permanently_crashed do
-              Logger.warning(
-                "DurableServer #{state.key} restored to permanently crashed after crashing again"
-              )
-            else
-              Logger.warning(
-                "DurableServer #{state.key} marked as permanently crashed after repeated failures"
-              )
-            end
+      {:error, sync_reason} ->
+        if report_sync_and_stop do
+          LifecycleManager.report_diagnostic(state.supervisor, :sync_and_stop_error)
         end
+
+        Logger.error(
+          "Failed to persist final status #{inspect(status)} for #{state.key}: #{inspect(sync_reason)}"
+        )
 
         :ok
     end
@@ -2043,111 +2039,119 @@ defmodule DurableServer do
 
       {:stop, {:shutdown, :delete}, reply, new_user_state} ->
         # shutdown-wrapped delete
-        state_with_reason = %{state | user_initiated_stop: {:shutdown, :delete}}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, {:shutdown, :delete})
+          |> Map.put(:final_status_set, :deleting)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :deleting}})
-
-        {:stop, {:shutdown, :delete}, reply, synced_state}
+        {:stop, {:shutdown, :delete}, reply, stopped_state}
 
       {:stop, {:shutdown, :delete}, new_user_state} ->
         # shutdown-wrapped delete
-        state_with_reason = %{state | user_initiated_stop: {:shutdown, :delete}}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, {:shutdown, :delete})
+          |> Map.put(:final_status_set, :deleting)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :deleting}})
-
-        {:stop, {:shutdown, :delete}, synced_state}
+        {:stop, {:shutdown, :delete}, stopped_state}
 
       {:stop, :delete, reply, new_user_state} ->
         # non-shutdown wrapped delete - transform to :normal (doesn't propagate exit to linked processes)
-        state_with_reason = %{state | user_initiated_stop: :delete}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, :delete)
+          |> Map.put(:final_status_set, :deleting)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :deleting}})
-
-        {:stop, :normal, reply, synced_state}
+        {:stop, :normal, reply, stopped_state}
 
       {:stop, :delete, new_user_state} ->
         # non-shutdown wrapped delete - transform to :normal (doesn't propagate exit to linked processes)
-        state_with_reason = %{state | user_initiated_stop: :delete}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, :delete)
+          |> Map.put(:final_status_set, :deleting)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :deleting}})
-
-        {:stop, :normal, synced_state}
+        {:stop, :normal, stopped_state}
 
       {:stop, {:shutdown, :permanent}, reply, new_user_state} ->
         # shutdown-wrapped permanent stop
-        state_with_reason = %{state | user_initiated_stop: {:shutdown, :permanent}}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, {:shutdown, :permanent})
+          |> Map.put(:final_status_set, :stopped_permanent)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :stopped_permanent}})
-
-        {:stop, {:shutdown, :permanent}, reply, synced_state}
+        {:stop, {:shutdown, :permanent}, reply, stopped_state}
 
       {:stop, {:shutdown, :permanent}, new_user_state} ->
         # shutdown-wrapped permanent stop
-        state_with_reason = %{state | user_initiated_stop: {:shutdown, :permanent}}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, {:shutdown, :permanent})
+          |> Map.put(:final_status_set, :stopped_permanent)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :stopped_permanent}})
-
-        {:stop, {:shutdown, :permanent}, synced_state}
+        {:stop, {:shutdown, :permanent}, stopped_state}
 
       {:stop, :permanent, reply, new_user_state} ->
         # non-shutdown wrapped permanent - transform to :normal (doesn't propagate exit to linked processes)
-        state_with_reason = %{state | user_initiated_stop: :permanent}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, :permanent)
+          |> Map.put(:final_status_set, :stopped_permanent)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :stopped_permanent}})
-
-        {:stop, :normal, reply, synced_state}
+        {:stop, :normal, reply, stopped_state}
 
       {:stop, :permanent, new_user_state} ->
         # non-shutdown wrapped permanent - transform to :normal (doesn't propagate exit to linked processes)
-        state_with_reason = %{state | user_initiated_stop: :permanent}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, :permanent)
+          |> Map.put(:final_status_set, :stopped_permanent)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :stopped_permanent}})
-
-        {:stop, :normal, synced_state}
+        {:stop, :normal, stopped_state}
 
       {:stop, :normal, reply, new_user_state} ->
-        # normal stop - sync with stopped_graceful status
-        state_with_reason = %{state | user_initiated_stop: :normal}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, :normal)
+          |> Map.put(:final_status_set, :stopped_graceful)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :stopped_graceful}})
-
-        {:stop, :normal, reply, synced_state}
+        {:stop, :normal, reply, stopped_state}
 
       {:stop, :normal, new_user_state} ->
-        # normal stop - sync with stopped_graceful status
-        state_with_reason = %{state | user_initiated_stop: :normal}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, :normal)
+          |> Map.put(:final_status_set, :stopped_graceful)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :stopped_graceful}})
-
-        {:stop, :normal, synced_state}
+        {:stop, :normal, stopped_state}
 
       {:stop, {:error, _reason} = error_reason, reply, new_user_state} ->
-        # error stop - will crash and set crash status
-        state_with_reason = %{state | user_initiated_stop: error_reason}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, error_reason)
+          |> Map.put(:final_status_set, :crashed)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :crashed}})
-
-        {:stop, error_reason, reply, synced_state}
+        {:stop, error_reason, reply, stopped_state}
 
       {:stop, {:error, _reason} = error_reason, new_user_state} ->
-        # error stop - will crash and set crash status
-        state_with_reason = %{state | user_initiated_stop: error_reason}
+        stopped_state =
+          state
+          |> Map.put(:user_initiated_stop, error_reason)
+          |> Map.put(:final_status_set, :crashed)
+          |> update_state(new_user_state)
 
-        {synced_state, _} =
-          handle_action(state_with_reason, new_user_state, {:sync, %{status: :crashed}})
-
-        {:stop, error_reason, synced_state}
+        {:stop, error_reason, stopped_state}
 
       {:stop, reason, _reply, _new_user_state} ->
         raise ArgumentError, """
@@ -2399,17 +2403,23 @@ defmodule DurableServer do
         %Meta{supervisor: sup_name, node_ref: stored_node_ref, node_str: node_str, pid: pid} =
           meta
       ) do
+    report_lock_diagnostic(sup_name, :check_lock_calls)
+
     cond do
       # if the pid lock holder wrote the graceful stop, it's gone
       Meta.stopped_graceful?(meta) ->
+        report_lock_diagnostic(sup_name, :check_lock_stopped_graceful)
         :expired
 
       # local node - call directly and compare node_refs
       node_str == to_string(node()) ->
-        __check_lock__(pid, stored_node_ref, sup_name)
+        result = __check_lock__(pid, stored_node_ref, sup_name)
+        report_lock_check_result(sup_name, result)
+        result
 
       # remote node, try rpc if we see the node online
       node_str in Enum.map(Node.list(), &to_string/1) ->
+        report_lock_diagnostic(sup_name, :check_lock_rpc_attempt)
         # remote node - use erpc
         rpc_result =
           erpc_call(
@@ -2424,46 +2434,68 @@ defmodule DurableServer do
           )
 
         case rpc_result do
-          {:locked, lock_pid} -> {:locked, lock_pid}
-          :expired -> :expired
+          {:locked, lock_pid} ->
+            report_lock_check_result(sup_name, {:locked, lock_pid})
+            {:locked, lock_pid}
+
+          :expired ->
+            report_lock_check_result(sup_name, :expired)
+            :expired
+
           # node/network failures - fallback to node health check to check expired status
-          {:error, {:erpc, :noconnection}} -> check_lock_via_node_health(meta)
-          {:error, {:erpc, :timeout}} -> check_lock_via_node_health(meta)
-          {:error, {:erpc, :notsup}} -> check_lock_via_node_health(meta)
+          {:error, {:erpc, :noconnection}} ->
+            report_lock_rpc_failure(sup_name, node_str, :noconnection)
+            check_lock_via_node_health(meta)
+
+          {:error, {:erpc, :timeout}} ->
+            report_lock_rpc_failure(sup_name, node_str, :timeout)
+            check_lock_via_node_health(meta)
+
+          {:error, {:erpc, :notsup}} ->
+            report_lock_rpc_failure(sup_name, node_str, :notsup)
+            check_lock_via_node_health(meta)
         end
 
       # node isn't known to us, check heartbeat cache to see if node is healthy
       true ->
+        report_lock_diagnostic(sup_name, :check_lock_node_not_connected)
         check_lock_via_node_health(meta)
     end
   end
 
-  defp check_lock_via_node_health(%Meta{node_ref: stored_node_ref} = meta) do
+  defp check_lock_via_node_health(%Meta{} = meta) do
+    %Meta{supervisor: sup_name, node_ref: stored_node_ref} = meta
+
     case LifecycleManager.lookup_node_health(meta) do
       # node is alive but not connected, treat as healthy until it goes stale
       # this could be temporary net split where both sides can reach object storage
       # but not eachother
       {:healthy, %{node_ref: ^stored_node_ref}} ->
+        report_lock_check_result(sup_name, {:locked, meta.pid})
         {:locked, meta.pid}
 
       # if node is healhty but has a newer node_ref, the node has been bounced for this
       # object and the pid is necessarily done, so we treat as expired
       {:healthy, %{node_ref: new_node_ref}} when new_node_ref > stored_node_ref ->
+        report_lock_check_result(sup_name, :expired)
         :expired
 
       # if node is healhty but has an older node_ref, a new node has come online
       # and placed a lock on this key and our node cache is not yet up to date
       {:healthy, %{node_ref: new_node_ref}} when new_node_ref < stored_node_ref ->
+        report_lock_check_result(sup_name, {:locked, meta.pid})
         {:locked, meta.pid}
 
       # node heartbeat is stale
       :stale ->
+        report_lock_check_result(sup_name, :expired)
         :expired
 
       # no heartbeat data in local cache - fetch directly from storage as fallback
       # this prevents incorrectly treating a node as expired just because we haven't
       # refreshed our cache since that node joined the cluster
       :unknown ->
+        report_lock_diagnostic(sup_name, :check_lock_heartbeat_unknown)
         check_lock_via_storage_heartbeat(meta)
     end
   end
@@ -2472,29 +2504,65 @@ defmodule DurableServer do
   defp check_lock_via_storage_heartbeat(
          %Meta{supervisor: supervisor_name, node_str: node_str, node_ref: stored_node_ref} = meta
        ) do
+    report_lock_diagnostic(supervisor_name, :check_lock_storage_heartbeat_fetch)
+
     case LifecycleManager.fetch_node_heartbeat_from_storage(supervisor_name, node_str) do
       {:healthy, %{node_ref: ^stored_node_ref}} ->
+        report_lock_check_result(supervisor_name, {:locked, meta.pid})
         {:locked, meta.pid}
 
       {:healthy, %{node_ref: new_node_ref}} when new_node_ref > stored_node_ref ->
+        report_lock_check_result(supervisor_name, :expired)
         :expired
 
       {:healthy, %{node_ref: new_node_ref}} when new_node_ref < stored_node_ref ->
+        report_lock_check_result(supervisor_name, {:locked, meta.pid})
         {:locked, meta.pid}
 
       :stale ->
+        report_lock_check_result(supervisor_name, :expired)
         :expired
 
       # No heartbeat in storage - node may have crashed before writing any heartbeat,
       # or heartbeat was cleaned up. Treat as expired.
       :not_found ->
+        report_lock_check_result(supervisor_name, :expired)
         :expired
 
       # Storage fetch failed - be conservative and assume lock is held to avoid
       # incorrectly stealing a lock due to transient storage errors
       {:error, _reason} ->
+        report_lock_diagnostic(supervisor_name, :check_lock_storage_heartbeat_error)
+        report_lock_check_result(supervisor_name, {:locked, meta.pid})
         {:locked, meta.pid}
     end
+  end
+
+  defp report_lock_diagnostic(supervisor_name, key) do
+    LifecycleManager.report_diagnostic(supervisor_name, key)
+  rescue
+    _ -> :ok
+  end
+
+  defp report_lock_check_result(supervisor_name, {:locked, _pid}) do
+    report_lock_diagnostic(supervisor_name, :check_lock_locked)
+  end
+
+  defp report_lock_check_result(supervisor_name, :expired) do
+    report_lock_diagnostic(supervisor_name, :check_lock_expired)
+  end
+
+  defp report_lock_rpc_failure(supervisor_name, node_str, reason)
+       when is_binary(node_str) and reason in [:timeout, :noconnection, :notsup] do
+    event_key =
+      case reason do
+        :timeout -> :check_lock_rpc_timeout
+        :noconnection -> :check_lock_rpc_noconnection
+        :notsup -> :check_lock_rpc_notsup
+      end
+
+    report_lock_diagnostic(supervisor_name, event_key)
+    report_lock_diagnostic(supervisor_name, {event_key, node_str})
   end
 
   # called via erpc on remote rpc call

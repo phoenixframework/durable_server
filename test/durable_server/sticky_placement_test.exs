@@ -482,6 +482,26 @@ defmodule DurableServer.StickyPlacementTest do
       assert nodes[node_str].heartbeat_meta == nil
     end
 
+    test "stop_discovery writes draining heartbeat immediately", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()}
+      )
+
+      Process.sleep(100)
+
+      :ok = DurableServer.LifecycleManager.stop_discovery(supervisor_name)
+
+      nodes = DurableServer.LifecycleManager.get_cluster_nodes(supervisor_name)
+      node_str = Atom.to_string(Node.self())
+
+      assert Map.has_key?(nodes, node_str)
+      assert nodes[node_str].heartbeat_meta["draining"] == true
+    end
+
     test "raises when heartbeat_meta function returns non-map", %{
       supervisor_name: supervisor_name,
       prefix: prefix

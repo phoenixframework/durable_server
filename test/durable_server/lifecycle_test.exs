@@ -51,6 +51,48 @@ defmodule DurableServer.LifecycleTest do
     end
   end
 
+  defmodule DelayedTerminateServer do
+    use DurableServer,
+      vsn: 1
+
+    def dump_state(state), do: Map.delete(state, :notify_pid)
+
+    def load_state(_old_vsn, persisted_state) do
+      DurableServer.LifecycleTest.atomify_keys(persisted_state)
+    end
+
+    def init(loaded_state) do
+      state =
+        loaded_state
+        |> Map.put_new(:count, 0)
+        |> Map.put_new(:terminate_delay_ms, 300)
+        |> Map.put_new(:notify_pid, nil)
+
+      {:ok, state, auto_sync: false}
+    end
+
+    def handle_call(:stop_normal, _from, state) do
+      {:stop, :normal, :ok, state}
+    end
+
+    def handle_call({:set_notify_pid, notify_pid}, _from, state) when is_pid(notify_pid) do
+      {:reply, :ok, Map.put(state, :notify_pid, notify_pid)}
+    end
+
+    def terminate(_reason, %{terminate_delay_ms: delay_ms, notify_pid: notify_pid})
+        when is_integer(delay_ms) and delay_ms > 0 do
+      if is_pid(notify_pid), do: send(notify_pid, {:terminate_started, self()})
+
+      Process.sleep(delay_ms)
+
+      if is_pid(notify_pid), do: send(notify_pid, {:terminate_finished, self()})
+
+      :ok
+    end
+
+    def terminate(_reason, _state), do: :ok
+  end
+
   setup do
     # Create test supervisor for this test
     supervisor_name = :"test_supervisor_#{DurableServer.UUID.uuid4()}"
@@ -171,6 +213,40 @@ defmodule DurableServer.LifecycleTest do
         DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
 
       assert data.meta.status == :stopped_graceful
+    end
+
+    test "graceful status persists after user terminate callback returns", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      config: config
+    } do
+      key = "delayed-terminate-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {DelayedTerminateServer, %{key: key, terminate_delay_ms: 300, notify_pid: self()}}
+        )
+
+      assert :ok = GenServer.call(pid, {:set_notify_pid, self()})
+
+      ref = Process.monitor(pid)
+      stop_task = Task.async(fn -> DurableServer.Supervisor.terminate_child(supervisor_name, pid) end)
+      assert_receive {:terminate_started, ^pid}, 1_000
+
+      {:ok, mid_data} =
+        DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+
+      assert mid_data.meta.status == :running
+      assert_receive {:terminate_finished, ^pid}, 1_000
+      assert :ok = Task.await(stop_task, 2_000)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+      {:ok, final_data} =
+        DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+
+      assert final_data.meta.status == :stopped_graceful
     end
 
     test "intentionaly stop permanent sets status to stopped_permanent", %{
@@ -673,7 +749,7 @@ defmodule DurableServer.LifecycleTest do
       wait_for_discovery_completion(manager_pid, 1500)
 
       # Manager should still be alive despite corrupted data
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       # Should have attempted to process or clean up corruption
       {:ok, data} =
@@ -755,7 +831,7 @@ defmodule DurableServer.LifecycleTest do
       wait_for_discovery_completion(manager_pid, 2000)
 
       # Manager should survive processing mixed objects
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       # Should have attempted restart only on valid crashed servers
       # Every 3rd key (0-indexed)
@@ -790,7 +866,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      assert Process.alive?(pid)
+      assert_process_alive(pid)
       GenServer.stop(pid)
     end
   end
@@ -804,6 +880,16 @@ defmodule DurableServer.LifecycleTest do
       )
 
     pid
+  end
+
+  defp assert_process_alive(pid, timeout_ms \\ 25) when is_pid(pid) do
+    ref = Process.monitor(pid)
+
+    try do
+      refute_receive {:DOWN, ^ref, :process, ^pid, _reason}, timeout_ms
+    after
+      Process.demonitor(ref, [:flush])
+    end
   end
 
   # Helper to create properly encoded test objects like DurableServer does
@@ -913,7 +999,7 @@ defmodule DurableServer.LifecycleTest do
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(pid, 500)
 
-      assert Process.alive?(pid)
+      assert_process_alive(pid)
       GenServer.stop(pid)
     end
 
@@ -948,7 +1034,7 @@ defmodule DurableServer.LifecycleTest do
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 500)
 
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
     end
 
@@ -994,7 +1080,7 @@ defmodule DurableServer.LifecycleTest do
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 500)
 
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
     end
 
@@ -1028,7 +1114,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1062,7 +1148,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1094,7 +1180,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1128,7 +1214,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1161,7 +1247,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1196,7 +1282,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1231,7 +1317,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1322,7 +1408,7 @@ defmodule DurableServer.LifecycleTest do
 
       # Wait for discovery to complete or manager to crash
       wait_for_discovery_completion(manager_pid, 100)
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
     end
@@ -1403,7 +1489,7 @@ defmodule DurableServer.LifecycleTest do
       send(manager_pid, :discover_and_restart)
       wait_for_discovery_completion(manager_pid, 100)
 
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
     end
 
@@ -1423,7 +1509,7 @@ defmodule DurableServer.LifecycleTest do
       wait_for_discovery_completion(manager_pid, 200)
 
       # Manager should still be alive and ready for next cycle
-      assert Process.alive?(manager_pid)
+      assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
     end
   end

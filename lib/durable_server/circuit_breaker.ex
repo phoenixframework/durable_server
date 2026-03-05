@@ -197,6 +197,57 @@ defmodule DurableServer.CircuitBreaker do
   end
 
   @doc """
+  Checks if remote placement attempts to `node_str` are currently rate-limited.
+
+  Returns `:ok` when placement attempts are allowed, or
+  `{:circuit_open, cooldown_ms}` when the node is in timeout cooldown.
+  """
+  @spec check_placement_node_timeout_circuit_breaker(t(), String.t()) ::
+          :ok | {:circuit_open, non_neg_integer()}
+  def check_placement_node_timeout_circuit_breaker(
+        %CircuitBreaker{table_name: table},
+        node_str
+      )
+      when is_binary(node_str) do
+    key = {:placement_node_timeout, node_str}
+    current_time = System.system_time(:millisecond)
+
+    case :ets.lookup(table, key) do
+      [{^key, _count, _last_reset, cooldown_until}] when current_time < cooldown_until ->
+        {:circuit_open, cooldown_until - current_time}
+
+      [{^key, _count, _last_reset, _cooldown_until}] ->
+        # cleanup expired cooldown entries aggressively to keep table small
+        :ets.delete(table, key)
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  @doc """
+  Opens a timeout cooldown for remote placement attempts to `node_str`.
+
+  This is used to avoid repeatedly hammering nodes that are timing out during
+  rolling deploys or transient network events.
+  """
+  @spec trip_placement_node_timeout_circuit_breaker(t(), String.t(), non_neg_integer()) :: :ok
+  def trip_placement_node_timeout_circuit_breaker(
+        %CircuitBreaker{table_name: table},
+        node_str,
+        cooldown_ms
+      )
+      when is_binary(node_str) and is_integer(cooldown_ms) and cooldown_ms > 0 do
+    key = {:placement_node_timeout, node_str}
+    current_time = System.system_time(:millisecond)
+    cooldown_until = current_time + cooldown_ms
+
+    :ets.insert(table, {key, 1, current_time, cooldown_until})
+    :ok
+  end
+
+  @doc """
   Prunes stale entries from the circuit breaker ets table.
 
   Called periodically by the LifecycleManager to clean up old entries

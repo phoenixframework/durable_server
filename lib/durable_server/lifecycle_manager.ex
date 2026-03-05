@@ -122,6 +122,7 @@ defmodule DurableServer.LifecycleManager do
             heartbeat_deadline_timer: nil,
             # Last successful heartbeat timing for diagnostics
             last_heartbeat_timing: nil,
+            discovery_diag_table: nil,
             discovery_skip_table: nil,
             discovery_stopped: false,
             discovery_burst_remaining: 0
@@ -170,6 +171,39 @@ defmodule DurableServer.LifecycleManager do
     GenServer.call(name(supervisor_name), :get_heartbeat_metrics)
   end
 
+  @doc """
+  Returns lifecycle discovery diagnostic counters for debugging cluster contention.
+
+  Keys are atoms or tuples such as `{:check_lock_rpc_timeout, "node@host"}`.
+  """
+  def get_discovery_diagnostics(supervisor_name) when is_atom(supervisor_name) do
+    table_name = discovery_diagnostics_table_name(supervisor_name)
+
+    case :ets.whereis(table_name) do
+      :undefined -> %{}
+      _ -> :ets.tab2list(table_name) |> Map.new()
+    end
+  rescue
+    ArgumentError -> %{}
+  end
+
+  @doc false
+  def report_diagnostic(supervisor_name, key, count \\ 1)
+      when is_atom(supervisor_name) and is_integer(count) and count > 0 do
+    table_name = discovery_diagnostics_table_name(supervisor_name)
+
+    case :ets.whereis(table_name) do
+      :undefined ->
+        :ok
+
+      _ ->
+        :ets.update_counter(table_name, key, {2, count}, {key, 0})
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
   def stop_discovery(supervisor_name) do
     GenServer.call(name(supervisor_name), :stop_discovery)
   end
@@ -211,6 +245,16 @@ defmodule DurableServer.LifecycleManager do
     skip_tab = :"durable_server_discovery_skip_#{supervisor_name}"
     :ets.new(skip_tab, [:set, :public, :named_table])
 
+    diagnostics_tab = discovery_diagnostics_table_name(supervisor_name)
+
+    :ets.new(diagnostics_tab, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
+
     state = %LifecycleManager{
       supervisor_name: supervisor_name,
       task_sup: task_supervisor,
@@ -226,6 +270,7 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_interval_ms: config.heartbeat_interval_ms,
       capacity_limits: capacity_limits,
       heartbeat_meta: heartbeat_meta,
+      discovery_diag_table: diagnostics_tab,
       discovery_skip_table: skip_tab,
       discovery_burst_remaining: Map.get(config, :discovery_burst_count, 0)
     }
@@ -494,7 +539,25 @@ defmodule DurableServer.LifecycleManager do
 
     :ets.insert(table_name, {:shutting_down, true})
 
-    {:reply, :ok, %{state | discovery_stopped: true, discovery_burst_remaining: 0}}
+    state = %{state | discovery_stopped: true, discovery_burst_remaining: 0}
+
+    # Publish a draining heartbeat immediately so peers stop routing remote placements here
+    # without waiting for the next periodic heartbeat tick.
+    state =
+      case write_node_heartbeat(state) do
+        {:ok, heartbeat_entry} ->
+          join_group_heartbeat(state, heartbeat_entry)
+          %{state | last_successful_heartbeat_at: System.system_time(:millisecond)}
+
+        {:error, reason} ->
+          log(state, :warning, fn ->
+            "Failed to write draining heartbeat during stop_discovery: #{inspect(reason)}"
+          end)
+
+          state
+      end
+
+    {:reply, :ok, state}
   end
 
   def handle_call(:get_heartbeat_metrics, _from, %LifecycleManager{} = state) do
@@ -614,7 +677,11 @@ defmodule DurableServer.LifecycleManager do
       |> Enum.into(%{})
 
     # resolve heartbeat_meta (can be a map or a function that returns a map)
-    heartbeat_meta = resolve_heartbeat_meta(state.heartbeat_meta)
+    # and add a draining marker while this supervisor is shutting down.
+    heartbeat_meta =
+      state.heartbeat_meta
+      |> resolve_heartbeat_meta()
+      |> maybe_mark_draining(state.supervisor_name)
 
     heartbeat_data =
       %{
@@ -658,17 +725,44 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp resolve_heartbeat_meta(nil), do: nil
-  defp resolve_heartbeat_meta(%{} = map), do: map
+  defp resolve_heartbeat_meta(%{} = map), do: normalize_heartbeat_meta_keys(map)
 
   defp resolve_heartbeat_meta(func) when is_function(func, 0) do
     case func.() do
       %{} = map ->
-        map
+        normalize_heartbeat_meta_keys(map)
 
       other ->
         raise ArgumentError,
               "heartbeat_meta function must return a map, got: #{inspect(other)}"
     end
+  end
+
+  defp maybe_mark_draining(heartbeat_meta, supervisor_name) when is_atom(supervisor_name) do
+    if supervisor_shutting_down?(supervisor_name) do
+      (heartbeat_meta || %{}) |> Map.put("draining", true)
+    else
+      heartbeat_meta
+    end
+  end
+
+  defp normalize_heartbeat_meta_keys(%{} = heartbeat_meta) do
+    Enum.into(heartbeat_meta, %{}, fn
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp supervisor_shutting_down?(supervisor_name) when is_atom(supervisor_name) do
+    case DurableServer.Supervisor.__get_config__(supervisor_name) do
+      %{ets_table: table_name} ->
+        match?([{:shutting_down, true}], :ets.lookup(table_name, :shutting_down))
+
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
   end
 
   # this gets run async inside a task
@@ -712,6 +806,11 @@ defmodule DurableServer.LifecycleManager do
                   {:fetch_error, key, {:json_decode, decode_reason}}
               end
 
+            {:error, :not_found} ->
+              # list/get race: key was removed after we listed it.
+              # This is expected during concurrent cleanup and should not fail heartbeat refresh.
+              {:missing, key}
+
             {:error, reason} ->
               {:fetch_error, key, reason}
           end
@@ -735,8 +834,14 @@ defmodule DurableServer.LifecycleManager do
           false
       end)
 
-    {dead_nodes, errors} =
+    {missing_nodes, non_missing_rest} =
       Enum.split_with(rest, fn
+        {:missing, _key} -> true
+        _ -> false
+      end)
+
+    {dead_nodes, errors} =
+      Enum.split_with(non_missing_rest, fn
         {:dead, _key, _node, _node_ref, _timestamp} -> true
         _ -> false
       end)
@@ -753,6 +858,12 @@ defmodule DurableServer.LifecycleManager do
           "Heartbeat fetch task failed: #{inspect(reason)}"
         end)
     end)
+
+    if missing_nodes != [] do
+      log(state, :debug, fn ->
+        "Skipped #{length(missing_nodes)} raced heartbeat key(s) during cache refresh"
+      end)
+    end
 
     error_count = length(errors)
 
@@ -792,6 +903,10 @@ defmodule DurableServer.LifecycleManager do
 
   defp heartbeat_table_name(supervisor_name) when is_atom(supervisor_name) do
     :"durable_server_heartbeats_#{supervisor_name}"
+  end
+
+  defp discovery_diagnostics_table_name(supervisor_name) when is_atom(supervisor_name) do
+    :"durable_server_discovery_diag_#{supervisor_name}"
   end
 
   # Join the Group heartbeat PG key with our heartbeat metadata so other nodes
@@ -885,14 +1000,21 @@ defmodule DurableServer.LifecycleManager do
 
     with %{heartbeat_interval_ms: heartbeat_interval_ms} <-
            DurableServer.Supervisor.__get_config__(supervisor_name),
-         [{^node_str, node_ref, timestamp, capacity, resources, _env_vars, _heartbeat_meta}] <-
+         [{^node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}] <-
            :ets.lookup(table_name, node_str) do
       current_time = System.system_time(:millisecond)
 
       if current_time - timestamp > heartbeat_interval_ms * 2 do
         :stale
       else
-        {:healthy, %{node_ref: node_ref, capacity: capacity, resources: resources}}
+        {:healthy,
+         %{
+           node_ref: node_ref,
+           capacity: capacity,
+           resources: resources,
+           env_vars: env_vars,
+           heartbeat_meta: heartbeat_meta
+         }}
       end
     else
       # Config not ready, or node not found in heartbeat table
@@ -990,6 +1112,7 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp discover_and_restart_servers(%LifecycleManager{} = state) do
+    diagnostics_before = discovery_diag_snapshot(state)
     skip_count = :ets.info(state.discovery_skip_table, :size)
 
     if skip_count > 0 do
@@ -1045,7 +1168,7 @@ defmodule DurableServer.LifecycleManager do
           "Processing parallel batch of #{length(batch)} servers for potential restart"
         end)
 
-        # process each item in parallel and block on results (Stream.run blocks)
+        # process each item in parallel and block until the batch completes
         batch
         |> Task.async_stream(
           fn {key, etag} ->
@@ -1072,16 +1195,106 @@ defmodule DurableServer.LifecycleManager do
                 :noop
             end
           end,
-          timeout: 60_000,
+          timeout: 120_000,
+          on_timeout: :kill_task,
+          ordered: false,
           max_concurrency: @parallel_restart_batch_size
         )
-        |> Stream.run()
+        |> Enum.reduce(%{timeouts: 0, exits: 0}, fn
+          {:ok, _result}, acc ->
+            acc
+
+          {:exit, :timeout}, acc ->
+            %{acc | timeouts: acc.timeouts + 1}
+
+          {:exit, reason}, acc ->
+            log(state, :warning, fn ->
+              "Discovery task exited for batch item: #{inspect(reason)}"
+            end)
+
+            %{acc | exits: acc.exits + 1}
+        end)
+        |> then(fn %{timeouts: timeouts, exits: exits} ->
+          if timeouts > 0 or exits > 0 do
+            log(state, :warning, fn ->
+              "Discovery batch had #{timeouts} timeout(s) and #{exits} exit(s) (batch_size=#{length(batch)}, timeout_ms=120000)"
+            end)
+          end
+        end)
 
       [] ->
         nil
     end)
 
+    log_discovery_diagnostics_delta(state, diagnostics_before)
     :ok
+  end
+
+  defp discovery_diag_snapshot(%LifecycleManager{} = state) do
+    case :ets.whereis(state.discovery_diag_table) do
+      :undefined -> %{}
+      _ -> :ets.tab2list(state.discovery_diag_table) |> Map.new()
+    end
+  rescue
+    ArgumentError -> %{}
+  end
+
+  defp log_discovery_diagnostics_delta(%LifecycleManager{} = state, before_snapshot) do
+    after_snapshot = discovery_diag_snapshot(state)
+
+    delta =
+      Enum.reduce(after_snapshot, %{}, fn {key, value}, acc ->
+        previous = Map.get(before_snapshot, key, 0)
+        diff = value - previous
+        if diff > 0, do: Map.put(acc, key, diff), else: acc
+      end)
+
+    group_nil = Map.get(delta, :group_lookup_nil, 0)
+    group_mismatch = Map.get(delta, :group_lookup_mismatch, 0)
+    slow_path = Map.get(delta, :slow_path_lock_checks, 0)
+    sync_stop_errors = Map.get(delta, :sync_and_stop_error, 0)
+    rpc_timeouts = Map.get(delta, :check_lock_rpc_timeout, 0)
+    rpc_noconnection = Map.get(delta, :check_lock_rpc_noconnection, 0)
+    rpc_notsup = Map.get(delta, :check_lock_rpc_notsup, 0)
+    placement_erpc_attempts = Map.get(delta, :remote_placement_erpc_attempt, 0)
+    placement_erpc_errors = Map.get(delta, :remote_placement_erpc_error, 0)
+    race_lookup_erpc_errors = Map.get(delta, :race_lookup_erpc_error, 0)
+
+    top_timeout_nodes = top_diag_nodes(delta, :check_lock_rpc_timeout)
+    top_noconnection_nodes = top_diag_nodes(delta, :check_lock_rpc_noconnection)
+    top_placement_attempt_nodes = top_diag_nodes(delta, :remote_placement_erpc_attempt)
+    top_placement_error_nodes = top_diag_nodes(delta, :remote_placement_erpc_error)
+
+    if group_nil > 0 or group_mismatch > 0 or sync_stop_errors > 0 or rpc_timeouts > 0 or
+         rpc_noconnection > 0 or rpc_notsup > 0 or placement_erpc_attempts > 0 or
+         placement_erpc_errors > 0 or race_lookup_erpc_errors > 0 do
+      log(state, :info, fn ->
+        "Discovery diagnostics delta: group_nil=#{group_nil} " <>
+          "group_mismatch=#{group_mismatch} slow_path=#{slow_path} " <>
+          "sync_stop_errors=#{sync_stop_errors} rpc_timeouts=#{rpc_timeouts} " <>
+          "rpc_noconnection=#{rpc_noconnection} rpc_notsup=#{rpc_notsup} " <>
+          "placement_erpc_attempts=#{placement_erpc_attempts} " <>
+          "placement_erpc_errors=#{placement_erpc_errors} " <>
+          "race_lookup_erpc_errors=#{race_lookup_erpc_errors} " <>
+          "timeout_nodes=#{inspect(top_timeout_nodes)} " <>
+          "noconnection_nodes=#{inspect(top_noconnection_nodes)} " <>
+          "placement_attempt_nodes=#{inspect(top_placement_attempt_nodes)} " <>
+          "placement_error_nodes=#{inspect(top_placement_error_nodes)}"
+      end)
+    end
+  end
+
+  defp top_diag_nodes(delta, event) do
+    delta
+    |> Enum.flat_map(fn
+      {{^event, node_str}, count} when is_binary(node_str) and is_integer(count) and count > 0 ->
+        [{node_str, count}]
+
+      _ ->
+        []
+    end)
+    |> Enum.sort_by(fn {_node_str, count} -> -count end)
+    |> Enum.take(3)
   end
 
   defp get_restartable_object(%LifecycleManager{} = state, key) do
@@ -1439,22 +1652,27 @@ defmodule DurableServer.LifecycleManager do
             case registry_meta do
               %{node_ref: node_ref} ->
                 if to_string(node(pid)) == meta.node_str and node_ref == meta.node_ref do
+                  report_diagnostic(supervisor_name, :group_lookup_match)
                   :healthy
                 else
+                  report_diagnostic(supervisor_name, :group_lookup_mismatch)
                   fetch_orphaned_slow_path(meta)
                 end
 
               %{} ->
+                report_diagnostic(supervisor_name, :group_lookup_mismatch)
                 fetch_orphaned_slow_path(meta)
             end
 
           nil ->
+            report_diagnostic(supervisor_name, :group_lookup_nil)
             fetch_orphaned_slow_path(meta)
         end
     end
   end
 
   defp fetch_orphaned_slow_path(%Meta{} = meta) do
+    report_diagnostic(meta.supervisor, :slow_path_lock_checks)
     node_health = lookup_node_health(meta)
 
     cond do
@@ -1756,7 +1974,9 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp parse_heartbeat_meta(nil), do: nil
-  defp parse_heartbeat_meta(%{} = heartbeat_meta), do: heartbeat_meta
+
+  defp parse_heartbeat_meta(%{} = heartbeat_meta),
+    do: normalize_heartbeat_meta_keys(heartbeat_meta)
 
   # Parses decoded heartbeat JSON into a structured tuple for ETS storage
   # Returns {:ok, {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}}
@@ -1848,7 +2068,7 @@ defmodule DurableServer.LifecycleManager do
 
         merged_nodes
         |> Enum.map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars,
-                        _heartbeat_meta} ->
+                        heartbeat_meta} ->
           try do
             node = String.to_existing_atom(node_str)
 
@@ -1856,7 +2076,14 @@ defmodule DurableServer.LifecycleManager do
 
             health =
               if heartbeat_age_ms <= @node_health_staleness_threshold_ms do
-                {:healthy, %{node_ref: node_ref, capacity: capacity, resources: resources}}
+                {:healthy,
+                 %{
+                   node_ref: node_ref,
+                   capacity: capacity,
+                   resources: resources,
+                   env_vars: env_vars,
+                   heartbeat_meta: heartbeat_meta
+                 }}
               else
                 :stale
               end
@@ -2038,13 +2265,19 @@ defmodule DurableServer.LifecycleManager do
     case node_health do
       {:healthy, %{capacity: nil, resources: nil}} ->
         # no capacity info (old heartbeat or no limits configured)
-        true
+        not node_draining?(node_health)
 
       {:healthy, info} ->
-        capacity_ok = check_capacity_ok(info[:capacity], module)
-        resources_ok = check_resources_ok(info[:resources], bypass_disk_check: bypass_disk_check)
+        if node_draining?(node_health) do
+          false
+        else
+          capacity_ok = check_capacity_ok(info[:capacity], module)
 
-        capacity_ok and resources_ok
+          resources_ok =
+            check_resources_ok(info[:resources], bypass_disk_check: bypass_disk_check)
+
+          capacity_ok and resources_ok
+        end
 
       _ ->
         # :stale, :unknown, or malformed
@@ -2121,52 +2354,63 @@ defmodule DurableServer.LifecycleManager do
     cpu_ok and memory_ok and disk_ok
   end
 
+  defp node_draining?({:healthy, %{heartbeat_meta: heartbeat_meta}})
+       when is_map(heartbeat_meta) do
+    Map.get(heartbeat_meta, "draining") == true
+  end
+
+  defp node_draining?(_), do: false
+
   defp capacity_rejection_reason({:healthy, info}, module) do
-    issues = []
+    if node_draining?({:healthy, info}) do
+      "node draining for shutdown"
+    else
+      issues = []
 
-    # Check total capacity
-    issues =
-      case info[:capacity][:total] do
-        %{current: current, limit: limit} when current >= limit ->
-          ["total: #{current}/#{limit}" | issues]
+      # Check total capacity
+      issues =
+        case info[:capacity][:total] do
+          %{current: current, limit: limit} when current >= limit ->
+            ["total: #{current}/#{limit}" | issues]
 
-        _ ->
-          issues
+          _ ->
+            issues
+        end
+
+      # Check module capacity
+      issues =
+        case info[:capacity][module] do
+          %{current: current, limit: limit} when current >= limit ->
+            ["#{inspect(module)}: #{current}/#{limit}" | issues]
+
+          _ ->
+            issues
+        end
+
+      # Check CPU
+      issues =
+        case info[:resources] do
+          %{cpu: cpu, max_cpu: max_cpu} when cpu >= max_cpu ->
+            ["CPU: #{cpu}% >= #{max_cpu}%" | issues]
+
+          _ ->
+            issues
+        end
+
+      # Check memory
+      issues =
+        case info[:resources] do
+          %{memory: memory, max_memory: max_memory} when memory >= max_memory ->
+            ["memory: #{memory}% >= #{max_memory}%" | issues]
+
+          _ ->
+            issues
+        end
+
+      case issues do
+        [] -> "node at capacity (unknown reason)"
+        _ -> "node at capacity: " <> Enum.join(issues, ", ")
       end
-
-    # Check module capacity
-    issues =
-      case info[:capacity][module] do
-        %{current: current, limit: limit} when current >= limit ->
-          ["#{inspect(module)}: #{current}/#{limit}" | issues]
-
-        _ ->
-          issues
-      end
-
-    # Check CPU
-    issues =
-      case info[:resources] do
-        %{cpu: cpu, max_cpu: max_cpu} when cpu >= max_cpu ->
-          ["CPU: #{cpu}% >= #{max_cpu}%" | issues]
-
-        _ ->
-          issues
-      end
-
-    # Check memory
-    issues =
-      case info[:resources] do
-        %{memory: memory, max_memory: max_memory} when memory >= max_memory ->
-          ["memory: #{memory}% >= #{max_memory}%" | issues]
-
-        _ ->
-          issues
-      end
-
-    case issues do
-      [] -> "node at capacity (unknown reason)"
-      _ -> "node at capacity: " <> Enum.join(issues, ", ")
     end
   end
 
