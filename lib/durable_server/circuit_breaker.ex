@@ -93,26 +93,15 @@ defmodule DurableServer.CircuitBreaker do
           :ok | {:circuit_open, non_neg_integer()}
   def check_module_circuit_breaker(%CircuitBreaker{table_name: table, config: config}, module) do
     current_time = System.system_time(:millisecond)
-    window_start = current_time - config.module_circuit_breaker_window_ms
 
-    case :ets.lookup(table, module) do
-      [{^module, _count, _last_reset, cooldown_until}] when current_time < cooldown_until ->
-        {:circuit_open, cooldown_until - current_time}
-
-      [{^module, _count, last_reset, _}] when last_reset < window_start ->
-        # Reset window
-        :ets.insert(table, {module, 0, current_time, 0})
-        :ok
-
-      [{^module, count, last_reset, _}] when count >= config.module_circuit_breaker_count ->
-        # Open circuit breaker
-        cooldown_until = current_time + config.module_circuit_breaker_cooldown_ms
-        :ets.insert(table, {module, count, last_reset, cooldown_until})
-        {:circuit_open, config.module_circuit_breaker_cooldown_ms}
-
-      _ ->
-        :ok
-    end
+    check_windowed(
+      table,
+      module,
+      current_time,
+      config.module_circuit_breaker_window_ms,
+      config.module_circuit_breaker_count,
+      config.module_circuit_breaker_cooldown_ms
+    )
   end
 
   @doc """
@@ -124,18 +113,7 @@ defmodule DurableServer.CircuitBreaker do
   @spec increment_module_circuit_breaker(t(), module()) :: :ok
   def increment_module_circuit_breaker(%CircuitBreaker{table_name: table}, module) do
     current_time = System.system_time(:millisecond)
-
-    # Use atomic update_counter to avoid race conditions
-    try do
-      :ets.update_counter(table, module, {2, 1})
-    catch
-      :error, :badarg ->
-        # Key doesn't exist, insert initial entry and try again
-        :ets.insert(table, {module, 0, current_time, 0})
-        :ets.update_counter(table, module, {2, 1})
-    end
-
-    :ok
+    inc(table, module, current_time)
   end
 
   @doc """
@@ -148,27 +126,15 @@ defmodule DurableServer.CircuitBreaker do
           :ok | {:circuit_open, non_neg_integer()}
   def check_global_lock_circuit_breaker(%CircuitBreaker{table_name: table, config: config}) do
     current_time = System.system_time(:millisecond)
-    window_start = current_time - config.global_lock_failure_window_ms
-    key = :global_lock_failures
 
-    case :ets.lookup(table, key) do
-      [{^key, _count, _last_reset, cooldown_until}] when current_time < cooldown_until ->
-        {:circuit_open, cooldown_until - current_time}
-
-      [{^key, _count, last_reset, _}] when last_reset < window_start ->
-        # reset window
-        :ets.insert(table, {key, 0, current_time, 0})
-        :ok
-
-      [{^key, count, last_reset, _}] when count >= config.global_lock_failure_count ->
-        # open circuit breaker
-        cooldown_until = current_time + config.global_lock_failure_cooldown_ms
-        :ets.insert(table, {key, count, last_reset, cooldown_until})
-        {:circuit_open, config.global_lock_failure_cooldown_ms}
-
-      _ ->
-        :ok
-    end
+    check_windowed(
+      table,
+      :global_lock_failures,
+      current_time,
+      config.global_lock_failure_window_ms,
+      config.global_lock_failure_count,
+      config.global_lock_failure_cooldown_ms
+    )
   end
 
   @doc """
@@ -181,19 +147,52 @@ defmodule DurableServer.CircuitBreaker do
   @spec increment_global_lock_failures(t()) :: :ok
   def increment_global_lock_failures(%CircuitBreaker{table_name: table}) do
     current_time = System.system_time(:millisecond)
-    key = :global_lock_failures
+    inc(table, :global_lock_failures, current_time)
+  end
 
-    # use atomic update_counter to avoid race conditions
-    try do
-      :ets.update_counter(table, key, {2, 1})
-    catch
-      :error, :badarg ->
-        # key doesn't exist, insert initial entry and try again
-        :ets.insert(table, {key, 0, current_time, 0})
-        :ets.update_counter(table, key, {2, 1})
+  @doc """
+  Checks if remote placement attempts to `node_str` are currently rate-limited.
+
+  Returns `:ok` when placement attempts are allowed, or
+  `{:circuit_open, cooldown_ms}` when the node is in timeout cooldown.
+  """
+  @spec check_placement_node_timeout_circuit_breaker(t(), String.t()) ::
+          :ok | {:circuit_open, non_neg_integer()}
+  def check_placement_node_timeout_circuit_breaker(
+        %CircuitBreaker{table_name: table},
+        node_str
+      )
+      when is_binary(node_str) do
+    key = {:placement_node_timeout, node_str}
+    current_time = System.system_time(:millisecond)
+
+    case check_cooldown(table, key, current_time) do
+      :ok ->
+        # cleanup expired cooldown entries aggressively to keep table small
+        :ets.delete(table, key)
+        :ok
+
+      other ->
+        other
     end
+  end
 
-    :ok
+  @doc """
+  Opens a timeout cooldown for remote placement attempts to `node_str`.
+
+  This is used to avoid repeatedly hammering nodes that are timing out during
+  rolling deploys or transient network events.
+  """
+  @spec trip_placement_node_timeout_circuit_breaker(t(), String.t(), non_neg_integer()) :: :ok
+  def trip_placement_node_timeout_circuit_breaker(
+        %CircuitBreaker{table_name: table},
+        node_str,
+        cooldown_ms
+      )
+      when is_binary(node_str) and is_integer(cooldown_ms) and cooldown_ms > 0 do
+    key = {:placement_node_timeout, node_str}
+    current_time = System.system_time(:millisecond)
+    trip_cooldown(table, key, current_time, cooldown_ms)
   end
 
   @doc """
@@ -205,17 +204,7 @@ defmodule DurableServer.CircuitBreaker do
   @spec prune_stale_entries(t()) :: :ok
   def prune_stale_entries(%CircuitBreaker{table_name: table, config: config}) do
     current_time = System.system_time(:millisecond)
-    window_start = current_time - config.module_circuit_breaker_window_ms
-
-    # Use select_delete to atomically remove stale entries
-    # Delete entries where last_reset is older than window_start AND cooldown_until is not active
-    match_spec = [
-      {{:"$1", :"$2", :"$3", :"$4"},
-       [{:and, {:<, :"$3", window_start}, {:"=<", :"$4", current_time}}], [true]}
-    ]
-
-    :ets.select_delete(table, match_spec)
-    :ok
+    prune(table, current_time, config.module_circuit_breaker_window_ms)
   end
 
   # Private functions
@@ -242,5 +231,80 @@ defmodule DurableServer.CircuitBreaker do
     window_start = current_time - breaker.config.crash_threshold_window_ms
 
     Enum.count(crash_history, fn %{timestamp: ts} -> ts > window_start end)
+  end
+
+  defp check_windowed(table, key, current_time, window_ms, limit, cooldown_ms) do
+    window_start = current_time - window_ms
+
+    case :ets.lookup(table, key) do
+      [{^key, _count, _last_reset, cooldown_until}] when current_time < cooldown_until ->
+        {:circuit_open, cooldown_until - current_time}
+
+      [{^key, _count, last_reset, _cooldown_until}] when last_reset < window_start ->
+        reset_window(table, key, current_time)
+        :ok
+
+      [{^key, count, last_reset, _cooldown_until}] when count >= limit ->
+        trip_cooldown(table, key, current_time, cooldown_ms, count, last_reset)
+        {:circuit_open, cooldown_ms}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp check_cooldown(table, key, current_time) do
+    case :ets.lookup(table, key) do
+      [{^key, _count, _last_reset, cooldown_until}] when current_time < cooldown_until ->
+        {:circuit_open, cooldown_until - current_time}
+
+      [{^key, _count, _last_reset, _cooldown_until}] ->
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp inc(table, key, current_time) do
+    # Use atomic update_counter to avoid race conditions.
+    try do
+      :ets.update_counter(table, key, {2, 1})
+    catch
+      :error, :badarg ->
+        # Key doesn't exist, insert initial entry and try again.
+        :ets.insert(table, {key, 0, current_time, 0})
+        :ets.update_counter(table, key, {2, 1})
+    end
+
+    :ok
+  end
+
+  defp trip_cooldown(table, key, current_time, cooldown_ms) do
+    trip_cooldown(table, key, current_time, cooldown_ms, 1, current_time)
+  end
+
+  defp trip_cooldown(table, key, current_time, cooldown_ms, count, last_reset) do
+    cooldown_until = current_time + cooldown_ms
+    :ets.insert(table, {key, count, last_reset, cooldown_until})
+    :ok
+  end
+
+  defp reset_window(table, key, current_time) do
+    :ets.insert(table, {key, 0, current_time, 0})
+  end
+
+  defp prune(table, current_time, window_ms) do
+    window_start = current_time - window_ms
+
+    # Use select_delete to atomically remove stale entries.
+    # Delete entries where last_reset is older than window_start and cooldown_until is not active.
+    match_spec = [
+      {{:"$1", :"$2", :"$3", :"$4"},
+       [{:and, {:<, :"$3", window_start}, {:"=<", :"$4", current_time}}], [true]}
+    ]
+
+    :ets.select_delete(table, match_spec)
+    :ok
   end
 end

@@ -25,6 +25,27 @@ defmodule DurableServer.RemotePlacementTest do
     def load_state(_vsn, state), do: state
   end
 
+  defmodule EnsureSingleflightTestServer do
+    use DurableServer, vsn: 1
+
+    @impl true
+    def init(%{singleflight_delay_ms: delay_ms} = state)
+        when is_integer(delay_ms) and delay_ms > 0 do
+      Process.sleep(delay_ms)
+      {:ok, Map.delete(state, :singleflight_delay_ms)}
+    end
+
+    def init(state) do
+      {:ok, state}
+    end
+
+    @impl true
+    def dump_state(state), do: state
+
+    @impl true
+    def load_state(_vsn, state), do: state
+  end
+
   setup do
     supervisor_name = :"test_supervisor_#{:erlang.unique_integer([:positive])}"
     prefix = "remote_placement_test_#{:erlang.unique_integer([:positive])}/"
@@ -224,7 +245,10 @@ defmodule DurableServer.RemotePlacementTest do
     } do
       start_supervised!(
         {DurableServer.Supervisor,
-         name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()}
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_singleflight_waiters_per_key_module: nil}
       )
 
       # Start first time
@@ -244,6 +268,91 @@ defmodule DurableServer.RemotePlacementTest do
         )
 
       assert pid1 == pid2
+    end
+
+    test "coalesces concurrent ensure_started_child calls by key+module", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_singleflight_waiters_per_key_module: nil}
+      )
+
+      key = "singleflight-#{:erlang.unique_integer([:positive])}"
+
+      child_spec =
+        {EnsureSingleflightTestServer, %{key: key, singleflight_delay_ms: 120}}
+
+      results =
+        1..24
+        |> Task.async_stream(
+          fn _ ->
+            DurableServer.Supervisor.ensure_started_child(supervisor_name, child_spec)
+          end,
+          max_concurrency: 24,
+          ordered: false,
+          timeout: :timer.seconds(10)
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      pids =
+        Enum.map(results, fn
+          {:ok, {pid, _meta}} when is_pid(pid) -> pid
+          other -> flunk("Unexpected ensure_started_child result: #{inspect(other)}")
+        end)
+
+      assert length(Enum.uniq(pids)) == 1
+
+      diagnostics = DurableServer.LifecycleManager.get_discovery_diagnostics(supervisor_name)
+      assert Map.get(diagnostics, :ensure_started_singleflight_leader, 0) >= 1
+      assert Map.get(diagnostics, :ensure_started_singleflight_waiter, 0) >= 1
+    end
+
+    test "fails fast when singleflight waiter cap is exceeded", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_singleflight_waiters_per_key_module: 1}
+      )
+
+      key = "singleflight-cap-#{:erlang.unique_integer([:positive])}"
+      child_spec = {EnsureSingleflightTestServer, %{key: key, singleflight_delay_ms: 300}}
+
+      results =
+        1..24
+        |> Task.async_stream(
+          fn _ ->
+            DurableServer.Supervisor.ensure_started_child(supervisor_name, child_spec)
+          end,
+          max_concurrency: 24,
+          ordered: false,
+          timeout: :timer.seconds(10)
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      success_count =
+        Enum.count(results, fn
+          {:ok, {pid, _meta}} when is_pid(pid) -> true
+          _ -> false
+        end)
+
+      overloaded_count =
+        Enum.count(results, fn
+          {:error, :singleflight_overloaded} -> true
+          _ -> false
+        end)
+
+      assert success_count >= 2
+      assert overloaded_count >= 1
     end
   end
 
@@ -336,6 +445,22 @@ defmodule DurableServer.RemotePlacementTest do
          }}
 
       assert DurableServer.LifecycleManager.can_node_accept_module?(
+               health,
+               RemotePlacementTestServer
+             )
+    end
+
+    test "returns false when node heartbeat marks node as draining" do
+      health =
+        {:healthy,
+         %{
+           node_ref: "test-ref",
+           capacity: %{:total => %{current: 1, limit: 10}},
+           resources: %{cpu: 10, max_cpu: 80},
+           heartbeat_meta: %{"draining" => true}
+         }}
+
+      refute DurableServer.LifecycleManager.can_node_accept_module?(
                health,
                RemotePlacementTestServer
              )
