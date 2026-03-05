@@ -174,7 +174,9 @@ defmodule DurableServer.LifecycleManager do
   @doc """
   Returns lifecycle discovery diagnostic counters for debugging cluster contention.
 
-  Keys are atoms or tuples such as `{:check_lock_rpc_timeout, "node@host"}`.
+  Keys are aggregate atoms, plus a small set of bounded tuple keys where the
+  second element is an atom reason (for example
+  `{:remote_placement_erpc_error, :timeout}`).
   """
   def get_discovery_diagnostics(supervisor_name) when is_atom(supervisor_name) do
     table_name = discovery_diagnostics_table_name(supervisor_name)
@@ -190,19 +192,34 @@ defmodule DurableServer.LifecycleManager do
   @doc false
   def report_diagnostic(supervisor_name, key, count \\ 1)
       when is_atom(supervisor_name) and is_integer(count) and count > 0 do
-    table_name = discovery_diagnostics_table_name(supervisor_name)
+    # Guardrail: reject high-cardinality diagnostic keys (e.g. node strings).
+    # We keep aggregate atoms and bounded reason tuples such as
+    # {:remote_placement_erpc_error, :timeout}.
+    if high_cardinality_diag_key?(key) do
+      :ok
+    else
+      table_name = discovery_diagnostics_table_name(supervisor_name)
 
-    case :ets.whereis(table_name) do
-      :undefined ->
-        :ok
+      case :ets.whereis(table_name) do
+        :undefined ->
+          :ok
 
-      _ ->
-        :ets.update_counter(table_name, key, {2, count}, {key, 0})
-        :ok
+        _ ->
+          :ets.update_counter(table_name, key, {2, count}, {key, 0})
+          :ok
+      end
     end
   rescue
     ArgumentError -> :ok
   end
+
+  defp high_cardinality_diag_key?(key) when is_tuple(key) do
+    key
+    |> Tuple.to_list()
+    |> Enum.any?(&is_binary/1)
+  end
+
+  defp high_cardinality_diag_key?(_), do: false
 
   def stop_discovery(supervisor_name) do
     GenServer.call(name(supervisor_name), :stop_discovery)
