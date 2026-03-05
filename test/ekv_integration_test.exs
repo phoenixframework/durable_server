@@ -64,7 +64,48 @@ defmodule DurableServer.EKVIntegrationTest do
       File.rm_rf(data_dir)
     end)
 
-    {:ok, supervisor_name: supervisor_name, prefix: prefix}
+    {:ok, supervisor_name: supervisor_name, prefix: prefix, ekv_name: ekv_name}
+  end
+
+  test "uses EKV backend defaults for heartbeat tracking and intervals", %{
+    supervisor_name: supervisor_name
+  } do
+    config = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    assert config.heartbeat_tracking_mode == :subscribe
+    assert config.discovery_interval_ms == 5_000
+    assert config.heartbeat_interval_ms == 5_000
+    assert config.heartbeat_reconcile_interval_ms == 30_000
+  end
+
+  test "explicit interval and tracking options override backend defaults", %{ekv_name: ekv_name} do
+    unique_id = System.unique_integer([:positive, :monotonic])
+    supervisor_name = :"durable_ekv_override_supervisor_#{unique_id}"
+    prefix = "ekv_integration_override/#{unique_id}/"
+
+    start_supervised!(%{
+      id: {DurableServer.Supervisor, supervisor_name},
+      start:
+        {DurableServer.Supervisor, :start_link,
+         [
+           [
+             name: supervisor_name,
+             prefix: prefix,
+             backend: {:ekv, [name: ekv_name]},
+             discovery_interval_ms: 11_000,
+             heartbeat_interval_ms: 7_000,
+             heartbeat_tracking_mode: :poll,
+             heartbeat_reconcile_interval_ms: 21_000
+           ]
+         ]}
+    })
+
+    config = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    assert config.discovery_interval_ms == 11_000
+    assert config.heartbeat_interval_ms == 7_000
+    assert config.heartbeat_tracking_mode == :poll
+    assert config.heartbeat_reconcile_interval_ms == 21_000
   end
 
   test "persists and reloads state with existing: true", %{supervisor_name: supervisor_name} do

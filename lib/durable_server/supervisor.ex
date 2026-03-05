@@ -69,6 +69,10 @@ defmodule DurableServer.Supervisor do
   - `:discovery_burst_count` - Number of initial discovery sweeps to run back-to-back
     without waiting for the discovery interval (default: 3)
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
+  - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
+    Defaults from backend capabilities.
+  - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval used
+    in `:subscribe` mode (default from backend capabilities).
   - `:dead_node_threshold_ms` - How long before a node is considered permanently dead and cleaned up
     (default: 86_400_000 = 24 hours)
   - `:crash_threshold_count` - Number of crashes before marking object as permanently crashed
@@ -171,6 +175,10 @@ defmodule DurableServer.Supervisor do
   @remote_placement_ready_timeout 500
   @shutdown_placement_attempt_wait_timeout :timer.seconds(1)
   @default_placement_timeout :timer.seconds(15)
+  @default_discovery_interval_ms 60_000
+  @default_heartbeat_interval_ms 10_000
+  @default_heartbeat_tracking_mode :poll
+  @default_heartbeat_reconcile_interval_ms 10_000
   @placement_retry_interval 500
   @placement_candidate_pool_multiplier 4
   @placement_candidate_pool_min 10
@@ -535,6 +543,8 @@ defmodule DurableServer.Supervisor do
   - `:max_children` - Maximum concurrent children (default: :infinity)
   - `:discovery_interval_ms` - Lifecycle discovery interval (default: 60_000)
   - `:heartbeat_interval_ms` - Node heartbeat interval (default: 10_000)
+  - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
+  - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
   - `:dead_node_threshold_ms` - Dead node cleanup threshold (default: 300_000)
   - `:crash_threshold_count` - Crashes before permanent crash (default: 5)
   - `:crash_threshold_window_ms` - Crash threshold window (default: 3_600_000)
@@ -2121,6 +2131,8 @@ defmodule DurableServer.Supervisor do
         :discovery_interval_ms,
         :discovery_burst_count,
         :heartbeat_interval_ms,
+        :heartbeat_tracking_mode,
+        :heartbeat_reconcile_interval_ms,
         :graceful_shutdown_timeout_ms,
         :graceful_shutdown_concurrency,
         :supervisor_shutdown_timeout_ms,
@@ -2154,6 +2166,33 @@ defmodule DurableServer.Supervisor do
     # Build storage backend from :backend or legacy :object_store options.
     {storage_backend, object_store} = build_storage_backend(opts, finch, task_sup)
     :ok = StorageBackend.ensure_ready(storage_backend)
+    backend_capabilities = StorageBackend.capabilities(storage_backend)
+
+    discovery_interval_ms =
+      extract_backend_tuned_interval!(
+        opts,
+        :discovery_interval_ms,
+        backend_capabilities,
+        @default_discovery_interval_ms
+      )
+
+    heartbeat_interval_ms =
+      extract_backend_tuned_interval!(
+        opts,
+        :heartbeat_interval_ms,
+        backend_capabilities,
+        @default_heartbeat_interval_ms
+      )
+
+    heartbeat_tracking_mode =
+      extract_heartbeat_tracking_mode_config(opts, backend_capabilities)
+
+    heartbeat_reconcile_interval_ms =
+      extract_heartbeat_reconcile_interval_config(
+        opts,
+        backend_capabilities,
+        heartbeat_tracking_mode
+      )
 
     # Extract and validate capacity limits
     capacity_limits = extract_capacity_limits(opts)
@@ -2228,9 +2267,11 @@ defmodule DurableServer.Supervisor do
       prefix: prefix,
       storage_backend: storage_backend,
       object_store: object_store,
-      discovery_interval_ms: Keyword.get(opts, :discovery_interval_ms, 60_000),
+      discovery_interval_ms: discovery_interval_ms,
       discovery_burst_count: Keyword.get(opts, :discovery_burst_count, 3),
-      heartbeat_interval_ms: Keyword.get(opts, :heartbeat_interval_ms, 10_000),
+      heartbeat_interval_ms: heartbeat_interval_ms,
+      heartbeat_tracking_mode: heartbeat_tracking_mode,
+      heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),
       graceful_shutdown_concurrency: Keyword.get(opts, :graceful_shutdown_concurrency, 50),
       supervisor_shutdown_timeout_ms: Keyword.get(opts, :supervisor_shutdown_timeout_ms, 60_000),
@@ -2448,6 +2489,7 @@ defmodule DurableServer.Supervisor do
   defp ensure_started_singleflight_waiters_registry_name(supervisor_name) do
     :"durable_sf_waiters_#{supervisor_name}"
   end
+
   defp extract_capacity_limits(opts) do
     limits = %{}
 
@@ -2624,6 +2666,66 @@ defmodule DurableServer.Supervisor do
       :error ->
         nil
     end
+  end
+
+  defp extract_backend_tuned_interval!(opts, key, backend_capabilities, fallback_default)
+       when is_list(opts) and is_atom(key) and is_map(backend_capabilities) and
+              is_integer(fallback_default) and fallback_default > 0 do
+    default =
+      case Map.get(backend_capabilities, key) do
+        value when is_integer(value) and value > 0 -> value
+        _ -> fallback_default
+      end
+
+    extract_positive_timeout!(opts, key, default)
+  end
+
+  defp extract_heartbeat_tracking_mode_config(opts, backend_capabilities)
+       when is_list(opts) and is_map(backend_capabilities) do
+    default_mode =
+      case Map.get(
+             backend_capabilities,
+             :heartbeat_tracking_mode,
+             @default_heartbeat_tracking_mode
+           ) do
+        mode when mode in [:poll, :subscribe] ->
+          mode
+
+        _ ->
+          @default_heartbeat_tracking_mode
+      end
+
+    case Keyword.get(opts, :heartbeat_tracking_mode, default_mode) do
+      mode when mode in [:poll, :subscribe] ->
+        mode
+
+      other ->
+        raise ArgumentError,
+              "heartbeat_tracking_mode must be :poll or :subscribe, got: #{inspect(other)}"
+    end
+  end
+
+  defp extract_heartbeat_reconcile_interval_config(
+         opts,
+         backend_capabilities,
+         heartbeat_tracking_mode
+       )
+       when is_list(opts) and is_map(backend_capabilities) and
+              heartbeat_tracking_mode in [:poll, :subscribe] do
+    fallback_default =
+      if heartbeat_tracking_mode == :subscribe do
+        30_000
+      else
+        @default_heartbeat_reconcile_interval_ms
+      end
+
+    default =
+      case Map.get(backend_capabilities, :heartbeat_reconcile_interval_ms, fallback_default) do
+        value when is_integer(value) and value > 0 -> value
+        _ -> fallback_default
+      end
+
+    extract_positive_timeout!(opts, :heartbeat_reconcile_interval_ms, default)
   end
 
   defp extract_placement_erpc_timeout_config(opts) do

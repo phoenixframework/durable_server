@@ -21,7 +21,15 @@ defmodule DurableServer.StorageBackend do
           optional(:last_modified) => term()
         }
 
+  @type capabilities :: %{
+          optional(:heartbeat_tracking_mode) => :poll | :subscribe,
+          optional(:discovery_interval_ms) => pos_integer(),
+          optional(:heartbeat_interval_ms) => pos_integer(),
+          optional(:heartbeat_reconcile_interval_ms) => pos_integer()
+        }
+
   @callback ensure_ready(state :: term()) :: :ok | {:error, term()}
+  @callback capabilities(state :: term()) :: capabilities()
   @callback get_object(state :: term(), key :: String.t(), opts :: keyword()) ::
               {:ok, object()} | {:error, term()}
   @callback list_all_objects_stream(state :: term(), prefix :: String.t(), opts :: keyword()) ::
@@ -39,6 +47,17 @@ defmodule DurableServer.StorageBackend do
               opts :: keyword()
             ) ::
               {:ok, object()} | {:error, term()}
+  @callback subscribe(
+              state :: term(),
+              subscriber :: pid(),
+              prefix :: String.t(),
+              opts :: keyword()
+            ) ::
+              {:ok, term()} | {:error, term()}
+  @callback unsubscribe(state :: term(), subscription_ref :: term()) ::
+              :ok | {:error, term()}
+
+  @optional_callbacks capabilities: 1, subscribe: 4, unsubscribe: 2
 
   @spec new(module(), term()) :: t()
   def new(adapter, state) when is_atom(adapter) do
@@ -48,6 +67,15 @@ defmodule DurableServer.StorageBackend do
   @spec ensure_ready(t()) :: :ok | {:error, term()}
   def ensure_ready(%__MODULE__{adapter: adapter, state: state}) do
     adapter.ensure_ready(state)
+  end
+
+  @spec capabilities(t()) :: capabilities()
+  def capabilities(%__MODULE__{adapter: adapter, state: state}) do
+    if function_exported?(adapter, :capabilities, 1) do
+      adapter.capabilities(state)
+    else
+      %{heartbeat_tracking_mode: :poll}
+    end
   end
 
   @spec get_object(t(), String.t(), keyword()) :: {:ok, object()} | {:error, term()}
@@ -90,5 +118,24 @@ defmodule DurableServer.StorageBackend do
   def update_object(%__MODULE__{adapter: adapter, state: state}, key, update_fn, opts \\ [])
       when is_binary(key) and is_function(update_fn, 1) and is_list(opts) do
     adapter.update_object(state, key, update_fn, opts)
+  end
+
+  @spec subscribe(t(), pid(), String.t(), keyword()) :: {:ok, term()} | {:error, term()}
+  def subscribe(%__MODULE__{adapter: adapter, state: state}, subscriber, prefix, opts \\ [])
+      when is_pid(subscriber) and is_binary(prefix) and is_list(opts) do
+    if function_exported?(adapter, :subscribe, 4) do
+      adapter.subscribe(state, subscriber, prefix, opts)
+    else
+      {:error, :unsupported}
+    end
+  end
+
+  @spec unsubscribe(t(), term()) :: :ok | {:error, term()}
+  def unsubscribe(%__MODULE__{adapter: adapter, state: state}, subscription_ref) do
+    if function_exported?(adapter, :unsubscribe, 2) do
+      adapter.unsubscribe(state, subscription_ref)
+    else
+      :ok
+    end
   end
 end

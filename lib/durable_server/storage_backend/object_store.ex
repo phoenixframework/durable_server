@@ -11,6 +11,16 @@ defmodule DurableServer.StorageBackend.ObjectStore do
   end
 
   @impl true
+  def capabilities(%ObjectStore{} = _store) do
+    %{
+      heartbeat_tracking_mode: :poll,
+      discovery_interval_ms: 60_000,
+      heartbeat_interval_ms: 10_000,
+      heartbeat_reconcile_interval_ms: 10_000
+    }
+  end
+
+  @impl true
   def get_object(%ObjectStore{} = store, key, opts) do
     ObjectStore.get_object(store, key, opts)
   end

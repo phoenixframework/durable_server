@@ -117,6 +117,9 @@ defmodule DurableServer.LifecycleManager do
             heartbeat_table: nil,
             discovery_interval_ms: nil,
             heartbeat_interval_ms: nil,
+            heartbeat_tracking_mode: :poll,
+            heartbeat_reconcile_interval_ms: nil,
+            heartbeat_subscription_ref: nil,
             capacity_limits: %{},
             heartbeat_meta: nil,
             last_successful_heartbeat_at: nil,
@@ -226,6 +229,7 @@ defmodule DurableServer.LifecycleManager do
     GenServer.call(name(supervisor_name), :stop_discovery)
   end
 
+  @impl true
   def init(opts) do
     supervisor_name = Keyword.fetch!(opts, :supervisor_name)
     task_supervisor = Keyword.fetch!(opts, :task_supervisor)
@@ -247,11 +251,16 @@ defmodule DurableServer.LifecycleManager do
     heartbeat_meta = Keyword.get(opts, :heartbeat_meta)
 
     config =
-      Keyword.get(opts, :config, %{
+      opts
+      |> Keyword.get(:config, %{
         discovery_interval_ms: 60_000,
         heartbeat_interval_ms: 10_000,
+        heartbeat_tracking_mode: :poll,
+        heartbeat_reconcile_interval_ms: 10_000,
         prefix: "test/"
       })
+      |> Map.put_new(:heartbeat_tracking_mode, :poll)
+      |> Map.put_new(:heartbeat_reconcile_interval_ms, 10_000)
 
     # Validate heartbeat timing config
     # Nodes are considered stale at 2x heartbeat_interval. If heartbeat_interval is too long,
@@ -298,6 +307,8 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_table: hearbeat_tab,
       discovery_interval_ms: config.discovery_interval_ms,
       heartbeat_interval_ms: config.heartbeat_interval_ms,
+      heartbeat_tracking_mode: config.heartbeat_tracking_mode,
+      heartbeat_reconcile_interval_ms: config.heartbeat_reconcile_interval_ms,
       capacity_limits: capacity_limits,
       heartbeat_meta: heartbeat_meta,
       discovery_diag_table: diagnostics_tab,
@@ -322,9 +333,15 @@ defmodule DurableServer.LifecycleManager do
     Process.send_after(self(), :heartbeat, config.heartbeat_interval_ms)
     Process.send_after(self(), :sweep_discovery_skip_set, @discovery_skip_sweep_interval_ms)
 
+    state = maybe_start_heartbeat_subscription(state)
+
+    if state.heartbeat_tracking_mode == :subscribe do
+      Process.send_after(self(), :heartbeat_reconcile, state.heartbeat_reconcile_interval_ms)
+    end
+
     # we MUST start with a populated node heartbeat cache
     # perform_heartbeat writes our heartbeat and refreshes the node health cache
-    {timing, heartbeat_entry} = perform_heartbeat(state)
+    {timing, heartbeat_entry} = perform_heartbeat(state, refresh_cache?: true)
 
     # Join Group with heartbeat data so other nodes see us instantly via peer_connect.
     # S3 is the source of truth for liveness; Group is the fast path for discovery.
@@ -338,6 +355,7 @@ defmodule DurableServer.LifecycleManager do
      }}
   end
 
+  @impl true
   def handle_info(:heartbeat, %LifecycleManager{} = state) do
     now = System.system_time(:millisecond)
     deadline_ms = heartbeat_hard_deadline_ms()
@@ -448,6 +466,36 @@ defmodule DurableServer.LifecycleManager do
     {:noreply, state}
   end
 
+  def handle_info(
+        :heartbeat_reconcile,
+        %LifecycleManager{heartbeat_tracking_mode: :subscribe} = state
+      ) do
+    Task.Supervisor.start_child(state.task_sup, fn ->
+      case refresh_node_heartbeat_cache(state) do
+        {:ok, _count, _cleaned_count, error_count} when error_count > 0 ->
+          log(state, :warning, fn ->
+            "Heartbeat reconcile observed #{error_count} heartbeat fetch error(s)"
+          end)
+
+        {:ok, _count, _cleaned_count, _error_count} ->
+          :ok
+      end
+    end)
+
+    Process.send_after(self(), :heartbeat_reconcile, state.heartbeat_reconcile_interval_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:heartbeat_reconcile, %LifecycleManager{} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info({:durable_server_storage_events, events}, %LifecycleManager{} = state)
+      when is_list(events) do
+    apply_storage_heartbeat_events(state, events)
+    {:noreply, state}
+  end
+
   def handle_info(:discover_and_restart, %LifecycleManager{discovery_stopped: true} = state) do
     {:noreply, state}
   end
@@ -552,6 +600,7 @@ defmodule DurableServer.LifecycleManager do
     {:stop, {:heartbeat_failed, reason}, state}
   end
 
+  @impl true
   def handle_call(:stop_discovery, _from, %LifecycleManager{} = state) do
     state =
       case state.current_discovery_task do
@@ -609,17 +658,16 @@ defmodule DurableServer.LifecycleManager do
     {:reply, metrics, state}
   end
 
-  defp perform_heartbeat(%LifecycleManager{} = state) do
-    start_time = System.monotonic_time(:millisecond)
+  @impl true
+  def terminate(_reason, %LifecycleManager{} = state) do
+    _ = maybe_stop_heartbeat_subscription(state)
+    :ok
+  end
 
-    # Start cache refresh in parallel (runs concurrently with PUT)
-    cache_task =
-      Task.Supervisor.async(state.task_sup, fn ->
-        cache_start = System.monotonic_time(:millisecond)
-        result = refresh_node_heartbeat_cache(state)
-        cache_duration = System.monotonic_time(:millisecond) - cache_start
-        {result, cache_duration}
-      end)
+  defp perform_heartbeat(%LifecycleManager{} = state, opts \\ []) do
+    opts = Keyword.validate!(opts, [:refresh_cache?])
+    refresh_cache? = Keyword.get(opts, :refresh_cache?, state.heartbeat_tracking_mode == :poll)
+    start_time = System.monotonic_time(:millisecond)
 
     # Do the critical heartbeat PUT inline
     put_start = System.monotonic_time(:millisecond)
@@ -637,9 +685,6 @@ defmodule DurableServer.LifecycleManager do
         {:error, reason} ->
           put_duration = System.monotonic_time(:millisecond) - put_start
 
-          # Kill the cache task since we're going to crash anyway
-          Task.shutdown(cache_task, :brutal_kill)
-
           # we must fail the DurableSupervisor tree (one_for_all) if we fail to heartbeat because our
           # children will become orphan claimable and if we can't reach object storage we are in a failed state
           raise RuntimeError,
@@ -648,8 +693,24 @@ defmodule DurableServer.LifecycleManager do
 
     put_duration = System.monotonic_time(:millisecond) - put_start
 
-    # Wait for cache refresh
-    {cache_result, cache_duration} = Task.await(cache_task, :timer.seconds(15))
+    cache_duration =
+      if refresh_cache? do
+        refresh_heartbeat_cache_with_timing!(state)
+      else
+        0
+      end
+
+    :ok = CircuitBreaker.prune_stale_entries(state.circuit_breaker)
+
+    total_duration = System.monotonic_time(:millisecond) - start_time
+
+    {%{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration}, heartbeat_entry}
+  end
+
+  defp refresh_heartbeat_cache_with_timing!(%LifecycleManager{} = state) do
+    cache_start = System.monotonic_time(:millisecond)
+    cache_result = refresh_node_heartbeat_cache(state)
+    cache_duration = System.monotonic_time(:millisecond) - cache_start
 
     case cache_result do
       {:ok, _count, _cleaned_count, error_count} when error_count > 0 ->
@@ -663,17 +724,101 @@ defmodule DurableServer.LifecycleManager do
           "Refreshed heartbeat cache with #{count} nodes, cleaned up #{cleaned_count} dead nodes in #{cache_duration}ms"
         end)
 
+        cache_duration
+
       {:ok, count, _cleaned_count, _error_count} ->
         log(state, :debug, fn ->
           "Refreshed heartbeat cache with #{count} nodes in #{cache_duration}ms"
         end)
+
+        cache_duration
     end
+  end
 
-    :ok = CircuitBreaker.prune_stale_entries(state.circuit_breaker)
+  defp maybe_start_heartbeat_subscription(
+         %LifecycleManager{heartbeat_tracking_mode: :subscribe} = state
+       ) do
+    heartbeat_prefix = "#{state.prefix}__nodes/"
 
-    total_duration = System.monotonic_time(:millisecond) - start_time
+    case StorageBackend.subscribe(state.object_store, self(), heartbeat_prefix) do
+      {:ok, subscription_ref} ->
+        %{state | heartbeat_subscription_ref: subscription_ref}
 
-    {%{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration}, heartbeat_entry}
+      {:error, :unsupported} ->
+        log(state, :warning, fn ->
+          "heartbeat_tracking_mode=:subscribe requested but backend does not support subscriptions, falling back to :poll"
+        end)
+
+        %{state | heartbeat_tracking_mode: :poll}
+
+      {:error, reason} ->
+        raise RuntimeError, "failed to subscribe heartbeat stream: #{inspect(reason)}"
+    end
+  end
+
+  defp maybe_start_heartbeat_subscription(%LifecycleManager{} = state), do: state
+
+  defp maybe_stop_heartbeat_subscription(
+         %LifecycleManager{heartbeat_subscription_ref: nil} = _state
+       ),
+       do: :ok
+
+  defp maybe_stop_heartbeat_subscription(%LifecycleManager{} = state) do
+    StorageBackend.unsubscribe(state.object_store, state.heartbeat_subscription_ref)
+  rescue
+    _ -> :ok
+  end
+
+  defp apply_storage_heartbeat_events(%LifecycleManager{} = state, events) when is_list(events) do
+    Enum.each(events, fn
+      %{type: :put, key: key, value: value} ->
+        apply_storage_heartbeat_put(state, key, value)
+
+      %{type: :delete, key: key} ->
+        apply_storage_heartbeat_delete(state, key)
+
+      _ ->
+        :ok
+    end)
+  end
+
+  defp apply_storage_heartbeat_put(%LifecycleManager{} = state, key, value)
+       when is_binary(key) and is_binary(value) do
+    if heartbeat_key_for_supervisor?(state, key) do
+      case JSON.decode(value) do
+        {:ok, data} ->
+          case parse_heartbeat_data(data) do
+            {:ok, heartbeat_tuple} ->
+              :ets.insert(state.heartbeat_table, heartbeat_tuple)
+
+            {:error, :invalid_format} ->
+              :ok
+          end
+
+        {:error, _reason} ->
+          :ok
+      end
+    end
+  end
+
+  defp apply_storage_heartbeat_put(%LifecycleManager{} = _state, _key, _value), do: :ok
+
+  defp apply_storage_heartbeat_delete(%LifecycleManager{} = state, key) when is_binary(key) do
+    nodes_prefix = "#{state.prefix}__nodes/"
+
+    if String.starts_with?(key, nodes_prefix) do
+      node_str = String.trim_leading(key, nodes_prefix)
+
+      if node_str != "" do
+        :ets.delete(state.heartbeat_table, node_str)
+      end
+    end
+  end
+
+  defp apply_storage_heartbeat_delete(%LifecycleManager{} = _state, _key), do: :ok
+
+  defp heartbeat_key_for_supervisor?(%LifecycleManager{} = state, key) when is_binary(key) do
+    String.starts_with?(key, "#{state.prefix}__nodes/")
   end
 
   defp log(%LifecycleManager{} = state, level, func)

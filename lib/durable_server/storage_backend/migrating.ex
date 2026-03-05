@@ -207,6 +207,13 @@ defmodule DurableServer.StorageBackend.Migrating do
   end
 
   @impl true
+  def capabilities(%{} = state) do
+    state
+    |> backend(state.read_preference)
+    |> StorageBackend.capabilities()
+  end
+
+  @impl true
   def get_object(%{} = state, key, opts) do
     read_backend = backend(state, state.read_preference)
     fallback_backend = backend(state, opposite(state.read_preference))
@@ -312,6 +319,27 @@ defmodule DurableServer.StorageBackend.Migrating do
         other
     end
   end
+
+  @impl true
+  def subscribe(%{} = state, subscriber, prefix, opts)
+      when is_pid(subscriber) and is_binary(prefix) and is_list(opts) do
+    read_preference = state.read_preference
+
+    case StorageBackend.subscribe(backend(state, read_preference), subscriber, prefix, opts) do
+      {:ok, subscription_ref} ->
+        {:ok, {read_preference, subscription_ref}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @impl true
+  def unsubscribe(%{} = state, {side, subscription_ref}) when side in @preference do
+    StorageBackend.unsubscribe(backend(state, side), subscription_ref)
+  end
+
+  def unsubscribe(%{} = _state, _subscription_ref), do: :ok
 
   defp promote_fallback_object(read_backend, key, body, read_opts, fallback_obj) do
     # Promote to the read backend so returned etag matches subsequent CAS writes.

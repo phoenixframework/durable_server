@@ -6,6 +6,7 @@ defmodule DurableServer.StorageBackend.EKV do
   @default_timeout 10_000
   @default_backoff {10, 60}
   @default_cas_retries 5
+  @subscribe_ready_timeout_ms 5_000
 
   @valid_state_opts [
     :name,
@@ -80,6 +81,67 @@ defmodule DurableServer.StorageBackend.EKV do
       :ok
     end
   end
+
+  @impl true
+  def capabilities(%{} = _state) do
+    %{
+      heartbeat_tracking_mode: :subscribe,
+      discovery_interval_ms: 5_000,
+      heartbeat_interval_ms: 5_000,
+      heartbeat_reconcile_interval_ms: 30_000
+    }
+  end
+
+  @impl true
+  def subscribe(%{} = state, subscriber, prefix, opts)
+      when is_pid(subscriber) and is_binary(prefix) and is_list(opts) do
+    _opts = Keyword.validate!(opts, [])
+
+    with_ekv(state, fn ->
+      parent = self()
+
+      {relay_pid, monitor_ref} =
+        spawn_monitor(fn ->
+          subscription_relay(parent, subscriber, state.name, prefix)
+        end)
+
+      receive do
+        {:durable_server_storage_subscribed, ^relay_pid, :ok} ->
+          Process.demonitor(monitor_ref, [:flush])
+          {:ok, relay_pid}
+
+        {:durable_server_storage_subscribed, ^relay_pid, {:error, reason}} ->
+          Process.demonitor(monitor_ref, [:flush])
+          {:error, reason}
+
+        {:DOWN, ^monitor_ref, :process, ^relay_pid, reason} ->
+          {:error, {:subscription_exit, reason}}
+      after
+        @subscribe_ready_timeout_ms ->
+          Process.exit(relay_pid, :kill)
+          {:error, :subscribe_timeout}
+      end
+    end)
+  end
+
+  @impl true
+  def unsubscribe(%{} = _state, subscription_ref) when is_pid(subscription_ref) do
+    if Process.alive?(subscription_ref) do
+      send(subscription_ref, {:durable_server_storage_unsubscribe, self()})
+
+      receive do
+        {:durable_server_storage_unsubscribed, ^subscription_ref} ->
+          :ok
+      after
+        @subscribe_ready_timeout_ms ->
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  def unsubscribe(%{} = _state, _subscription_ref), do: :ok
 
   @impl true
   def get_object(%{} = state, key, opts) when is_binary(key) do
@@ -467,6 +529,56 @@ defmodule DurableServer.StorageBackend.EKV do
     :rand.uniform(max_ms - min_ms + 1) + min_ms - 1
   end
 
+  defp subscription_relay(parent, subscriber, name, prefix) do
+    monitor_ref = Process.monitor(subscriber)
+
+    case ekv_subscribe(name, prefix) do
+      :ok ->
+        send(parent, {:durable_server_storage_subscribed, self(), :ok})
+        subscription_relay_loop(subscriber, name, prefix, monitor_ref)
+
+      {:error, reason} ->
+        send(parent, {:durable_server_storage_subscribed, self(), {:error, reason}})
+    end
+  end
+
+  defp subscription_relay_loop(subscriber, name, prefix, monitor_ref) do
+    receive do
+      {:durable_server_storage_unsubscribe, from} ->
+        _ = ekv_unsubscribe(name, prefix)
+        send(from, {:durable_server_storage_unsubscribed, self()})
+        :ok
+
+      {:DOWN, ^monitor_ref, :process, ^subscriber, _reason} ->
+        _ = ekv_unsubscribe(name, prefix)
+        :ok
+
+      {:ekv, events, %{name: ^name}} when is_list(events) ->
+        normalized_events =
+          events
+          |> Enum.flat_map(&normalize_ekv_event/1)
+
+        if normalized_events != [] do
+          send(subscriber, {:durable_server_storage_events, normalized_events})
+        end
+
+        subscription_relay_loop(subscriber, name, prefix, monitor_ref)
+
+      _other ->
+        subscription_relay_loop(subscriber, name, prefix, monitor_ref)
+    end
+  end
+
+  defp normalize_ekv_event(%{type: :put, key: key, value: value}) when is_binary(key) do
+    [%{type: :put, key: key, value: value}]
+  end
+
+  defp normalize_ekv_event(%{type: :delete, key: key, value: value}) when is_binary(key) do
+    [%{type: :delete, key: key, value: value}]
+  end
+
+  defp normalize_ekv_event(_event), do: []
+
   defp ekv_mod, do: :"Elixir.EKV"
 
   defp ekv_get_config(name), do: apply(ekv_mod(), :get_config, [name])
@@ -475,4 +587,6 @@ defmodule DurableServer.StorageBackend.EKV do
   defp ekv_put(name, key, value, opts), do: apply(ekv_mod(), :put, [name, key, value, opts])
   defp ekv_get(name, key, opts), do: apply(ekv_mod(), :get, [name, key, opts])
   defp ekv_delete(name, key, opts), do: apply(ekv_mod(), :delete, [name, key, opts])
+  defp ekv_subscribe(name, prefix), do: apply(ekv_mod(), :subscribe, [name, prefix])
+  defp ekv_unsubscribe(name, prefix), do: apply(ekv_mod(), :unsubscribe, [name, prefix])
 end
