@@ -96,6 +96,10 @@ defmodule DurableServer.Supervisor do
   - `:placement_region` - Optional region label used for placement timeout tuning.
     This value is written to heartbeat metadata as `"placement_region"` and used to detect
     same-region vs cross-region placement calls.
+  - `:placement_erpc_timeout_same_region_ms` - Timeout for remote placement ERPC calls when
+    target node is in the same `placement_region`. Default: `3_000`
+  - `:placement_erpc_timeout_cross_region_ms` - Timeout for remote placement ERPC calls when
+    target node is in a different/unknown `placement_region`. Default: `8_000`
   - `:sticky_placement_history_limit` - Maximum number of placement history entries to keep
     per server (default: 5). History tracks unique placement changes over time, useful for
     identifying displaced servers and re-homing decisions. Oldest entries are pruned first.
@@ -535,6 +539,10 @@ defmodule DurableServer.Supervisor do
   - `:object_store` - The configured `DurableServer.ObjectStore`. Defaults to preconfigured store.
   - `:init_info` - Map of user-defined data passed to each server's `init/2` callback (default: `%{}`)
   - `:placement_region` - Optional region label used for placement timeout tuning.
+  - `:placement_erpc_timeout_same_region_ms` - Same-region remote placement ERPC timeout in ms.
+    Default: #{@placement_erpc_timeout_same_region_ms}
+  - `:placement_erpc_timeout_cross_region_ms` - Cross-region remote placement ERPC timeout in ms.
+    Default: #{@placement_erpc_timeout_cross_region_ms}
   """
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -1207,11 +1215,15 @@ defmodule DurableServer.Supervisor do
        when is_atom(supervisor) and is_atom(node) do
     local_region = lookup_local_region(supervisor)
     remote_region = lookup_node_region(supervisor, node)
+    %{
+      placement_erpc_timeout_same_region_ms: same_region_timeout_ms,
+      placement_erpc_timeout_cross_region_ms: cross_region_timeout_ms
+    } = __get_config__(supervisor)
 
     if is_binary(local_region) and is_binary(remote_region) and local_region == remote_region do
-      @placement_erpc_timeout_same_region_ms
+      same_region_timeout_ms
     else
-      @placement_erpc_timeout_cross_region_ms
+      cross_region_timeout_ms
     end
   end
 
@@ -2110,7 +2122,9 @@ defmodule DurableServer.Supervisor do
         :sticky_placement,
         :default_sticky_placement,
         :heartbeat_meta,
-        :placement_region
+        :placement_region,
+        :placement_erpc_timeout_same_region_ms,
+        :placement_erpc_timeout_cross_region_ms
       ])
 
     name = Keyword.fetch!(opts, :name)
@@ -2146,6 +2160,16 @@ defmodule DurableServer.Supervisor do
     # Extract and validate heartbeat_meta config
     heartbeat_meta = extract_heartbeat_meta_config(opts)
     placement_region = extract_placement_region_config(opts)
+
+    {placement_erpc_timeout_same_region_ms, placement_erpc_timeout_cross_region_ms} =
+      extract_placement_erpc_timeout_config(opts)
+
+    if placement_erpc_timeout_same_region_ms > placement_erpc_timeout_cross_region_ms do
+      Logger.warning(
+        "placement_erpc_timeout_same_region_ms (#{placement_erpc_timeout_same_region_ms}) is greater than " <>
+          "placement_erpc_timeout_cross_region_ms (#{placement_erpc_timeout_cross_region_ms}); this may be unexpected"
+      )
+    end
 
     # For DynamicSupervisor, use :infinity or integer (not map)
     max_children =
@@ -2206,6 +2230,8 @@ defmodule DurableServer.Supervisor do
       sticky_placement_history_limit: Keyword.get(opts, :sticky_placement_history_limit, 5),
       init_info: Keyword.get(opts, :init_info, %{}),
       placement_region: placement_region,
+      placement_erpc_timeout_same_region_ms: placement_erpc_timeout_same_region_ms,
+      placement_erpc_timeout_cross_region_ms: placement_erpc_timeout_cross_region_ms,
       circuit_breaker: circuit_breaker,
       ets_table: table_name
     }
@@ -2493,6 +2519,35 @@ defmodule DurableServer.Supervisor do
 
       :error ->
         nil
+    end
+  end
+
+  defp extract_placement_erpc_timeout_config(opts) do
+    same_region_timeout_ms =
+      extract_positive_timeout!(
+        opts,
+        :placement_erpc_timeout_same_region_ms,
+        @placement_erpc_timeout_same_region_ms
+      )
+
+    cross_region_timeout_ms =
+      extract_positive_timeout!(
+        opts,
+        :placement_erpc_timeout_cross_region_ms,
+        @placement_erpc_timeout_cross_region_ms
+      )
+
+    {same_region_timeout_ms, cross_region_timeout_ms}
+  end
+
+  defp extract_positive_timeout!(opts, key, default) when is_list(opts) and is_atom(key) do
+    case Keyword.get(opts, key, default) do
+      timeout when is_integer(timeout) and timeout > 0 ->
+        timeout
+
+      other ->
+        raise ArgumentError,
+              "#{key} must be a positive integer (milliseconds), got: #{inspect(other)}"
     end
   end
 
