@@ -1556,8 +1556,8 @@ defmodule DurableServer.Supervisor do
           waiter_ref = make_ref()
           monitor_ref = Process.monitor(owner_pid)
 
-          try do
-            result =
+          result =
+            try do
               case Registry.register(waiters_registry, singleflight_key, waiter_ref) do
                 {:ok, _} ->
                   receive do
@@ -1594,25 +1594,25 @@ defmodule DurableServer.Supervisor do
                 {:error, {:already_registered, _}} ->
                   :retry
               end
-
-            case result do
-              {:follow_owner, new_owner_pid} ->
-                wait_for_ensure_started_singleflight_owner(
-                  supervisor,
-                  owner_registry,
-                  waiters_registry,
-                  singleflight_key,
-                  new_owner_pid,
-                  wait_timeout_ms
-                )
-
-              other ->
-                other
+            after
+              Process.demonitor(monitor_ref, [:flush])
+              safe_registry_unregister(waiters_registry, singleflight_key)
+              SingleflightGuard.release(guard_ref)
             end
-          after
-            Process.demonitor(monitor_ref, [:flush])
-            safe_registry_unregister(waiters_registry, singleflight_key)
-            SingleflightGuard.release(guard_ref)
+
+          case result do
+            {:follow_owner, new_owner_pid} ->
+              wait_for_ensure_started_singleflight_owner(
+                supervisor,
+                owner_registry,
+                waiters_registry,
+                singleflight_key,
+                new_owner_pid,
+                wait_timeout_ms
+              )
+
+            other ->
+              other
           end
       end
     end

@@ -18,25 +18,38 @@ defmodule DurableServer.SingleflightGuard do
       now = System.monotonic_time(:millisecond)
 
       if cooldown_open?(table, guard_key, now) do
-        {:error, :singleflight_overloaded}
-      else
-        count =
-          :ets.update_counter(
-            table,
-            guard_key,
-            {2, 1},
-            {guard_key, 0, 0, now}
-          )
+        case maybe_recover_from_stale_counter(
+               supervisor_name,
+               table,
+               guard_key,
+               singleflight_key,
+               max_waiters,
+               now
+             ) do
+          :ok ->
+            acquire_with_counter(
+              supervisor_name,
+              table,
+              guard_key,
+              singleflight_key,
+              wait_timeout_ms,
+              max_waiters,
+              now
+            )
 
-        :ets.update_element(table, guard_key, {4, now})
-
-        if count > max_waiters do
-          :ets.insert(table, {guard_key, count, now + wait_timeout_ms, now})
-          decrement_count(table, guard_key, now)
-          {:error, :singleflight_overloaded}
-        else
-          {:ok, {table, guard_key}}
+          {:overloaded, _actual_waiters, _repaired_count} ->
+            {:error, :singleflight_overloaded}
         end
+      else
+        acquire_with_counter(
+          supervisor_name,
+          table,
+          guard_key,
+          singleflight_key,
+          wait_timeout_ms,
+          max_waiters,
+          now
+        )
       end
     else
       {:ok, nil}
@@ -123,6 +136,75 @@ defmodule DurableServer.SingleflightGuard do
     end
   end
 
+  defp acquire_with_counter(
+         supervisor_name,
+         table,
+         guard_key,
+         singleflight_key,
+         wait_timeout_ms,
+         max_waiters,
+         now
+       ) do
+    count =
+      :ets.update_counter(
+        table,
+        guard_key,
+        {2, 1},
+        {guard_key, 0, 0, now}
+      )
+
+    :ets.update_element(table, guard_key, {4, now})
+
+    if count > max_waiters do
+      case maybe_recover_from_stale_counter(
+             supervisor_name,
+             table,
+             guard_key,
+             singleflight_key,
+             max_waiters,
+             now
+           ) do
+        :ok ->
+          {:ok, {table, guard_key}}
+
+        {:overloaded, _actual_waiters, _repaired_count} ->
+          :ets.insert(table, {guard_key, count, now + wait_timeout_ms, now})
+          decrement_count(table, guard_key, now)
+          {:error, :singleflight_overloaded}
+      end
+    else
+      {:ok, {table, guard_key}}
+    end
+  end
+
+  defp maybe_recover_from_stale_counter(
+         supervisor_name,
+         table,
+         guard_key,
+         singleflight_key,
+         max_waiters,
+         now
+       ) do
+    actual_waiters = waiter_count(supervisor_name, singleflight_key)
+
+    # Include the current caller's pending waiter slot in the repaired count.
+    repaired_count = max(actual_waiters + 1, 1)
+
+    if repaired_count <= max_waiters do
+      :ets.insert(table, {guard_key, repaired_count, 0, now})
+      :ok
+    else
+      {:overloaded, actual_waiters, repaired_count}
+    end
+  end
+
+  defp waiter_count(supervisor_name, singleflight_key) when is_atom(supervisor_name) do
+    waiters_registry = waiters_registry_name(supervisor_name)
+    Registry.count_match(waiters_registry, singleflight_key, :_)
+  rescue
+    _ -> 0
+  end
+
   defp sweep_table(table) when is_atom(table) do
     now = System.monotonic_time(:millisecond)
     stale_cutoff = now - @stale_entry_ttl_ms
@@ -162,5 +244,9 @@ defmodule DurableServer.SingleflightGuard do
 
   defp process_name(supervisor_name) do
     :"durable_sf_guard_#{supervisor_name}"
+  end
+
+  defp waiters_registry_name(supervisor_name) do
+    :"durable_sf_waiters_#{supervisor_name}"
   end
 end
