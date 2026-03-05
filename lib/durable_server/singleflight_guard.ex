@@ -5,15 +5,11 @@ defmodule DurableServer.SingleflightGuard do
   @sweep_interval_ms :timer.minutes(1)
   @stale_entry_ttl_ms :timer.minutes(10)
 
-  @type guard_ref :: {atom(), term()} | nil
-
   def start_link(opts) when is_list(opts) do
     supervisor_name = Keyword.fetch!(opts, :supervisor_name)
     GenServer.start_link(__MODULE__, supervisor_name, name: process_name(supervisor_name))
   end
 
-  @spec acquire(atom(), term(), pos_integer(), pos_integer() | nil) ::
-          {:ok, guard_ref()} | {:error, :singleflight_overloaded}
   def acquire(supervisor_name, singleflight_key, wait_timeout_ms, max_waiters)
       when is_atom(supervisor_name) and is_integer(wait_timeout_ms) and wait_timeout_ms > 0 do
     if is_integer(max_waiters) and max_waiters > 0 do
