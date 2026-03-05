@@ -1125,4 +1125,55 @@ defmodule DurableServer.CircuitBreakerTest do
       assert cooldown_ms == 3000
     end
   end
+
+  describe "placement node timeout circuit breaker" do
+    setup do
+      supervisor_name = :"test_supervisor_placement_timeout_#{DurableServer.UUID.uuid4()}"
+      circuit_breaker = CircuitBreaker.new(supervisor_name, @default_config)
+      %{circuit_breaker: circuit_breaker}
+    end
+
+    test "returns :ok when no timeout cooldown exists", %{circuit_breaker: circuit_breaker} do
+      assert CircuitBreaker.check_placement_node_timeout_circuit_breaker(
+               circuit_breaker,
+               "node@host"
+             ) == :ok
+    end
+
+    test "opens cooldown after timeout trip and returns remaining cooldown", %{
+      circuit_breaker: circuit_breaker
+    } do
+      :ok =
+        CircuitBreaker.trip_placement_node_timeout_circuit_breaker(
+          circuit_breaker,
+          "node@host",
+          2_000
+        )
+
+      assert {:circuit_open, remaining} =
+               CircuitBreaker.check_placement_node_timeout_circuit_breaker(
+                 circuit_breaker,
+                 "node@host"
+               )
+
+      assert remaining <= 2_000
+      assert remaining > 0
+    end
+
+    test "returns :ok after cooldown expires and cleans up entry", %{
+      circuit_breaker: circuit_breaker
+    } do
+      key = {:placement_node_timeout, "node@host"}
+      now = System.system_time(:millisecond)
+      expired = now - 100
+      :ets.insert(circuit_breaker.table_name, {key, 1, now, expired})
+
+      assert CircuitBreaker.check_placement_node_timeout_circuit_breaker(
+               circuit_breaker,
+               "node@host"
+             ) == :ok
+
+      assert [] == :ets.lookup(circuit_breaker.table_name, key)
+    end
+  end
 end

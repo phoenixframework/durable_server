@@ -29,6 +29,7 @@ defmodule DurableServer.Supervisor do
       MyApp.DurableSup
       ├── TaskSupervisor          # The task supervisor for for async internal operations
       ├── DynamicSupervisor       # The supervisor for all `DurableServer` processes on this node
+      ├── SingleflightGuard       # Guard table sweeper for ensure_started waiters
       ├── LifecycleManager        # Monitors and restarts crashed servers
       └── Terminator              # Coordinates graceful shutdown
 
@@ -37,6 +38,9 @@ defmodule DurableServer.Supervisor do
   **LifecycleManager**: Automatically detects and restarts crashed or orphaned
   DurableServer processes within this supervisor's scope. Uses object storage
   queries and node heartbeats to identify servers that need restart.
+
+  **SingleflightGuard**: Maintains and sweeps the per-key/module waiter guard
+  table used by `ensure_started_child/3` overload protection.
 
   **Terminator**: Handles graceful shutdown by instructing all DurableServer
   processes to sync their state before termination. Waits for confirmation
@@ -91,8 +95,18 @@ defmodule DurableServer.Supervisor do
   - `:heartbeat_meta` - Optional node metadata as a map or zero-arity function returning a map.
     Metadata is included in heartbeats and can be queried via `get_cluster_nodes/1` for admin
     dashboards or other informational purposes. Keys are converted to strings during JSON
-    serialization. Example: `heartbeat_meta: %{"region" => System.get_env("FLY_REGION")}`
-    or `heartbeat_meta: fn -> %{"region" => System.get_env("FLY_REGION")} end`
+    serialization. Example: `heartbeat_meta: %{"app" => "myapp"}`
+    or `heartbeat_meta: fn -> %{"deployment" => "bluegreen"} end`
+  - `:placement_region` - Optional region label used for placement timeout tuning.
+    This value is written to heartbeat metadata as `"placement_region"` and used to detect
+    same-region vs cross-region placement calls.
+  - `:placement_erpc_timeout_same_region_ms` - Timeout for remote placement ERPC calls when
+    target node is in the same `placement_region`. Default: `3_000`
+  - `:placement_erpc_timeout_cross_region_ms` - Timeout for remote placement ERPC calls when
+    target node is in a different/unknown `placement_region`. Default: `8_000`
+  - `:max_singleflight_waiters_per_key_module` - Per `{key, module}` cap for
+    concurrent `ensure_started_child/3` waiters. Calls beyond the cap fail fast with
+    `{:error, :singleflight_overloaded}`. Default: `50_000`. Set to `nil` to disable.
   - `:sticky_placement_history_limit` - Maximum number of placement history entries to keep
     per server (default: 5). History tracks unique placement changes over time, useful for
     identifying displaced servers and re-homing decisions. Oldest entries are pruned first.
@@ -146,14 +160,22 @@ defmodule DurableServer.Supervisor do
   @durable :durable
 
   alias DurableServer
-  alias DurableServer.{LifecycleManager, Terminator, CircuitBreaker, Meta}
+  alias DurableServer.{LifecycleManager, Terminator, CircuitBreaker, Meta, SingleflightGuard}
   alias DurableServer.ObjectStore
 
   @max_start_child_tries 10
   @default_ready_timeout 5_000
+  @remote_placement_ready_timeout 500
   @shutdown_placement_attempt_wait_timeout :timer.seconds(1)
   @default_placement_timeout :timer.seconds(15)
   @placement_retry_interval 500
+  @placement_candidate_pool_multiplier 4
+  @placement_candidate_pool_min 10
+  @placement_node_timeout_cooldown_ms :timer.seconds(15)
+  @placement_erpc_timeout_same_region_ms 3_000
+  @placement_erpc_timeout_cross_region_ms 8_000
+  @ensure_started_singleflight_wait_timeout_ms :timer.seconds(30)
+  @default_max_singleflight_waiters_per_key_module 50_000
 
   @doc """
   Checks if the DurableServer.Supervisor is ready to handle requests.
@@ -221,11 +243,22 @@ defmodule DurableServer.Supervisor do
   def lookup(sup_name, key) when is_atom(sup_name) and is_binary(key) do
     case Group.lookup(sup_name, key, extract_meta: & &1) do
       {pid, meta} when is_pid(pid) ->
-        # handle case where node-local DOWN from a caller races group cleanup
-        if node(pid) == Node.self() && !Process.alive?(pid) do
-          nil
-        else
-          {pid, meta.user_meta}
+        owner_node = node(pid)
+
+        cond do
+          # handle case where node-local DOWN from a caller races group cleanup
+          owner_node == Node.self() and not Process.alive?(pid) ->
+            nil
+
+          # if Group still points at a disconnected node, treat as not found so callers
+          # can re-resolve placement instead of repeatedly targeting stale owners.
+          owner_node != Node.self() and owner_node not in Node.list(:connected) ->
+            report_placement_diagnostic(sup_name, :lookup_remote_node_disconnected)
+
+            nil
+
+          true ->
+            {pid, meta.user_meta}
         end
 
       nil ->
@@ -513,6 +546,14 @@ defmodule DurableServer.Supervisor do
   - `:module_circuit_breaker_cooldown_ms` - Module circuit breaker cooldown (default: 600_000)
   - `:object_store` - The configured `DurableServer.ObjectStore`. Defaults to preconfigured store.
   - `:init_info` - Map of user-defined data passed to each server's `init/2` callback (default: `%{}`)
+  - `:placement_region` - Optional region label used for placement timeout tuning.
+  - `:placement_erpc_timeout_same_region_ms` - Same-region remote placement ERPC timeout in ms.
+    Default: #{@placement_erpc_timeout_same_region_ms}
+  - `:placement_erpc_timeout_cross_region_ms` - Cross-region remote placement ERPC timeout in ms.
+    Default: #{@placement_erpc_timeout_cross_region_ms}
+  - `:max_singleflight_waiters_per_key_module` - Per `{key, module}` cap for
+    concurrent `ensure_started_child/3` waiters. Calls beyond the cap fail fast with
+    `{:error, :singleflight_overloaded}`. Default: `50_000`. Set to `nil` to disable.
   """
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -604,13 +645,16 @@ defmodule DurableServer.Supervisor do
       # Wait for the supervisor to be ready to handle the race where RPC arrives before
       # ETS tables are created during node startup/rolling deploys.
       if max_placement_retries == 0 do
-        case wait_until_ready(supervisor) do
+        case wait_until_ready(supervisor,
+               timeout: @remote_placement_ready_timeout,
+               poll_interval: 50
+             ) do
           :ok ->
             :ok
 
           {:error, :timeout} ->
             Logger.warning(
-              "DurableServer.Supervisor #{inspect(supervisor)} not ready after #{@default_ready_timeout}ms on remote placement"
+              "DurableServer.Supervisor #{inspect(supervisor)} not ready after #{@remote_placement_ready_timeout}ms on remote placement"
             )
 
             # Return error so caller can try another node
@@ -781,6 +825,8 @@ defmodule DurableServer.Supervisor do
                      }) do
                   {:healthy, _node_ref} ->
                     try do
+                      report_placement_diagnostic(supervisor, :race_lookup_erpc_attempt)
+
                       case safe_erpc_call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
                         {pid, meta} when is_pid(pid) ->
                           {:error, {:already_started, {pid, meta}}}
@@ -797,6 +843,13 @@ defmodule DurableServer.Supervisor do
                       # Node appeared healthy but RPC failed - retry start since the
                       # "winning" process is likely gone
                       :error, {:erpc, erpc_reason} ->
+                        report_placement_diagnostic(supervisor, :race_lookup_erpc_error)
+
+                        report_placement_diagnostic(
+                          supervisor,
+                          {:race_lookup_erpc_error, erpc_reason}
+                        )
+
                         Logger.info(
                           "erpc to #{inspect(node(pid))} failed (#{inspect(erpc_reason)}), retrying start for #{inspect(key)}"
                         )
@@ -842,12 +895,16 @@ defmodule DurableServer.Supervisor do
           {nil, nil}
       end
 
+    candidate_limit =
+      max(max_retries * @placement_candidate_pool_multiplier, @placement_candidate_pool_min)
+
     eligible_nodes =
       LifecycleManager.find_eligible_nodes(supervisor, module,
-        limit: max_retries,
+        limit: candidate_limit,
         key: key,
         sticky_placement: sticky_placement
       )
+      |> prioritize_placement_nodes(supervisor, max_retries)
 
     case eligible_nodes do
       [] ->
@@ -864,6 +921,78 @@ defmodule DurableServer.Supervisor do
           sticky_placement: sticky_placement
         )
     end
+  end
+
+  # Prioritizes remote placement targets to avoid timeout storms:
+  # 1) Prefer connected nodes first
+  # 2) Skip nodes currently in timeout cooldown
+  # 3) If no connected targets remain, allow disconnected nodes as fallback
+  defp prioritize_placement_nodes(nodes, supervisor, max_retries)
+       when is_list(nodes) and is_atom(supervisor) and is_integer(max_retries) do
+    connected_set = Node.list() |> MapSet.new()
+
+    {connected_nodes, disconnected_nodes} =
+      Enum.split_with(nodes, fn node -> MapSet.member?(connected_set, node) end)
+
+    connected_candidates =
+      connected_nodes
+      |> Enum.reject(&placement_node_in_timeout_cooldown?(supervisor, &1))
+
+    disconnected_candidates =
+      disconnected_nodes
+      |> Enum.reject(&placement_node_in_timeout_cooldown?(supervisor, &1))
+      |> Enum.map(fn node ->
+        report_placement_diagnostic(supervisor, :remote_placement_node_disconnected_skip)
+
+        node
+      end)
+
+    candidates =
+      case connected_candidates do
+        [_ | _] -> connected_candidates
+        [] -> disconnected_candidates
+      end
+
+    Enum.take(candidates, max_retries)
+  end
+
+  defp placement_node_in_timeout_cooldown?(supervisor, node)
+       when is_atom(supervisor) and is_atom(node) do
+    node_str = to_string(node)
+
+    %{circuit_breaker: %CircuitBreaker{} = circuit_breaker} = __get_config__(supervisor)
+
+    case CircuitBreaker.check_placement_node_timeout_circuit_breaker(
+           circuit_breaker,
+           node_str
+         ) do
+      :ok ->
+        false
+
+      {:circuit_open, _cooldown_ms} ->
+        report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_skip)
+
+        true
+    end
+  rescue
+    _ -> false
+  end
+
+  defp mark_placement_node_timeout(supervisor, node) when is_atom(supervisor) and is_atom(node) do
+    node_str = to_string(node)
+    %{circuit_breaker: %CircuitBreaker{} = circuit_breaker} = __get_config__(supervisor)
+
+    :ok =
+      CircuitBreaker.trip_placement_node_timeout_circuit_breaker(
+        circuit_breaker,
+        node_str,
+        @placement_node_timeout_cooldown_ms
+      )
+
+    report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_trip)
+    :ok
+  rescue
+    _ -> :ok
   end
 
   defp try_remote_placement_with_retry(supervisor, child_spec, max_retries, deadline) do
@@ -977,16 +1106,24 @@ defmodule DurableServer.Supervisor do
 
   defp try_nodes(supervisor, {module, _init_arg} = child_spec, [node | rest], placement_opts) do
     Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
+    report_placement_diagnostic(supervisor, :remote_placement_erpc_attempt)
     shutdown_retries = Keyword.get(placement_opts, :shutdown_retries, 0)
+    erpc_timeout_ms = placement_erpc_timeout_ms(supervisor, node)
 
     # NOTE: we MUST pass max_placement_retries: 0 to prevent recursive retry on the other side
     try do
       result =
-        safe_erpc_call(node, __MODULE__, :start_child, [
-          supervisor,
-          child_spec,
-          [max_placement_retries: 0]
-        ])
+        safe_erpc_call(
+          node,
+          __MODULE__,
+          :start_child,
+          [
+            supervisor,
+            child_spec,
+            [max_placement_retries: 0]
+          ],
+          erpc_timeout_ms
+        )
 
       case result do
         {:ok, {pid, meta}} ->
@@ -1011,13 +1148,21 @@ defmodule DurableServer.Supervisor do
       end
     catch
       :throw, {:error, :not_ready} ->
+        report_placement_diagnostic(supervisor, :remote_placement_not_ready)
         Logger.warning("Node #{inspect(node)} not ready (still starting up), trying next node")
 
         try_nodes(supervisor, child_spec, rest, placement_opts)
 
       :error, {:erpc, erpc_reason} ->
+        if erpc_reason in [:timeout, :noconnection] do
+          mark_placement_node_timeout(supervisor, node)
+        end
+
+        report_placement_diagnostic(supervisor, :remote_placement_erpc_error)
+        report_placement_diagnostic(supervisor, {:remote_placement_erpc_error, erpc_reason})
+
         Logger.warning(
-          "ERPC to #{inspect(node)} failed: #{inspect(erpc_reason)}, trying next node"
+          "ERPC to #{inspect(node)} failed: #{inspect(erpc_reason)} (timeout=#{erpc_timeout_ms}ms), trying next node"
         )
 
         try_nodes(supervisor, child_spec, rest, placement_opts)
@@ -1036,6 +1181,7 @@ defmodule DurableServer.Supervisor do
             key: Keyword.get(placement_opts, :key),
             sticky_placement: Keyword.get(placement_opts, :sticky_placement)
           )
+          |> prioritize_placement_nodes(supervisor, 3)
 
         case fresh_nodes do
           [] ->
@@ -1065,6 +1211,50 @@ defmodule DurableServer.Supervisor do
 
         try_nodes(supervisor, child_spec, rest, placement_opts)
     end
+  end
+
+  defp placement_erpc_timeout_ms(supervisor, node)
+       when is_atom(supervisor) and is_atom(node) do
+    local_region = lookup_local_region(supervisor)
+    remote_region = lookup_node_region(supervisor, node)
+
+    %{
+      placement_erpc_timeout_same_region_ms: same_region_timeout_ms,
+      placement_erpc_timeout_cross_region_ms: cross_region_timeout_ms
+    } = __get_config__(supervisor)
+
+    if is_binary(local_region) and is_binary(remote_region) and local_region == remote_region do
+      same_region_timeout_ms
+    else
+      cross_region_timeout_ms
+    end
+  end
+
+  defp lookup_local_region(supervisor) when is_atom(supervisor) do
+    %{placement_region: region} = __get_config__(supervisor)
+    region
+  rescue
+    _ -> nil
+  end
+
+  defp lookup_node_region(supervisor, node) when is_atom(supervisor) and is_atom(node) do
+    node_str = to_string(node)
+
+    case LifecycleManager.lookup_node_health(%{supervisor: supervisor, node_str: node_str}) do
+      {:healthy, node_health} when is_map(node_health) ->
+        heartbeat_meta =
+          case Map.get(node_health, :heartbeat_meta) do
+            %{} = map -> map
+            _ -> %{}
+          end
+
+        Map.get(heartbeat_meta, "placement_region")
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
   end
 
   @doc """
@@ -1113,23 +1303,36 @@ defmodule DurableServer.Supervisor do
       )
   """
   def ensure_started_child(supervisor, {module, init_arg} = child_spec, opts \\ []) do
-    key =
-      case init_arg do
-        %{key: key} ->
-          key
+    key = ensure_started_child_key!(init_arg)
+    singleflight_key = {:ensure_started_child, key, module}
+    singleflight_wait_timeout_ms = ensure_started_singleflight_wait_timeout_ms(opts)
 
-        _ ->
-          raise ArgumentError,
-                "ensure_started_child expects a map with :key field, got: #{inspect(init_arg)}"
-      end
+    case with_ensure_started_singleflight(
+           supervisor,
+           singleflight_key,
+           singleflight_wait_timeout_ms,
+           fn ->
+             do_ensure_started_child(supervisor, module, key, child_spec, opts)
+           end
+         ) do
+      {:result, result} ->
+        result
 
+      :retry ->
+        ensure_started_child(supervisor, child_spec, opts)
+    end
+  end
+
+  defp do_ensure_started_child(supervisor, module, key, child_spec, opts) do
     case lookup(supervisor, key) do
       {pid, meta} ->
         {:ok, {pid, meta}}
 
       nil ->
         local_only = Keyword.get(opts, :local_only, false)
-        placement_timeout = Keyword.get(opts, :placement_timeout, @default_placement_timeout)
+        # ensure_started_child should be single-attempt by default so hot paths
+        # can control retry policy at the caller boundary.
+        placement_timeout = Keyword.get(opts, :placement_timeout, nil)
 
         # Try to fetch stored object to check sticky placement before attempting local start
         config = __get_config__(supervisor)
@@ -1246,10 +1449,15 @@ defmodule DurableServer.Supervisor do
 
             true ->
               # Normal flow: try local first, then remote if capacity exceeded
+              start_opts =
+                opts
+                |> Keyword.delete(:existing)
+                |> Keyword.put_new(:placement_timeout, nil)
+
               case start_child(
                      supervisor,
                      child_spec_with_restart,
-                     Keyword.delete(opts, :existing)
+                     start_opts
                    ) do
                 {:ok, {pid, meta}} ->
                   {:ok, {pid, meta}}
@@ -1264,6 +1472,173 @@ defmodule DurableServer.Supervisor do
           end
         end
     end
+  end
+
+  defp ensure_started_child_key!(%{key: key}), do: key
+
+  defp ensure_started_child_key!(init_arg) do
+    raise ArgumentError,
+          "ensure_started_child expects a map with :key field, got: #{inspect(init_arg)}"
+  end
+
+  defp ensure_started_singleflight_wait_timeout_ms(opts) when is_list(opts) do
+    case Keyword.get(opts, :placement_timeout) do
+      timeout when is_integer(timeout) and timeout > 0 ->
+        max(timeout, @ensure_started_singleflight_wait_timeout_ms)
+
+      _ ->
+        @ensure_started_singleflight_wait_timeout_ms
+    end
+  end
+
+  defp with_ensure_started_singleflight(supervisor, singleflight_key, wait_timeout_ms, fun)
+       when is_atom(supervisor) and is_integer(wait_timeout_ms) and wait_timeout_ms > 0 and
+              is_function(fun, 0) do
+    owner_registry = ensure_started_singleflight_registry_name(supervisor)
+    waiters_registry = ensure_started_singleflight_waiters_registry_name(supervisor)
+
+    case Registry.register(owner_registry, singleflight_key, :singleflight_owner) do
+      {:ok, _owner_pid} ->
+        report_placement_diagnostic(supervisor, :ensure_started_singleflight_leader)
+
+        try do
+          result = fun.()
+
+          dispatch_ensure_started_singleflight_result(
+            waiters_registry,
+            singleflight_key,
+            result
+          )
+
+          {:result, result}
+        after
+          safe_registry_unregister(owner_registry, singleflight_key)
+        end
+
+      {:error, {:already_registered, owner_pid}} ->
+        report_placement_diagnostic(supervisor, :ensure_started_singleflight_waiter)
+
+        wait_for_ensure_started_singleflight_owner(
+          supervisor,
+          owner_registry,
+          waiters_registry,
+          singleflight_key,
+          owner_pid,
+          wait_timeout_ms
+        )
+    end
+  rescue
+    ArgumentError ->
+      # Supervisor is shutting down or registry already gone; fall back to direct call.
+      {:result, fun.()}
+  end
+
+  defp wait_for_ensure_started_singleflight_owner(
+         supervisor,
+         owner_registry,
+         waiters_registry,
+         singleflight_key,
+         owner_pid,
+         wait_timeout_ms
+       )
+       when is_atom(supervisor) and is_atom(owner_registry) and is_atom(waiters_registry) and
+              is_pid(owner_pid) and is_integer(wait_timeout_ms) and wait_timeout_ms > 0 do
+    if owner_pid == self() do
+      :retry
+    else
+      %{max_singleflight_waiters_per_key_module: max_waiters} = __get_config__(supervisor)
+
+      case SingleflightGuard.acquire(supervisor, singleflight_key, wait_timeout_ms, max_waiters) do
+        {:error, :singleflight_overloaded} ->
+          {:result, {:error, :singleflight_overloaded}}
+
+        {:ok, guard_ref} ->
+          waiter_ref = make_ref()
+          monitor_ref = Process.monitor(owner_pid)
+
+          result =
+            try do
+              case Registry.register(waiters_registry, singleflight_key, waiter_ref) do
+                {:ok, _} ->
+                  receive do
+                    {:singleflight_done, ^singleflight_key, ^waiter_ref, singleflight_result} ->
+                      {:result, singleflight_result}
+
+                    {:DOWN, ^monitor_ref, :process, ^owner_pid, _reason} ->
+                      report_placement_diagnostic(
+                        supervisor,
+                        :ensure_started_singleflight_owner_down
+                      )
+
+                      :retry
+                  after
+                    wait_timeout_ms ->
+                      report_placement_diagnostic(
+                        supervisor,
+                        :ensure_started_singleflight_wait_timeout
+                      )
+
+                      case Registry.lookup(owner_registry, singleflight_key) do
+                        [] ->
+                          :retry
+
+                        [{new_owner_pid, _value}]
+                        when is_pid(new_owner_pid) and new_owner_pid != owner_pid ->
+                          {:follow_owner, new_owner_pid}
+
+                        _ ->
+                          :retry
+                      end
+                  end
+
+                {:error, {:already_registered, _}} ->
+                  :retry
+              end
+            after
+              Process.demonitor(monitor_ref, [:flush])
+              safe_registry_unregister(waiters_registry, singleflight_key)
+              SingleflightGuard.release(guard_ref)
+            end
+
+          case result do
+            {:follow_owner, new_owner_pid} ->
+              wait_for_ensure_started_singleflight_owner(
+                supervisor,
+                owner_registry,
+                waiters_registry,
+                singleflight_key,
+                new_owner_pid,
+                wait_timeout_ms
+              )
+
+            other ->
+              other
+          end
+      end
+    end
+  rescue
+    ArgumentError -> :retry
+  end
+
+  defp dispatch_ensure_started_singleflight_result(waiters_registry, singleflight_key, result)
+       when is_atom(waiters_registry) do
+    Registry.dispatch(waiters_registry, singleflight_key, fn entries ->
+      Enum.each(entries, fn {pid, waiter_ref} ->
+        send(pid, {:singleflight_done, singleflight_key, waiter_ref, result})
+      end)
+    end)
+
+    :ok
+  rescue
+    ArgumentError ->
+      :ok
+  end
+
+  defp safe_registry_unregister(registry, key) when is_atom(registry) do
+    Registry.unregister(registry, key)
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   # When the local node doesn't match sticky placement, poll Group.lookup and attempt
@@ -1524,14 +1899,21 @@ defmodule DurableServer.Supervisor do
       target_node != nil ->
         # Explicit target node specified
         Logger.info("Rehoming #{key}: placing on specified target #{inspect(target_node)}")
+        erpc_timeout_ms = placement_erpc_timeout_ms(supervisor, target_node)
 
         try do
           result =
-            safe_erpc_call(target_node, __MODULE__, :start_child, [
-              supervisor,
-              child_spec,
-              [max_placement_retries: 0]
-            ])
+            safe_erpc_call(
+              target_node,
+              __MODULE__,
+              :start_child,
+              [
+                supervisor,
+                child_spec,
+                [max_placement_retries: 0]
+              ],
+              erpc_timeout_ms
+            )
 
           case result do
             {:ok, {pid, meta}} ->
@@ -1554,6 +1936,10 @@ defmodule DurableServer.Supervisor do
             {:error, :not_ready}
 
           :error, {:erpc, erpc_reason} ->
+            if erpc_reason in [:timeout, :noconnection] do
+              mark_placement_node_timeout(supervisor, target_node)
+            end
+
             Logger.error("ERPC to #{inspect(target_node)} failed: #{inspect(erpc_reason)}")
             {:error, {:erpc, erpc_reason}}
         end
@@ -1569,6 +1955,7 @@ defmodule DurableServer.Supervisor do
             key: nil,
             sticky_placement: nil
           )
+          |> prioritize_placement_nodes(supervisor, 3)
 
         case eligible_nodes do
           [] ->
@@ -1750,7 +2137,11 @@ defmodule DurableServer.Supervisor do
         :global_lock_failure_cooldown_ms,
         :sticky_placement,
         :default_sticky_placement,
-        :heartbeat_meta
+        :heartbeat_meta,
+        :placement_region,
+        :placement_erpc_timeout_same_region_ms,
+        :placement_erpc_timeout_cross_region_ms,
+        :max_singleflight_waiters_per_key_module
       ])
 
     name = Keyword.fetch!(opts, :name)
@@ -1785,6 +2176,20 @@ defmodule DurableServer.Supervisor do
 
     # Extract and validate heartbeat_meta config
     heartbeat_meta = extract_heartbeat_meta_config(opts)
+    placement_region = extract_placement_region_config(opts)
+
+    {placement_erpc_timeout_same_region_ms, placement_erpc_timeout_cross_region_ms} =
+      extract_placement_erpc_timeout_config(opts)
+
+    max_singleflight_waiters_per_key_module =
+      extract_max_singleflight_waiters_per_key_module_config(opts)
+
+    if placement_erpc_timeout_same_region_ms > placement_erpc_timeout_cross_region_ms do
+      Logger.warning(
+        "placement_erpc_timeout_same_region_ms (#{placement_erpc_timeout_same_region_ms}) is greater than " <>
+          "placement_erpc_timeout_cross_region_ms (#{placement_erpc_timeout_cross_region_ms}); this may be unexpected"
+      )
+    end
 
     # For DynamicSupervisor, use :infinity or integer (not map)
     max_children =
@@ -1844,6 +2249,10 @@ defmodule DurableServer.Supervisor do
       dead_node_threshold_ms: Keyword.get(opts, :dead_node_threshold_ms, 5 * 60 * 1000),
       sticky_placement_history_limit: Keyword.get(opts, :sticky_placement_history_limit, 5),
       init_info: Keyword.get(opts, :init_info, %{}),
+      placement_region: placement_region,
+      placement_erpc_timeout_same_region_ms: placement_erpc_timeout_same_region_ms,
+      placement_erpc_timeout_cross_region_ms: placement_erpc_timeout_cross_region_ms,
+      max_singleflight_waiters_per_key_module: max_singleflight_waiters_per_key_module,
       circuit_breaker: circuit_breaker,
       ets_table: table_name
     }
@@ -1876,6 +2285,9 @@ defmodule DurableServer.Supervisor do
 
     children = [
       {Group, group_opts},
+      {Registry, keys: :unique, name: ensure_started_singleflight_registry_name(name)},
+      {Registry, keys: :duplicate, name: ensure_started_singleflight_waiters_registry_name(name)},
+      {SingleflightGuard, supervisor_name: name},
       {Task.Supervisor, name: task_sup_name},
       {DynamicSupervisor,
        name: dynamic_sup_name,
@@ -1910,6 +2322,12 @@ defmodule DurableServer.Supervisor do
       :erlang.error({:erpc, :noconnection})
   end
 
+  defp report_placement_diagnostic(supervisor_name, key) do
+    LifecycleManager.report_diagnostic(supervisor_name, key)
+  rescue
+    _ -> :ok
+  end
+
   @doc false
   def __safe_apply__(mod, func, args) do
     case :init.get_status() do
@@ -1938,6 +2356,14 @@ defmodule DurableServer.Supervisor do
 
   defp ets_table_name(supervisor_name) do
     :"durable_supervisor_#{supervisor_name}"
+  end
+
+  defp ensure_started_singleflight_registry_name(supervisor_name) do
+    :"durable_sf_owner_#{supervisor_name}"
+  end
+
+  defp ensure_started_singleflight_waiters_registry_name(supervisor_name) do
+    :"durable_sf_waiters_#{supervisor_name}"
   end
 
   defp extract_capacity_limits(opts) do
@@ -2073,7 +2499,7 @@ defmodule DurableServer.Supervisor do
   defp extract_heartbeat_meta_config(opts) do
     case Keyword.get(opts, :heartbeat_meta) do
       nil ->
-        nil
+        %{}
 
       %{} = map ->
         map
@@ -2092,6 +2518,75 @@ defmodule DurableServer.Supervisor do
       other ->
         raise ArgumentError,
               "heartbeat_meta must be a map or a zero-arity function returning a map, got: #{inspect(other)}"
+    end
+  end
+
+  defp extract_placement_region_config(opts) do
+    case Keyword.fetch(opts, :placement_region) do
+      {:ok, nil} ->
+        nil
+
+      {:ok, region} when is_binary(region) ->
+        region = String.trim(region)
+
+        if region == "" do
+          raise ArgumentError, "placement_region must be a non-empty string when provided"
+        else
+          region
+        end
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "placement_region must be a string when provided, got: #{inspect(other)}"
+
+      :error ->
+        nil
+    end
+  end
+
+  defp extract_placement_erpc_timeout_config(opts) do
+    same_region_timeout_ms =
+      extract_positive_timeout!(
+        opts,
+        :placement_erpc_timeout_same_region_ms,
+        @placement_erpc_timeout_same_region_ms
+      )
+
+    cross_region_timeout_ms =
+      extract_positive_timeout!(
+        opts,
+        :placement_erpc_timeout_cross_region_ms,
+        @placement_erpc_timeout_cross_region_ms
+      )
+
+    {same_region_timeout_ms, cross_region_timeout_ms}
+  end
+
+  defp extract_max_singleflight_waiters_per_key_module_config(opts) do
+    case Keyword.fetch(opts, :max_singleflight_waiters_per_key_module) do
+      :error ->
+        @default_max_singleflight_waiters_per_key_module
+
+      {:ok, nil} ->
+        nil
+
+      {:ok, max_waiters} when is_integer(max_waiters) and max_waiters > 0 ->
+        max_waiters
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "max_singleflight_waiters_per_key_module must be a positive integer when provided, got: #{inspect(other)}"
+    end
+  end
+
+  defp extract_positive_timeout!(opts, key, default) when is_list(opts) and is_atom(key) do
+    case Keyword.get(opts, key, default) do
+      timeout when is_integer(timeout) and timeout > 0 ->
+        timeout
+
+      other ->
+        raise ArgumentError,
+              "#{key} must be a positive integer (milliseconds), got: #{inspect(other)}"
     end
   end
 
