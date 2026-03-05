@@ -698,6 +698,7 @@ defmodule DurableServer.LifecycleManager do
     heartbeat_meta =
       state.heartbeat_meta
       |> resolve_heartbeat_meta()
+      |> maybe_apply_placement_region(state.config)
       |> maybe_mark_draining(state.supervisor_name)
 
     heartbeat_data =
@@ -741,7 +742,7 @@ defmodule DurableServer.LifecycleManager do
     end
   end
 
-  defp resolve_heartbeat_meta(nil), do: nil
+  defp resolve_heartbeat_meta(nil), do: %{}
   defp resolve_heartbeat_meta(%{} = map), do: normalize_heartbeat_meta_keys(map)
 
   defp resolve_heartbeat_meta(func) when is_function(func, 0) do
@@ -754,6 +755,14 @@ defmodule DurableServer.LifecycleManager do
               "heartbeat_meta function must return a map, got: #{inspect(other)}"
     end
   end
+
+  defp maybe_apply_placement_region(heartbeat_meta, %{placement_region: region})
+       when is_map(heartbeat_meta) and is_binary(region) and region != "" do
+    Map.put(heartbeat_meta, "placement_region", region)
+  end
+
+  defp maybe_apply_placement_region(%{} = heartbeat_meta, _),
+    do: Map.delete(heartbeat_meta, "placement_region")
 
   defp maybe_mark_draining(heartbeat_meta, supervisor_name) when is_atom(supervisor_name) do
     if supervisor_shutting_down?(supervisor_name) do

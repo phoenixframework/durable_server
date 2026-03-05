@@ -463,7 +463,7 @@ defmodule DurableServer.StickyPlacementTest do
       assert heartbeat_meta["dynamic"] == true
     end
 
-    test "heartbeat_meta is nil when not configured", %{
+    test "heartbeat_meta defaults to empty map when not configured", %{
       supervisor_name: supervisor_name,
       prefix: prefix
     } do
@@ -479,7 +479,7 @@ defmodule DurableServer.StickyPlacementTest do
       node_str = Atom.to_string(Node.self())
 
       assert Map.has_key?(nodes, node_str)
-      assert nodes[node_str].heartbeat_meta == nil
+      assert nodes[node_str].heartbeat_meta == %{}
     end
 
     test "stop_discovery writes draining heartbeat immediately", %{

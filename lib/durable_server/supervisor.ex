@@ -91,8 +91,11 @@ defmodule DurableServer.Supervisor do
   - `:heartbeat_meta` - Optional node metadata as a map or zero-arity function returning a map.
     Metadata is included in heartbeats and can be queried via `get_cluster_nodes/1` for admin
     dashboards or other informational purposes. Keys are converted to strings during JSON
-    serialization. Example: `heartbeat_meta: %{"region" => System.get_env("FLY_REGION")}`
-    or `heartbeat_meta: fn -> %{"region" => System.get_env("FLY_REGION")} end`
+    serialization. Example: `heartbeat_meta: %{"app" => "myapp"}`
+    or `heartbeat_meta: fn -> %{"deployment" => "bluegreen"} end`
+  - `:placement_region` - Optional region label used for placement timeout tuning.
+    This value is written to heartbeat metadata as `"placement_region"` and used to detect
+    same-region vs cross-region placement calls.
   - `:sticky_placement_history_limit` - Maximum number of placement history entries to keep
     per server (default: 5). History tracks unique placement changes over time, useful for
     identifying displaced servers and re-homing decisions. Oldest entries are pruned first.
@@ -531,6 +534,7 @@ defmodule DurableServer.Supervisor do
   - `:module_circuit_breaker_cooldown_ms` - Module circuit breaker cooldown (default: 600_000)
   - `:object_store` - The configured `DurableServer.ObjectStore`. Defaults to preconfigured store.
   - `:init_info` - Map of user-defined data passed to each server's `init/2` callback (default: `%{}`)
+  - `:placement_region` - Optional region label used for placement timeout tuning.
   """
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -1201,7 +1205,7 @@ defmodule DurableServer.Supervisor do
 
   defp placement_erpc_timeout_ms(supervisor, node)
        when is_atom(supervisor) and is_atom(node) do
-    local_region = System.get_env("FLY_REGION")
+    local_region = lookup_local_region(supervisor)
     remote_region = lookup_node_region(supervisor, node)
 
     if is_binary(local_region) and is_binary(remote_region) and local_region == remote_region do
@@ -1211,15 +1215,30 @@ defmodule DurableServer.Supervisor do
     end
   end
 
+  defp lookup_local_region(supervisor) when is_atom(supervisor) do
+    case __get_config__(supervisor) do
+      %{placement_region: region} when is_binary(region) ->
+        region
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
   defp lookup_node_region(supervisor, node) when is_atom(supervisor) and is_atom(node) do
     node_str = to_string(node)
 
     case LifecycleManager.lookup_node_health(%{supervisor: supervisor, node_str: node_str}) do
-      {:healthy, %{env_vars: env_vars}} when is_map(env_vars) ->
-        env_vars["FLY_REGION"]
+      {:healthy, node_health} when is_map(node_health) ->
+        heartbeat_meta =
+          case Map.get(node_health, :heartbeat_meta) do
+            %{} = map -> map
+            _ -> %{}
+          end
 
-      {:healthy, %{heartbeat_meta: heartbeat_meta}} when is_map(heartbeat_meta) ->
-        heartbeat_meta["region"] || heartbeat_meta["fly_region"]
+        Map.get(heartbeat_meta, "placement_region")
 
       _ ->
         nil
@@ -2090,7 +2109,8 @@ defmodule DurableServer.Supervisor do
         :global_lock_failure_cooldown_ms,
         :sticky_placement,
         :default_sticky_placement,
-        :heartbeat_meta
+        :heartbeat_meta,
+        :placement_region
       ])
 
     name = Keyword.fetch!(opts, :name)
@@ -2125,6 +2145,7 @@ defmodule DurableServer.Supervisor do
 
     # Extract and validate heartbeat_meta config
     heartbeat_meta = extract_heartbeat_meta_config(opts)
+    placement_region = extract_placement_region_config(opts)
 
     # For DynamicSupervisor, use :infinity or integer (not map)
     max_children =
@@ -2184,6 +2205,7 @@ defmodule DurableServer.Supervisor do
       dead_node_threshold_ms: Keyword.get(opts, :dead_node_threshold_ms, 5 * 60 * 1000),
       sticky_placement_history_limit: Keyword.get(opts, :sticky_placement_history_limit, 5),
       init_info: Keyword.get(opts, :init_info, %{}),
+      placement_region: placement_region,
       circuit_breaker: circuit_breaker,
       ets_table: table_name
     }
@@ -2429,7 +2451,7 @@ defmodule DurableServer.Supervisor do
   defp extract_heartbeat_meta_config(opts) do
     case Keyword.get(opts, :heartbeat_meta) do
       nil ->
-        nil
+        %{}
 
       %{} = map ->
         map
@@ -2448,6 +2470,29 @@ defmodule DurableServer.Supervisor do
       other ->
         raise ArgumentError,
               "heartbeat_meta must be a map or a zero-arity function returning a map, got: #{inspect(other)}"
+    end
+  end
+
+  defp extract_placement_region_config(opts) do
+    case Keyword.fetch(opts, :placement_region) do
+      {:ok, nil} ->
+        nil
+
+      {:ok, region} when is_binary(region) ->
+        region = String.trim(region)
+
+        if region == "" do
+          raise ArgumentError, "placement_region must be a non-empty string when provided"
+        else
+          region
+        end
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "placement_region must be a string when provided, got: #{inspect(other)}"
+
+      :error ->
+        nil
     end
   end
 
