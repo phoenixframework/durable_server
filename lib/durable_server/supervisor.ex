@@ -240,11 +240,6 @@ defmodule DurableServer.Supervisor do
           owner_node != Node.self() and owner_node not in Node.list(:connected) ->
             report_placement_diagnostic(sup_name, :lookup_remote_node_disconnected)
 
-            report_placement_diagnostic(
-              sup_name,
-              {:lookup_remote_node_disconnected, to_string(owner_node)}
-            )
-
             nil
 
           true ->
@@ -807,10 +802,7 @@ defmodule DurableServer.Supervisor do
                      }) do
                   {:healthy, _node_ref} ->
                     try do
-                      report_placement_diagnostic(
-                        supervisor,
-                        {:race_lookup_erpc_attempt, to_string(node(pid))}
-                      )
+                      report_placement_diagnostic(supervisor, :race_lookup_erpc_attempt)
 
                       case safe_erpc_call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
                         {pid, meta} when is_pid(pid) ->
@@ -833,11 +825,6 @@ defmodule DurableServer.Supervisor do
                         report_placement_diagnostic(
                           supervisor,
                           {:race_lookup_erpc_error, erpc_reason}
-                        )
-
-                        report_placement_diagnostic(
-                          supervisor,
-                          {:race_lookup_erpc_error, to_string(node(pid))}
                         )
 
                         Logger.info(
@@ -934,11 +921,6 @@ defmodule DurableServer.Supervisor do
       |> Enum.map(fn node ->
         report_placement_diagnostic(supervisor, :remote_placement_node_disconnected_skip)
 
-        report_placement_diagnostic(
-          supervisor,
-          {:remote_placement_node_disconnected_skip, to_string(node)}
-        )
-
         node
       end)
 
@@ -967,11 +949,6 @@ defmodule DurableServer.Supervisor do
           {:circuit_open, _cooldown_ms} ->
             report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_skip)
 
-            report_placement_diagnostic(
-              supervisor,
-              {:remote_placement_node_cooldown_skip, node_str}
-            )
-
             true
         end
 
@@ -995,7 +972,6 @@ defmodule DurableServer.Supervisor do
           )
 
         report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_trip)
-        report_placement_diagnostic(supervisor, {:remote_placement_node_cooldown_trip, node_str})
         :ok
 
       _ ->
@@ -1117,7 +1093,6 @@ defmodule DurableServer.Supervisor do
   defp try_nodes(supervisor, {module, _init_arg} = child_spec, [node | rest], placement_opts) do
     Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
     report_placement_diagnostic(supervisor, :remote_placement_erpc_attempt)
-    report_placement_diagnostic(supervisor, {:remote_placement_erpc_attempt, to_string(node)})
     shutdown_retries = Keyword.get(placement_opts, :shutdown_retries, 0)
     erpc_timeout_ms = placement_erpc_timeout_ms(supervisor, node)
 
@@ -1160,7 +1135,6 @@ defmodule DurableServer.Supervisor do
     catch
       :throw, {:error, :not_ready} ->
         report_placement_diagnostic(supervisor, :remote_placement_not_ready)
-        report_placement_diagnostic(supervisor, {:remote_placement_not_ready, to_string(node)})
         Logger.warning("Node #{inspect(node)} not ready (still starting up), trying next node")
 
         try_nodes(supervisor, child_spec, rest, placement_opts)
@@ -1172,7 +1146,6 @@ defmodule DurableServer.Supervisor do
 
         report_placement_diagnostic(supervisor, :remote_placement_erpc_error)
         report_placement_diagnostic(supervisor, {:remote_placement_erpc_error, erpc_reason})
-        report_placement_diagnostic(supervisor, {:remote_placement_erpc_error, to_string(node)})
 
         Logger.warning(
           "ERPC to #{inspect(node)} failed: #{inspect(erpc_reason)} (timeout=#{erpc_timeout_ms}ms), trying next node"

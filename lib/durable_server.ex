@@ -1651,9 +1651,7 @@ defmodule DurableServer do
       {:error, error_reason} ->
         maybe_sync_final_status(state, state.final_status_set || :crashed)
 
-        Logger.info(
-          "DurableServer #{state.key} stopping with error (#{inspect(error_reason)})"
-        )
+        Logger.info("DurableServer #{state.key} stopping with error (#{inspect(error_reason)})")
 
         :ok
     end
@@ -2562,7 +2560,6 @@ defmodule DurableServer do
       end
 
     report_lock_diagnostic(supervisor_name, event_key)
-    report_lock_diagnostic(supervisor_name, {event_key, node_str})
   end
 
   # called via erpc on remote rpc call

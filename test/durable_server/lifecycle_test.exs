@@ -231,7 +231,10 @@ defmodule DurableServer.LifecycleTest do
       assert :ok = GenServer.call(pid, {:set_notify_pid, self()})
 
       ref = Process.monitor(pid)
-      stop_task = Task.async(fn -> DurableServer.Supervisor.terminate_child(supervisor_name, pid) end)
+
+      stop_task =
+        Task.async(fn -> DurableServer.Supervisor.terminate_child(supervisor_name, pid) end)
+
       assert_receive {:terminate_started, ^pid}, 1_000
 
       {:ok, mid_data} =

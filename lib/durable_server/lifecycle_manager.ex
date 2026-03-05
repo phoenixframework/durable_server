@@ -1260,11 +1260,6 @@ defmodule DurableServer.LifecycleManager do
     placement_erpc_errors = Map.get(delta, :remote_placement_erpc_error, 0)
     race_lookup_erpc_errors = Map.get(delta, :race_lookup_erpc_error, 0)
 
-    top_timeout_nodes = top_diag_nodes(delta, :check_lock_rpc_timeout)
-    top_noconnection_nodes = top_diag_nodes(delta, :check_lock_rpc_noconnection)
-    top_placement_attempt_nodes = top_diag_nodes(delta, :remote_placement_erpc_attempt)
-    top_placement_error_nodes = top_diag_nodes(delta, :remote_placement_erpc_error)
-
     if group_nil > 0 or group_mismatch > 0 or sync_stop_errors > 0 or rpc_timeouts > 0 or
          rpc_noconnection > 0 or rpc_notsup > 0 or placement_erpc_attempts > 0 or
          placement_erpc_errors > 0 or race_lookup_erpc_errors > 0 do
@@ -1275,26 +1270,9 @@ defmodule DurableServer.LifecycleManager do
           "rpc_noconnection=#{rpc_noconnection} rpc_notsup=#{rpc_notsup} " <>
           "placement_erpc_attempts=#{placement_erpc_attempts} " <>
           "placement_erpc_errors=#{placement_erpc_errors} " <>
-          "race_lookup_erpc_errors=#{race_lookup_erpc_errors} " <>
-          "timeout_nodes=#{inspect(top_timeout_nodes)} " <>
-          "noconnection_nodes=#{inspect(top_noconnection_nodes)} " <>
-          "placement_attempt_nodes=#{inspect(top_placement_attempt_nodes)} " <>
-          "placement_error_nodes=#{inspect(top_placement_error_nodes)}"
+          "race_lookup_erpc_errors=#{race_lookup_erpc_errors}"
       end)
     end
-  end
-
-  defp top_diag_nodes(delta, event) do
-    delta
-    |> Enum.flat_map(fn
-      {{^event, node_str}, count} when is_binary(node_str) and is_integer(count) and count > 0 ->
-        [{node_str, count}]
-
-      _ ->
-        []
-    end)
-    |> Enum.sort_by(fn {_node_str, count} -> -count end)
-    |> Enum.take(3)
   end
 
   defp get_restartable_object(%LifecycleManager{} = state, key) do
