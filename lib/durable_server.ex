@@ -871,7 +871,7 @@ defmodule DurableServer do
     prefix = Map.fetch!(config, :prefix)
     circuit_breaker = Map.fetch!(config, :circuit_breaker)
     object_store = Map.fetch!(config, :object_store)
-    sticky_placement_history_limit = Map.get(config, :sticky_placement_history_limit, 5)
+    sticky_placement_history_limit = Map.fetch!(config, :sticky_placement_history_limit)
     # trap exits to handle crashes and coordinate with Terminator
     Process.flag(:trap_exit, true)
 
@@ -983,7 +983,7 @@ defmodule DurableServer do
                 }
 
                 # Merge user's init_info from supervisor config
-                init_info = Map.get(config, :init_info, %{})
+                init_info = Map.fetch!(config, :init_info)
                 info = Map.merge(info, init_info)
 
                 # Try init/2 first, fall back to init/1

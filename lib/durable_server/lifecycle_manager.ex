@@ -780,13 +780,8 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp supervisor_shutting_down?(supervisor_name) when is_atom(supervisor_name) do
-    case DurableServer.Supervisor.__get_config__(supervisor_name) do
-      %{ets_table: table_name} ->
-        match?([{:shutting_down, true}], :ets.lookup(table_name, :shutting_down))
-
-      _ ->
-        false
-    end
+    %{ets_table: table_name} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    match?([{:shutting_down, true}], :ets.lookup(table_name, :shutting_down))
   rescue
     _ -> false
   end
@@ -1024,30 +1019,33 @@ defmodule DurableServer.LifecycleManager do
     # but hasn't fully initialized its supervisor/ETS tables yet
     table_name = heartbeat_table_name(supervisor_name)
 
-    with %{heartbeat_interval_ms: heartbeat_interval_ms} <-
-           DurableServer.Supervisor.__get_config__(supervisor_name),
-         [{^node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}] <-
-           :ets.lookup(table_name, node_str) do
-      current_time = System.system_time(:millisecond)
+    %{heartbeat_interval_ms: heartbeat_interval_ms} =
+      DurableServer.Supervisor.__get_config__(supervisor_name)
 
-      if current_time - timestamp > heartbeat_interval_ms * 2 do
-        :stale
-      else
-        {:healthy,
-         %{
-           node_ref: node_ref,
-           capacity: capacity,
-           resources: resources,
-           env_vars: env_vars,
-           heartbeat_meta: heartbeat_meta
-         }}
-      end
-    else
-      # Config not ready, or node not found in heartbeat table
-      _ -> :unknown
+    case :ets.lookup(table_name, node_str) do
+      [{^node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}] ->
+        current_time = System.system_time(:millisecond)
+
+        if current_time - timestamp > heartbeat_interval_ms * 2 do
+          :stale
+        else
+          {:healthy,
+           %{
+             node_ref: node_ref,
+             capacity: capacity,
+             resources: resources,
+             env_vars: env_vars,
+             heartbeat_meta: heartbeat_meta
+           }}
+        end
+
+      # Node not found in heartbeat table
+      _ ->
+        :unknown
     end
   rescue
-    # ETS table doesn't exist yet (node still initializing)
+    # Supervisor or ETS table doesn't exist yet (node still initializing)
+    RuntimeError -> :unknown
     ArgumentError -> :unknown
   end
 
@@ -1069,49 +1067,47 @@ defmodule DurableServer.LifecycleManager do
   """
   def fetch_node_heartbeat_from_storage(supervisor_name, node_str)
       when is_atom(supervisor_name) and is_binary(node_str) do
-    with %{
-           prefix: prefix,
-           heartbeat_interval_ms: heartbeat_interval_ms,
-           object_store: object_store
-         } <-
-           DurableServer.Supervisor.__get_config__(supervisor_name) do
-      key = "#{prefix}__nodes/#{node_str}"
+    %{
+      prefix: prefix,
+      heartbeat_interval_ms: heartbeat_interval_ms,
+      object_store: object_store
+    } = DurableServer.Supervisor.__get_config__(supervisor_name)
 
-      case DurableServer.ObjectStore.get_object(object_store, key) do
-        {:ok, %{body: body}} ->
-          case JSON.decode(body) do
-            {:ok, data} ->
-              case parse_heartbeat_data(data) do
-                {:ok,
-                 {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars,
-                  _heartbeat_meta}} ->
-                  current_time = System.system_time(:millisecond)
+    key = "#{prefix}__nodes/#{node_str}"
 
-                  if current_time - timestamp > heartbeat_interval_ms * 2 do
-                    :stale
-                  else
-                    # Cache the fetched heartbeat so subsequent lookups are fast
-                    cache_fetched_heartbeat(supervisor_name, data)
-                    {:healthy, %{node_ref: node_ref}}
-                  end
+    case DurableServer.ObjectStore.get_object(object_store, key) do
+      {:ok, %{body: body}} ->
+        case JSON.decode(body) do
+          {:ok, data} ->
+            case parse_heartbeat_data(data) do
+              {:ok,
+               {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
+                current_time = System.system_time(:millisecond)
 
-                {:error, :invalid_format} ->
-                  {:error, :invalid_heartbeat_format}
-              end
+                if current_time - timestamp > heartbeat_interval_ms * 2 do
+                  :stale
+                else
+                  # Cache the fetched heartbeat so subsequent lookups are fast
+                  cache_fetched_heartbeat(supervisor_name, data)
+                  {:healthy, %{node_ref: node_ref}}
+                end
 
-            {:error, _reason} ->
-              {:error, :invalid_heartbeat_format}
-          end
+              {:error, :invalid_format} ->
+                {:error, :invalid_heartbeat_format}
+            end
 
-        {:error, :not_found} ->
-          :not_found
+          {:error, _reason} ->
+            {:error, :invalid_heartbeat_format}
+        end
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      nil -> {:error, :supervisor_not_ready}
+      {:error, :not_found} ->
+        :not_found
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  rescue
+    RuntimeError -> {:error, :supervisor_not_ready}
   end
 
   # Cache a heartbeat fetched from storage into the local ETS table

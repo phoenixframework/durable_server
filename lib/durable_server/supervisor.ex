@@ -949,23 +949,19 @@ defmodule DurableServer.Supervisor do
        when is_atom(supervisor) and is_atom(node) do
     node_str = to_string(node)
 
-    case __get_config__(supervisor) do
-      %{circuit_breaker: %CircuitBreaker{} = circuit_breaker} ->
-        case CircuitBreaker.check_placement_node_timeout_circuit_breaker(
-               circuit_breaker,
-               node_str
-             ) do
-          :ok ->
-            false
+    %{circuit_breaker: %CircuitBreaker{} = circuit_breaker} = __get_config__(supervisor)
 
-          {:circuit_open, _cooldown_ms} ->
-            report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_skip)
-
-            true
-        end
-
-      _ ->
+    case CircuitBreaker.check_placement_node_timeout_circuit_breaker(
+           circuit_breaker,
+           node_str
+         ) do
+      :ok ->
         false
+
+      {:circuit_open, _cooldown_ms} ->
+        report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_skip)
+
+        true
     end
   rescue
     _ -> false
@@ -973,22 +969,17 @@ defmodule DurableServer.Supervisor do
 
   defp mark_placement_node_timeout(supervisor, node) when is_atom(supervisor) and is_atom(node) do
     node_str = to_string(node)
+    %{circuit_breaker: %CircuitBreaker{} = circuit_breaker} = __get_config__(supervisor)
 
-    case __get_config__(supervisor) do
-      %{circuit_breaker: %CircuitBreaker{} = circuit_breaker} ->
-        :ok =
-          CircuitBreaker.trip_placement_node_timeout_circuit_breaker(
-            circuit_breaker,
-            node_str,
-            @placement_node_timeout_cooldown_ms
-          )
+    :ok =
+      CircuitBreaker.trip_placement_node_timeout_circuit_breaker(
+        circuit_breaker,
+        node_str,
+        @placement_node_timeout_cooldown_ms
+      )
 
-        report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_trip)
-        :ok
-
-      _ ->
-        :ok
-    end
+    report_placement_diagnostic(supervisor, :remote_placement_node_cooldown_trip)
+    :ok
   rescue
     _ -> :ok
   end
@@ -1215,6 +1206,7 @@ defmodule DurableServer.Supervisor do
        when is_atom(supervisor) and is_atom(node) do
     local_region = lookup_local_region(supervisor)
     remote_region = lookup_node_region(supervisor, node)
+
     %{
       placement_erpc_timeout_same_region_ms: same_region_timeout_ms,
       placement_erpc_timeout_cross_region_ms: cross_region_timeout_ms
@@ -1228,13 +1220,8 @@ defmodule DurableServer.Supervisor do
   end
 
   defp lookup_local_region(supervisor) when is_atom(supervisor) do
-    case __get_config__(supervisor) do
-      %{placement_region: region} when is_binary(region) ->
-        region
-
-      _ ->
-        nil
-    end
+    %{placement_region: region} = __get_config__(supervisor)
+    region
   rescue
     _ -> nil
   end
