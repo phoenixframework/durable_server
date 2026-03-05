@@ -2038,116 +2038,124 @@ defmodule DurableServer do
       {:stop, {:shutdown, :delete}, reply, new_user_state} ->
         # shutdown-wrapped delete
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, {:shutdown, :delete})
-          |> Map.put(:final_status_set, :deleting)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: {:shutdown, :delete}, final_status_set: :deleting},
+            new_user_state
+          )
 
         {:stop, {:shutdown, :delete}, reply, stopped_state}
 
       {:stop, {:shutdown, :delete}, new_user_state} ->
         # shutdown-wrapped delete
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, {:shutdown, :delete})
-          |> Map.put(:final_status_set, :deleting)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: {:shutdown, :delete}, final_status_set: :deleting},
+            new_user_state
+          )
 
         {:stop, {:shutdown, :delete}, stopped_state}
 
       {:stop, :delete, reply, new_user_state} ->
         # non-shutdown wrapped delete - transform to :normal (doesn't propagate exit to linked processes)
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, :delete)
-          |> Map.put(:final_status_set, :deleting)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: :delete, final_status_set: :deleting},
+            new_user_state
+          )
 
         {:stop, :normal, reply, stopped_state}
 
       {:stop, :delete, new_user_state} ->
         # non-shutdown wrapped delete - transform to :normal (doesn't propagate exit to linked processes)
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, :delete)
-          |> Map.put(:final_status_set, :deleting)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: :delete, final_status_set: :deleting},
+            new_user_state
+          )
 
         {:stop, :normal, stopped_state}
 
       {:stop, {:shutdown, :permanent}, reply, new_user_state} ->
         # shutdown-wrapped permanent stop
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, {:shutdown, :permanent})
-          |> Map.put(:final_status_set, :stopped_permanent)
-          |> update_state(new_user_state)
+          update_state(
+            %{
+              state
+              | user_initiated_stop: {:shutdown, :permanent},
+                final_status_set: :stopped_permanent
+            },
+            new_user_state
+          )
 
         {:stop, {:shutdown, :permanent}, reply, stopped_state}
 
       {:stop, {:shutdown, :permanent}, new_user_state} ->
         # shutdown-wrapped permanent stop
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, {:shutdown, :permanent})
-          |> Map.put(:final_status_set, :stopped_permanent)
-          |> update_state(new_user_state)
+          update_state(
+            %{
+              state
+              | user_initiated_stop: {:shutdown, :permanent},
+                final_status_set: :stopped_permanent
+            },
+            new_user_state
+          )
 
         {:stop, {:shutdown, :permanent}, stopped_state}
 
       {:stop, :permanent, reply, new_user_state} ->
         # non-shutdown wrapped permanent - transform to :normal (doesn't propagate exit to linked processes)
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, :permanent)
-          |> Map.put(:final_status_set, :stopped_permanent)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: :permanent, final_status_set: :stopped_permanent},
+            new_user_state
+          )
 
         {:stop, :normal, reply, stopped_state}
 
       {:stop, :permanent, new_user_state} ->
         # non-shutdown wrapped permanent - transform to :normal (doesn't propagate exit to linked processes)
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, :permanent)
-          |> Map.put(:final_status_set, :stopped_permanent)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: :permanent, final_status_set: :stopped_permanent},
+            new_user_state
+          )
 
         {:stop, :normal, stopped_state}
 
       {:stop, :normal, reply, new_user_state} ->
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, :normal)
-          |> Map.put(:final_status_set, :stopped_graceful)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: :normal, final_status_set: :stopped_graceful},
+            new_user_state
+          )
 
         {:stop, :normal, reply, stopped_state}
 
       {:stop, :normal, new_user_state} ->
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, :normal)
-          |> Map.put(:final_status_set, :stopped_graceful)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: :normal, final_status_set: :stopped_graceful},
+            new_user_state
+          )
 
         {:stop, :normal, stopped_state}
 
       {:stop, {:error, _reason} = error_reason, reply, new_user_state} ->
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, error_reason)
-          |> Map.put(:final_status_set, :crashed)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: error_reason, final_status_set: :crashed},
+            new_user_state
+          )
 
         {:stop, error_reason, reply, stopped_state}
 
       {:stop, {:error, _reason} = error_reason, new_user_state} ->
         stopped_state =
-          state
-          |> Map.put(:user_initiated_stop, error_reason)
-          |> Map.put(:final_status_set, :crashed)
-          |> update_state(new_user_state)
+          update_state(
+            %{state | user_initiated_stop: error_reason, final_status_set: :crashed},
+            new_user_state
+          )
 
         {:stop, error_reason, stopped_state}
 
