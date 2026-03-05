@@ -245,7 +245,10 @@ defmodule DurableServer.RemotePlacementTest do
     } do
       start_supervised!(
         {DurableServer.Supervisor,
-         name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()}
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_singleflight_waiters_per_key_module: nil}
       )
 
       # Start first time
@@ -267,13 +270,16 @@ defmodule DurableServer.RemotePlacementTest do
       assert pid1 == pid2
     end
 
-    test "coalesces concurrent ensure_started_child calls by key+child_spec", %{
+    test "coalesces concurrent ensure_started_child calls by key+module", %{
       supervisor_name: supervisor_name,
       prefix: prefix
     } do
       start_supervised!(
         {DurableServer.Supervisor,
-         name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()}
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_singleflight_waiters_per_key_module: nil}
       )
 
       key = "singleflight-#{:erlang.unique_integer([:positive])}"
@@ -304,6 +310,49 @@ defmodule DurableServer.RemotePlacementTest do
       diagnostics = DurableServer.LifecycleManager.get_discovery_diagnostics(supervisor_name)
       assert Map.get(diagnostics, :ensure_started_singleflight_leader, 0) >= 1
       assert Map.get(diagnostics, :ensure_started_singleflight_waiter, 0) >= 1
+    end
+
+    test "fails fast when singleflight waiter cap is exceeded", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_singleflight_waiters_per_key_module: 1}
+      )
+
+      key = "singleflight-cap-#{:erlang.unique_integer([:positive])}"
+      child_spec = {EnsureSingleflightTestServer, %{key: key, singleflight_delay_ms: 300}}
+
+      results =
+        1..24
+        |> Task.async_stream(
+          fn _ ->
+            DurableServer.Supervisor.ensure_started_child(supervisor_name, child_spec)
+          end,
+          max_concurrency: 24,
+          ordered: false,
+          timeout: :timer.seconds(10)
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      success_count =
+        Enum.count(results, fn
+          {:ok, {pid, _meta}} when is_pid(pid) -> true
+          _ -> false
+        end)
+
+      overloaded_count =
+        Enum.count(results, fn
+          {:error, :singleflight_overloaded} -> true
+          _ -> false
+        end)
+
+      assert success_count >= 2
+      assert overloaded_count >= 1
     end
   end
 

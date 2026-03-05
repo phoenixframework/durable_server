@@ -29,6 +29,7 @@ defmodule DurableServer.Supervisor do
       MyApp.DurableSup
       ├── TaskSupervisor          # The task supervisor for for async internal operations
       ├── DynamicSupervisor       # The supervisor for all `DurableServer` processes on this node
+      ├── SingleflightGuard       # Guard table sweeper for ensure_started waiters
       ├── LifecycleManager        # Monitors and restarts crashed servers
       └── Terminator              # Coordinates graceful shutdown
 
@@ -37,6 +38,9 @@ defmodule DurableServer.Supervisor do
   **LifecycleManager**: Automatically detects and restarts crashed or orphaned
   DurableServer processes within this supervisor's scope. Uses object storage
   queries and node heartbeats to identify servers that need restart.
+
+  **SingleflightGuard**: Maintains and sweeps the per-key/module waiter guard
+  table used by `ensure_started_child/3` overload protection.
 
   **Terminator**: Handles graceful shutdown by instructing all DurableServer
   processes to sync their state before termination. Waits for confirmation
@@ -100,6 +104,9 @@ defmodule DurableServer.Supervisor do
     target node is in the same `placement_region`. Default: `3_000`
   - `:placement_erpc_timeout_cross_region_ms` - Timeout for remote placement ERPC calls when
     target node is in a different/unknown `placement_region`. Default: `8_000`
+  - `:max_singleflight_waiters_per_key_module` - Per `{key, module}` cap for
+    concurrent `ensure_started_child/3` waiters. Calls beyond the cap fail fast with
+    `{:error, :singleflight_overloaded}`. Default: `50_000`. Set to `nil` to disable.
   - `:sticky_placement_history_limit` - Maximum number of placement history entries to keep
     per server (default: 5). History tracks unique placement changes over time, useful for
     identifying displaced servers and re-homing decisions. Oldest entries are pruned first.
@@ -153,7 +160,7 @@ defmodule DurableServer.Supervisor do
   @durable :durable
 
   alias DurableServer
-  alias DurableServer.{LifecycleManager, Terminator, CircuitBreaker, Meta}
+  alias DurableServer.{LifecycleManager, Terminator, CircuitBreaker, Meta, SingleflightGuard}
   alias DurableServer.ObjectStore
 
   @max_start_child_tries 10
@@ -168,6 +175,7 @@ defmodule DurableServer.Supervisor do
   @placement_erpc_timeout_same_region_ms 3_000
   @placement_erpc_timeout_cross_region_ms 8_000
   @ensure_started_singleflight_wait_timeout_ms :timer.seconds(30)
+  @default_max_singleflight_waiters_per_key_module 50_000
 
   @doc """
   Checks if the DurableServer.Supervisor is ready to handle requests.
@@ -543,6 +551,9 @@ defmodule DurableServer.Supervisor do
     Default: #{@placement_erpc_timeout_same_region_ms}
   - `:placement_erpc_timeout_cross_region_ms` - Cross-region remote placement ERPC timeout in ms.
     Default: #{@placement_erpc_timeout_cross_region_ms}
+  - `:max_singleflight_waiters_per_key_module` - Per `{key, module}` cap for
+    concurrent `ensure_started_child/3` waiters. Calls beyond the cap fail fast with
+    `{:error, :singleflight_overloaded}`. Default: `50_000`. Set to `nil` to disable.
   """
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -1293,7 +1304,7 @@ defmodule DurableServer.Supervisor do
   """
   def ensure_started_child(supervisor, {module, init_arg} = child_spec, opts \\ []) do
     key = ensure_started_child_key!(init_arg)
-    singleflight_key = {:ensure_started_child, key, child_spec}
+    singleflight_key = {:ensure_started_child, key, module}
     singleflight_wait_timeout_ms = ensure_started_singleflight_wait_timeout_ms(opts)
 
     case with_ensure_started_singleflight(
@@ -1535,56 +1546,74 @@ defmodule DurableServer.Supervisor do
     if owner_pid == self() do
       :retry
     else
-      waiter_ref = make_ref()
-      monitor_ref = Process.monitor(owner_pid)
+      %{max_singleflight_waiters_per_key_module: max_waiters} = __get_config__(supervisor)
 
-      result =
-        case Registry.register(waiters_registry, singleflight_key, waiter_ref) do
-          {:ok, _} ->
-            receive do
-              {:singleflight_done, ^singleflight_key, ^waiter_ref, singleflight_result} ->
-                {:result, singleflight_result}
+      case SingleflightGuard.acquire(supervisor, singleflight_key, wait_timeout_ms, max_waiters) do
+        {:error, :singleflight_overloaded} ->
+          {:result, {:error, :singleflight_overloaded}}
 
-              {:DOWN, ^monitor_ref, :process, ^owner_pid, _reason} ->
-                report_placement_diagnostic(supervisor, :ensure_started_singleflight_owner_down)
-                :retry
-            after
-              wait_timeout_ms ->
-                report_placement_diagnostic(supervisor, :ensure_started_singleflight_wait_timeout)
+        {:ok, guard_ref} ->
+          waiter_ref = make_ref()
+          monitor_ref = Process.monitor(owner_pid)
 
-                case Registry.lookup(owner_registry, singleflight_key) do
-                  [] ->
-                    :retry
+          try do
+            result =
+              case Registry.register(waiters_registry, singleflight_key, waiter_ref) do
+                {:ok, _} ->
+                  receive do
+                    {:singleflight_done, ^singleflight_key, ^waiter_ref, singleflight_result} ->
+                      {:result, singleflight_result}
 
-                  [{new_owner_pid, _value}]
-                  when is_pid(new_owner_pid) and new_owner_pid != owner_pid ->
-                    {:follow_owner, new_owner_pid}
+                    {:DOWN, ^monitor_ref, :process, ^owner_pid, _reason} ->
+                      report_placement_diagnostic(
+                        supervisor,
+                        :ensure_started_singleflight_owner_down
+                      )
 
-                  _ ->
-                    :retry
-                end
+                      :retry
+                  after
+                    wait_timeout_ms ->
+                      report_placement_diagnostic(
+                        supervisor,
+                        :ensure_started_singleflight_wait_timeout
+                      )
+
+                      case Registry.lookup(owner_registry, singleflight_key) do
+                        [] ->
+                          :retry
+
+                        [{new_owner_pid, _value}]
+                        when is_pid(new_owner_pid) and new_owner_pid != owner_pid ->
+                          {:follow_owner, new_owner_pid}
+
+                        _ ->
+                          :retry
+                      end
+                  end
+
+                {:error, {:already_registered, _}} ->
+                  :retry
+              end
+
+            case result do
+              {:follow_owner, new_owner_pid} ->
+                wait_for_ensure_started_singleflight_owner(
+                  supervisor,
+                  owner_registry,
+                  waiters_registry,
+                  singleflight_key,
+                  new_owner_pid,
+                  wait_timeout_ms
+                )
+
+              other ->
+                other
             end
-
-          {:error, {:already_registered, _}} ->
-            :retry
-        end
-
-      Process.demonitor(monitor_ref, [:flush])
-      safe_registry_unregister(waiters_registry, singleflight_key)
-
-      case result do
-        {:follow_owner, new_owner_pid} ->
-          wait_for_ensure_started_singleflight_owner(
-            supervisor,
-            owner_registry,
-            waiters_registry,
-            singleflight_key,
-            new_owner_pid,
-            wait_timeout_ms
-          )
-
-        other ->
-          other
+          after
+            Process.demonitor(monitor_ref, [:flush])
+            safe_registry_unregister(waiters_registry, singleflight_key)
+            SingleflightGuard.release(guard_ref)
+          end
       end
     end
   rescue
@@ -2111,7 +2140,8 @@ defmodule DurableServer.Supervisor do
         :heartbeat_meta,
         :placement_region,
         :placement_erpc_timeout_same_region_ms,
-        :placement_erpc_timeout_cross_region_ms
+        :placement_erpc_timeout_cross_region_ms,
+        :max_singleflight_waiters_per_key_module
       ])
 
     name = Keyword.fetch!(opts, :name)
@@ -2150,6 +2180,9 @@ defmodule DurableServer.Supervisor do
 
     {placement_erpc_timeout_same_region_ms, placement_erpc_timeout_cross_region_ms} =
       extract_placement_erpc_timeout_config(opts)
+
+    max_singleflight_waiters_per_key_module =
+      extract_max_singleflight_waiters_per_key_module_config(opts)
 
     if placement_erpc_timeout_same_region_ms > placement_erpc_timeout_cross_region_ms do
       Logger.warning(
@@ -2219,6 +2252,7 @@ defmodule DurableServer.Supervisor do
       placement_region: placement_region,
       placement_erpc_timeout_same_region_ms: placement_erpc_timeout_same_region_ms,
       placement_erpc_timeout_cross_region_ms: placement_erpc_timeout_cross_region_ms,
+      max_singleflight_waiters_per_key_module: max_singleflight_waiters_per_key_module,
       circuit_breaker: circuit_breaker,
       ets_table: table_name
     }
@@ -2253,6 +2287,7 @@ defmodule DurableServer.Supervisor do
       {Group, group_opts},
       {Registry, keys: :unique, name: ensure_started_singleflight_registry_name(name)},
       {Registry, keys: :duplicate, name: ensure_started_singleflight_waiters_registry_name(name)},
+      {SingleflightGuard, supervisor_name: name},
       {Task.Supervisor, name: task_sup_name},
       {DynamicSupervisor,
        name: dynamic_sup_name,
@@ -2324,11 +2359,11 @@ defmodule DurableServer.Supervisor do
   end
 
   defp ensure_started_singleflight_registry_name(supervisor_name) do
-    :"durable_supervisor_ensure_started_singleflight_registry_#{supervisor_name}"
+    :"durable_sf_owner_#{supervisor_name}"
   end
 
   defp ensure_started_singleflight_waiters_registry_name(supervisor_name) do
-    :"durable_supervisor_ensure_started_singleflight_waiters_registry_#{supervisor_name}"
+    :"durable_sf_waiters_#{supervisor_name}"
   end
 
   defp extract_capacity_limits(opts) do
@@ -2525,6 +2560,23 @@ defmodule DurableServer.Supervisor do
       )
 
     {same_region_timeout_ms, cross_region_timeout_ms}
+  end
+
+  defp extract_max_singleflight_waiters_per_key_module_config(opts) do
+    case Keyword.fetch(opts, :max_singleflight_waiters_per_key_module) do
+      :error ->
+        @default_max_singleflight_waiters_per_key_module
+
+      {:ok, nil} ->
+        nil
+
+      {:ok, max_waiters} when is_integer(max_waiters) and max_waiters > 0 ->
+        max_waiters
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "max_singleflight_waiters_per_key_module must be a positive integer when provided, got: #{inspect(other)}"
+    end
   end
 
   defp extract_positive_timeout!(opts, key, default) when is_list(opts) and is_atom(key) do
