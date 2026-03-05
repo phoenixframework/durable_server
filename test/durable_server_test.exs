@@ -148,6 +148,10 @@ defmodule DurableServerTest do
       {:reply, :ok, state, {:continue, :increment_and_sync}, meta: new_meta}
     end
 
+    def handle_call({:continue_with_meta_and_sync_option, new_meta}, _from, state) do
+      {:reply, :ok, state, {:continue, :increment}, meta: new_meta, sync: true}
+    end
+
     def handle_call({:invalid_meta_test, invalid_meta}, _from, state) do
       # This should cause a function clause error since invalid_meta isn't a map
       {:reply, :ok, state, meta: invalid_meta}
@@ -273,6 +277,51 @@ defmodule DurableServerTest do
     def handle_call(:get_info, _from, state) do
       {:reply, state.info, state}
     end
+  end
+
+  defmodule AfterTerminateTestServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: Map.take(state, [:key, :count])
+
+    def load_state(_old_vsn, persisted_state) do
+      persisted_state
+      |> DurableServerTest.atomify_keys()
+      |> Map.put_new(:count, 0)
+      |> Map.put(:test_pid, nil)
+    end
+
+    def init(%{key: key} = init_state) do
+      {:ok, %{key: key, count: 0, test_pid: Map.get(init_state, :test_pid)}}
+    end
+
+    def handle_call({:set_test_pid, test_pid}, _from, state) do
+      {:reply, :ok, %{state | test_pid: test_pid}}
+    end
+
+    def handle_call(:increment, _from, %{count: count} = state) do
+      {:reply, count + 1, %{state | count: count + 1}}
+    end
+
+    def handle_call(:stop_normal, _from, state) do
+      {:stop, :normal, :ok, state}
+    end
+
+    def handle_call(:stop_error, _from, state) do
+      {:stop, {:error, :boom}, :ok, state}
+    end
+
+    def terminate(reason, state) do
+      {:after_terminate_payload, state.test_pid, reason, state.count}
+    end
+
+    def after_terminate({:after_terminate_payload, pid, terminate_reason, count}, info)
+        when is_pid(pid) do
+      send(pid, {:after_terminate_called, terminate_reason, count, info})
+      :ok
+    end
+
+    def after_terminate(_terminate_return, _info), do: :ok
   end
 
   setup do
@@ -690,7 +739,7 @@ defmodule DurableServerTest do
     @tag :durable_server
     test "callbacks can combine action and :meta option", %{
       supervisor_name: supervisor_name,
-      prefix: _prefix
+      prefix: prefix
     } do
       key = "combo-test-server"
       initial_meta = %{counter: 0}
@@ -722,6 +771,27 @@ defmodule DurableServerTest do
 
       assert {^pid, ^continue_meta} =
                DurableServer.Supervisor.lookup(supervisor_name, key)
+
+      # Test with continue action + meta + explicit sync option
+      sync_option_meta = %{counter: 3, continue_sync: true}
+      assert :ok = GenServer.call(pid, {:continue_with_meta_and_sync_option, sync_option_meta})
+
+      # ensure processed
+      :sys.get_state(pid)
+
+      # Verify continue processed and metadata updated
+      # 11 + 1 from continue(:increment)
+      assert GenServer.call(pid, :get_count) == 12
+      assert {^pid, ^sync_option_meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+
+      # Verify sync: true persisted callback state even though continue action itself did not return :sync
+      store = test_object_store()
+
+      {:ok, %StoredState{} = persisted_data} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
+
+      # `sync: true` syncs the state at callback return time (before handle_continue/2 runs)
+      assert %{state: %{"count" => 11}} = persisted_data
     end
 
     @tag :durable_server
@@ -832,6 +902,63 @@ defmodule DurableServerTest do
       # For now, verify the server continues operating
       assert GenServer.call(pid, :increment_and_sync) == 1
       assert GenServer.call(pid, :get_count) == 1
+    end
+  end
+
+  describe "after_terminate callback" do
+    test "invokes after_terminate after graceful final sync", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      key = "after-terminate-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {AfterTerminateTestServer, %{key: key}}
+        )
+
+      :ok = GenServer.call(pid, {:set_test_pid, self()})
+
+      # mutate without explicit sync
+      assert 1 = GenServer.call(pid, :increment)
+
+      store = test_object_store()
+
+      {:ok, persisted_before} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
+
+      assert %{state: %{"count" => 0}} = persisted_before
+
+      assert :ok = GenServer.call(pid, :stop_normal)
+
+      assert_receive {:after_terminate_called, :normal, 1, info}, 1_000
+      assert info.key == key
+      assert info.supervisor == supervisor_name
+      assert info.final_status == :stopped_graceful
+      assert info.sync_result == :ok
+      assert info.reason == :normal
+
+      {:ok, persisted_after} =
+        DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
+
+      assert %{state: %{"count" => 1}} = persisted_after
+    end
+
+    test "does not invoke after_terminate for non-graceful stop", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "after-terminate-error-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {AfterTerminateTestServer, %{key: key}}
+        )
+
+      :ok = GenServer.call(pid, {:set_test_pid, self()})
+      assert :ok = GenServer.call(pid, :stop_error)
+      refute_receive {:after_terminate_called, _terminate_reason, _count, _info}, 300
     end
   end
 

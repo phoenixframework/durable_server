@@ -190,6 +190,8 @@ defmodule DurableServer do
   State is synchronized to storage in these scenarios:
 
   1. **Manual sync**: Return `:sync` from any callback, ie: `{:noreply, state, :sync}`
+     You can also combine sync with other actions via callback options,
+     e.g. `{:noreply, state, {:continue, term}, sync: true}`.
   2. **Automatic sync**: When `:auto_sync` is enabled all changes are immediately written when
     any callback returns, or the `:sync_every_ms` interval can be provided to periodically sync changes.
   3. **Graceful shutdown**: Automatically synced during normal termination, ie: cold deploys
@@ -529,6 +531,8 @@ defmodule DurableServer do
 
   @type user_meta :: map()
   @type sync_action :: :sync
+  @type callback_option :: {:meta, user_meta()} | {:sync, boolean()}
+  @type callback_options :: [callback_option()]
   @type timeout_action ::
           timeout() | :hibernate | {:continue, term()} | sync_action()
 
@@ -597,12 +601,12 @@ defmodule DurableServer do
   @callback handle_call(request :: term(), from :: GenServer.from(), state :: term()) ::
               {:reply, reply, new_state}
               | {:reply, reply, new_state, timeout_action()}
-              | {:reply, reply, new_state, meta: user_meta()}
-              | {:reply, reply, new_state, timeout_action(), meta: user_meta()}
+              | {:reply, reply, new_state, callback_options()}
+              | {:reply, reply, new_state, timeout_action(), callback_options()}
               | {:noreply, new_state}
               | {:noreply, new_state, timeout_action()}
-              | {:noreply, new_state, meta: user_meta()}
-              | {:noreply, new_state, timeout_action(), meta: user_meta()}
+              | {:noreply, new_state, callback_options()}
+              | {:noreply, new_state, timeout_action(), callback_options()}
               | {:stop, reason, reply, new_state}
               | {:stop, {:shutdown, :delete}, reply, new_state}
               | {:stop, {:shutdown, :permanent}, reply, new_state}
@@ -618,8 +622,8 @@ defmodule DurableServer do
   @callback handle_cast(request :: term(), state :: term()) ::
               {:noreply, new_state}
               | {:noreply, new_state, timeout_action()}
-              | {:noreply, new_state, meta: user_meta()}
-              | {:noreply, new_state, timeout_action(), meta: user_meta()}
+              | {:noreply, new_state, callback_options()}
+              | {:noreply, new_state, timeout_action(), callback_options()}
               | {:stop, reason :: term(), new_state}
               | {:stop, {:shutdown, :delete}, new_state}
               | {:stop, {:shutdown, :permanent}, new_state}
@@ -630,8 +634,8 @@ defmodule DurableServer do
   @callback handle_info(msg :: :timeout | term(), state :: term()) ::
               {:noreply, new_state}
               | {:noreply, new_state, timeout_action()}
-              | {:noreply, new_state, meta: user_meta()}
-              | {:noreply, new_state, timeout_action(), meta: user_meta()}
+              | {:noreply, new_state, callback_options()}
+              | {:noreply, new_state, timeout_action(), callback_options()}
               | {:stop, reason :: term(), new_state}
               | {:stop, {:shutdown, :delete}, new_state}
               | {:stop, {:shutdown, :permanent}, new_state}
@@ -642,8 +646,8 @@ defmodule DurableServer do
   @callback handle_continue(continue :: term(), state :: term()) ::
               {:noreply, new_state}
               | {:noreply, new_state, timeout_action()}
-              | {:noreply, new_state, meta: user_meta()}
-              | {:noreply, new_state, timeout_action(), meta: user_meta()}
+              | {:noreply, new_state, callback_options()}
+              | {:noreply, new_state, timeout_action(), callback_options()}
               | {:stop, reason :: term(), new_state}
               | {:stop, {:shutdown, :delete}, new_state}
               | {:stop, {:shutdown, :permanent}, new_state}
@@ -652,6 +656,23 @@ defmodule DurableServer do
             when new_state: term()
 
   @callback terminate(reason :: term(), state :: term()) :: term()
+
+  @doc """
+  Optional callback invoked after `terminate/2` and after final status sync.
+
+  This callback is only invoked when the final status sync completed successfully
+  for a graceful stop (`final_status: :stopped_graceful` and `sync_result: :ok`).
+
+  The first argument is exactly the return value from `terminate/2`.
+  The second argument is an info map:
+
+    * `:key` - DurableServer key
+    * `:supervisor` - Supervisor name
+    * `:final_status` - Final persisted status atom
+    * `:sync_result` - `:ok | {:error, term()}`
+    * `:reason` - Termination reason passed to `terminate/2`
+  """
+  @callback after_terminate(terminate_return :: term(), info :: map()) :: term()
 
   @callback code_change(old_vsn :: term() | {:down, term()}, state :: term(), extra :: term()) ::
               {:ok, new_state :: term()} | {:error, reason :: term()}
@@ -711,6 +732,7 @@ defmodule DurableServer do
                       handle_info: 2,
                       handle_continue: 2,
                       terminate: 2,
+                      after_terminate: 2,
                       code_change: 3
 
   defstruct object_store: nil,
@@ -811,6 +833,10 @@ defmodule DurableServer do
         :ok
       end
 
+      def after_terminate(_terminate_return, _info) do
+        :ok
+      end
+
       # Default code_change for hot upgrades: no migration needed
       # Override this to provide version-specific state migrations:
       #
@@ -833,6 +859,7 @@ defmodule DurableServer do
                      handle_info: 2,
                      handle_continue: 2,
                      terminate: 2,
+                     after_terminate: 2,
                      code_change: 3
     end
   end
@@ -1598,15 +1625,18 @@ defmodule DurableServer do
 
   def terminate(reason, %DurableServer{} = state) do
     # Ensure user callback terminate/2 finishes before we persist final status metadata.
-    _ = state.module.terminate(reason, state.user_state)
+    terminate_return = state.module.terminate(reason, state.user_state)
 
-    case state.user_initiated_stop do
-      nil ->
-        handle_external_terminate(reason, state)
+    {final_status, sync_result} =
+      case state.user_initiated_stop do
+        nil ->
+          handle_external_terminate(reason, state)
 
-      user_stop ->
-        handle_user_initiated_terminate(user_stop, reason, state)
-    end
+        user_stop ->
+          handle_user_initiated_terminate(user_stop, reason, state)
+      end
+
+    maybe_invoke_after_terminate(state, terminate_return, reason, final_status, sync_result)
   end
 
   # user-initiated termination
@@ -1616,7 +1646,8 @@ defmodule DurableServer do
         # delete storage for :delete or {:shutdown, :delete}
         Logger.info("DurableServer #{state.key} terminating for deletion - removing from storage")
 
-        maybe_sync_final_status(state, state.final_status_set || :deleting)
+        final_status = state.final_status_set || :deleting
+        sync_result = maybe_sync_final_status(state, final_status)
 
         case ObjectStore.delete_object(state.object_store, storage_key(state)) do
           :ok ->
@@ -1629,7 +1660,7 @@ defmodule DurableServer do
             Logger.error("Failed to delete storage for #{state.key}: #{inspect(reason)}")
         end
 
-        :ok
+        {final_status, sync_result}
 
       user_stop
       when user_stop in [:normal, :permanent, {:shutdown, :permanent}, {:shutdown, :normal}] ->
@@ -1640,20 +1671,21 @@ defmodule DurableServer do
               _ -> :stopped_graceful
             end
 
-        maybe_sync_final_status(state, final_status)
+        sync_result = maybe_sync_final_status(state, final_status)
 
         Logger.info(
           "DurableServer #{state.key} shutting down gracefully via user stop (#{inspect(user_stop)})"
         )
 
-        :ok
+        {final_status, sync_result}
 
       {:error, error_reason} ->
-        maybe_sync_final_status(state, state.final_status_set || :crashed)
+        final_status = state.final_status_set || :crashed
+        sync_result = maybe_sync_final_status(state, final_status)
 
         Logger.info("DurableServer #{state.key} stopping with error (#{inspect(error_reason)})")
 
-        :ok
+        {final_status, sync_result}
     end
   end
 
@@ -1661,7 +1693,8 @@ defmodule DurableServer do
   defp handle_external_terminate(reason, %DurableServer{} = state) do
     case state.final_status_set do
       status when not is_nil(status) ->
-        maybe_sync_final_status(state, status)
+        sync_result = maybe_sync_final_status(state, status)
+        {status, sync_result}
 
       nil ->
         case reason do
@@ -1671,7 +1704,9 @@ defmodule DurableServer do
               "DurableServer #{state.key} shutting down gracefully (reason: #{inspect(reason)})"
             )
 
-            maybe_sync_final_status(state, :stopped_graceful)
+            final_status = :stopped_graceful
+            sync_result = maybe_sync_final_status(state, final_status)
+            {final_status, sync_result}
 
           {:shutdown, _} ->
             # external graceful shutdown (e.g., supervisor terminate_child)
@@ -1679,10 +1714,12 @@ defmodule DurableServer do
               "DurableServer #{state.key} shutting down gracefully (reason: #{inspect(reason)})"
             )
 
-            maybe_sync_final_status(state, :stopped_graceful)
+            final_status = :stopped_graceful
+            sync_result = maybe_sync_final_status(state, final_status)
+            {final_status, sync_result}
 
           :normal ->
-            :ok
+            {nil, :ok}
 
           _crash_reason ->
             # this is a crash - update status using crash tracking system
@@ -1741,7 +1778,7 @@ defmodule DurableServer do
                 end
             end
 
-            :ok
+            {final_status, :ok}
         end
     end
   end
@@ -1766,9 +1803,57 @@ defmodule DurableServer do
           "Failed to persist final status #{inspect(status)} for #{state.key}: #{inspect(sync_reason)}"
         )
 
-        :ok
+        {:error, sync_reason}
     end
   end
+
+  defp maybe_invoke_after_terminate(
+         %DurableServer{} = state,
+         terminate_return,
+         reason,
+         :stopped_graceful,
+         :ok
+       ) do
+    if function_exported?(state.module, :after_terminate, 2) do
+      info = %{
+        key: state.key,
+        supervisor: state.supervisor,
+        final_status: :stopped_graceful,
+        sync_result: :ok,
+        reason: reason
+      }
+
+      try do
+        _ = state.module.after_terminate(terminate_return, info)
+        :ok
+      rescue
+        exception ->
+          Logger.error("""
+          after_terminate callback failed for #{state.key}: #{Exception.message(exception)}
+          """)
+
+          :ok
+      catch
+        kind, caught ->
+          Logger.error("""
+          after_terminate callback failed for #{state.key}: #{inspect({kind, caught})}
+          """)
+
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp maybe_invoke_after_terminate(
+         _state,
+         _terminate_return,
+         _reason,
+         _final_status,
+         _sync_result
+       ),
+       do: :ok
 
   @impl true
   def code_change(old_vsn, %__MODULE__{} = state, extra) do
@@ -1942,18 +2027,13 @@ defmodule DurableServer do
 
         {:reply, reply, new_state}
 
-      # handle option-tuple. Currently we only have a single keyword (:meta)
+      # Handle action + options tuple.
       {:reply, reply, new_user_state, action, opts}
       when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
-        opts = Keyword.validate!(opts, [:meta])
-
-        updated_state =
-          case Keyword.fetch(opts, :meta) do
-            {:ok, new_user_meta} -> update_registry_meta(state, new_user_meta)
-            :error -> state
-          end
+        {updated_state, sync?} = apply_callback_options(state, opts)
 
         {final_state, final_action} = handle_action(updated_state, new_user_state, action)
+        final_state = maybe_sync_with_option(final_state, sync? and not sync_action?(action))
 
         if final_action do
           {:reply, reply, final_state, final_action}
@@ -1962,18 +2042,12 @@ defmodule DurableServer do
         end
 
       {:reply, reply, new_user_state, opts} when is_list(opts) ->
-        opts = Keyword.validate!(opts, [:meta])
-
-        updated_state =
-          case Keyword.fetch(opts, :meta) do
-            {:ok, new_user_meta} -> update_registry_meta(state, new_user_meta)
-            :error -> state
-          end
+        {updated_state, sync?} = apply_callback_options(state, opts)
 
         new_state =
           updated_state
           |> update_state(new_user_state)
-          |> auto_sync_to_storage()
+          |> maybe_sync_or_auto_sync(sync?)
 
         {:reply, reply, new_state}
 
@@ -1994,15 +2068,10 @@ defmodule DurableServer do
 
       {:noreply, new_user_state, action, opts}
       when (is_atom(action) or is_tuple(action)) and is_list(opts) ->
-        opts = Keyword.validate!(opts, [:meta])
-
-        updated_state =
-          case Keyword.fetch(opts, :meta) do
-            {:ok, new_user_meta} -> update_registry_meta(state, new_user_meta)
-            :error -> state
-          end
+        {updated_state, sync?} = apply_callback_options(state, opts)
 
         {final_state, final_action} = handle_action(updated_state, new_user_state, action)
+        final_state = maybe_sync_with_option(final_state, sync? and not sync_action?(action))
 
         if final_action do
           {:noreply, final_state, final_action}
@@ -2011,18 +2080,12 @@ defmodule DurableServer do
         end
 
       {:noreply, new_user_state, opts} when is_list(opts) ->
-        opts = Keyword.validate!(opts, [:meta])
-
-        updated_state =
-          case Keyword.fetch(opts, :meta) do
-            {:ok, new_user_meta} -> update_registry_meta(state, new_user_meta)
-            :error -> state
-          end
+        {updated_state, sync?} = apply_callback_options(state, opts)
 
         new_state =
           updated_state
           |> update_state(new_user_state)
-          |> auto_sync_to_storage()
+          |> maybe_sync_or_auto_sync(sync?)
 
         {:noreply, new_state}
 
@@ -2198,40 +2261,75 @@ defmodule DurableServer do
 
     case action do
       :sync ->
-        case sync_to_storage(state) do
-          {:ok, %DurableServer{} = synced_state} ->
-            {synced_state, nil}
-
-          {:error, :conflict} ->
-            fatal_exit!(
-              "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
-            )
-
-          {:error, reason} ->
-            Logger.error("Failed to sync state: #{inspect(reason)}")
-            # continue with updated state even if sync failed for transient reason (ie timeout)
-            {state, nil}
-        end
+        {do_sync(state), nil}
 
       {:sync, %{} = metadata} ->
-        case sync_to_storage(state, meta: metadata) do
-          {:ok, %DurableServer{} = synced_state} ->
-            {synced_state, nil}
-
-          {:error, :conflict} ->
-            fatal_exit!(
-              "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
-            )
-
-          {:error, reason} ->
-            Logger.error("Failed to sync state with metadata: #{inspect(reason)}")
-            # continue with updated state even if sync failed for transient reason (ie timeout)
-            {state, nil}
-        end
+        {do_sync(state, metadata), nil}
 
       other_action ->
         # handle timeout, hibernate, continue actions
         {state, other_action}
+    end
+  end
+
+  defp apply_callback_options(%__MODULE__{} = state, opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:meta, :sync])
+    sync? = validate_sync_option!(opts)
+
+    state =
+      case Keyword.fetch(opts, :meta) do
+        {:ok, new_user_meta} -> update_registry_meta(state, new_user_meta)
+        :error -> state
+      end
+
+    {state, sync?}
+  end
+
+  defp validate_sync_option!(opts) do
+    case Keyword.get(opts, :sync, false) do
+      value when is_boolean(value) ->
+        value
+
+      other ->
+        raise ArgumentError, "expected :sync option to be a boolean, got: #{inspect(other)}"
+    end
+  end
+
+  defp sync_action?(:sync), do: true
+  defp sync_action?({:sync, %{} = _metadata}), do: true
+  defp sync_action?(_), do: false
+
+  defp maybe_sync_or_auto_sync(%__MODULE__{} = state, true), do: do_sync(state)
+  defp maybe_sync_or_auto_sync(%__MODULE__{} = state, false), do: auto_sync_to_storage(state)
+
+  defp maybe_sync_with_option(%__MODULE__{} = state, true), do: do_sync(state)
+  defp maybe_sync_with_option(%__MODULE__{} = state, false), do: state
+
+  defp do_sync(%__MODULE__{} = state, metadata \\ nil) do
+    sync_result =
+      case metadata do
+        nil -> sync_to_storage(state)
+        %{} = metadata -> sync_to_storage(state, meta: metadata)
+      end
+
+    case sync_result do
+      {:ok, %DurableServer{} = synced_state} ->
+        synced_state
+
+      {:error, :conflict} ->
+        fatal_exit!(
+          "#{state.key} object updated out from underneath: #{inspect(node: node(), pid: self())}"
+        )
+
+      {:error, reason} ->
+        if is_map(metadata) do
+          Logger.error("Failed to sync state with metadata: #{inspect(reason)}")
+        else
+          Logger.error("Failed to sync state: #{inspect(reason)}")
+        end
+
+        # continue with updated state even if sync failed for transient reason (ie timeout)
+        state
     end
   end
 
