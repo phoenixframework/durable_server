@@ -1419,7 +1419,7 @@ defmodule DurableServer do
   Returns `:ok` if the claim succeeds, or `{:error, reason}` if it fails.
   """
   def claim_restart_attempt(%ObjectStore{} = store, %StoredState{} = stored_state, opts) do
-    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
     claim_restart_attempt(backend, stored_state, opts)
   end
 
@@ -1463,7 +1463,7 @@ defmodule DurableServer do
   Clear restart attempt metadata from a server object.
   """
   def clear_restart_attempt(%ObjectStore{} = store, data) do
-    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
     clear_restart_attempt(backend, data)
   end
 
@@ -1498,7 +1498,7 @@ defmodule DurableServer do
   Get just the metadata for a server without the full object.
   """
   def get_server_metadata(%ObjectStore{} = store, path) do
-    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
     get_server_metadata(backend, path)
   end
 
@@ -2427,7 +2427,7 @@ defmodule DurableServer do
   end
 
   def fetch_stored_state(%ObjectStore{} = store, %{key: key, prefix: prefix}) do
-    backend = StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
     fetch_stored_state(backend, %{key: key, prefix: prefix})
   end
 

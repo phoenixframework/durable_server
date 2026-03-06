@@ -241,7 +241,7 @@ defmodule DurableServer.LifecycleManager do
           backend
 
         %ObjectStore{} = store ->
-          StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+          StorageBackend.new(DurableServer.Backends.ObjectStore, store)
 
         nil ->
           raise ArgumentError, "LifecycleManager requires :storage_backend or :object_store"

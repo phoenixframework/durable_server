@@ -2,8 +2,8 @@ defmodule DurableServer.MigratingBackendIntegrationTest do
   use ExUnit.Case, async: false
 
   alias DurableServer.StorageBackend
-  alias DurableServer.StorageBackend.EKV
-  alias DurableServer.StorageBackend.Migrating
+  alias DurableServer.Backends.EKVStore
+  alias DurableServer.Backends.MigrationStore
 
   @moduletag :integration
   @moduletag :capture_log
@@ -44,8 +44,8 @@ defmodule DurableServer.MigratingBackendIntegrationTest do
        ]}
     )
 
-    primary = StorageBackend.new(EKV, EKV.normalize_opts(name: primary_name))
-    secondary = StorageBackend.new(EKV, EKV.normalize_opts(name: secondary_name))
+    primary = StorageBackend.new(EKVStore, EKVStore.normalize_opts(name: primary_name))
+    secondary = StorageBackend.new(EKVStore, EKVStore.normalize_opts(name: secondary_name))
     migrating = migrating_backend(primary, secondary)
 
     on_exit(fn ->
@@ -143,9 +143,9 @@ defmodule DurableServer.MigratingBackendIntegrationTest do
     state =
       defaults
       |> Keyword.merge(opts)
-      |> Migrating.normalize_opts()
+      |> MigrationStore.normalize_opts()
 
-    StorageBackend.new(Migrating, state)
+    StorageBackend.new(MigrationStore, state)
   end
 
   defp ekv_mod, do: :"Elixir.EKV"

@@ -1,6 +1,7 @@
 defmodule DurableServer.EKVIntegrationTest do
   use ExUnit.Case, async: false
 
+  alias DurableServer.Backends.EKVStore
   alias DurableServer.{LifecycleManager, Meta, StoredState}
   alias DurableServer.StorageBackend
   alias DurableServer.TestCounterServer, as: CounterServer
@@ -34,7 +35,7 @@ defmodule DurableServer.EKVIntegrationTest do
        [
          name: supervisor_name,
          prefix: prefix,
-         backend: {:ekv, [name: ekv_name]},
+         backend: {EKVStore, [name: ekv_name]},
          graceful_shutdown_timeout_ms: 500
        ]}
     )
@@ -70,7 +71,7 @@ defmodule DurableServer.EKVIntegrationTest do
            [
              name: supervisor_name,
              prefix: prefix,
-             backend: {:ekv, [name: ekv_name]},
+             backend: {EKVStore, [name: ekv_name]},
              discovery_interval_ms: 11_000,
              heartbeat_interval_ms: 7_000,
              heartbeat_tracking_mode: :poll,
@@ -149,6 +150,41 @@ defmodule DurableServer.EKVIntegrationTest do
       )
 
     assert 1 == GenServer.call(restarted_pid, :get_count)
+  end
+
+  test "persists a minimal explicit stored-state envelope in EKV", %{
+    supervisor_name: supervisor_name,
+    prefix: prefix,
+    ekv_name: ekv_name
+  } do
+    key = "counter-envelope"
+
+    {:ok, {pid, _meta}} =
+      DurableServer.Supervisor.start_child(
+        supervisor_name,
+        {CounterServer, %{key: key, count: 4}}
+      )
+
+    assert 5 == GenServer.call(pid, :increment_and_sync)
+
+    assert_eventually(fn ->
+      case ekv_mod().lookup(ekv_name, "#{prefix}#{key}") do
+        {%{vsn: 1, state: %{"count" => 5}, meta: meta}, _vsn}
+        when is_map(meta) and not is_struct(meta) ->
+          Map.keys(meta) |> Enum.member?(:status)
+
+        _ ->
+          false
+      end
+    end)
+
+    {%{} = raw_body, _vsn} = ekv_mod().lookup(ekv_name, "#{prefix}#{key}")
+
+    assert Enum.sort(Map.keys(raw_body)) == [:meta, :state, :vsn]
+    refute is_struct(raw_body)
+    refute is_struct(raw_body.meta)
+    refute Map.has_key?(raw_body.meta, :key)
+    refute Map.has_key?(raw_body.meta, :prefix)
   end
 
   test "concurrent starts for the same key resolve to a single owner", %{
@@ -297,7 +333,7 @@ defmodule DurableServer.EKVIntegrationTest do
            [
              name: supervisor_name,
              prefix: prefix,
-             backend: {:ekv, [name: ekv_name]},
+             backend: {EKVStore, [name: ekv_name]},
              discovery_interval_ms: 200,
              heartbeat_interval_ms: 250,
              heartbeat_reconcile_interval_ms: 10_000,
@@ -318,7 +354,7 @@ defmodule DurableServer.EKVIntegrationTest do
                   [
                     name: supervisor_name,
                     prefix: prefix,
-                    backend: {:ekv, [name: ekv_name]},
+                    backend: {EKVStore, [name: ekv_name]},
                     discovery_interval_ms: 200,
                     heartbeat_interval_ms: 250,
                     heartbeat_reconcile_interval_ms: 10_000,

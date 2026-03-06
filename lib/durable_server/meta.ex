@@ -43,14 +43,38 @@ defmodule DurableServer.Meta do
   # note we are using struct! so keys cannot be removed (but can be added)
   # if we remove keys we need to change the decode function to pluck out valid keys
   def decode_from_binary(meta_str, %{key: key, prefix: prefix}) when is_binary(meta_str) do
-    valid_keys = Map.keys(%__MODULE__{})
-    meta_map = meta_str |> Base.decode64!() |> :erlang.binary_to_term() |> Map.take(valid_keys)
-    %{struct!(Meta, meta_map) | key: key, prefix: prefix}
+    meta_str
+    |> Base.decode64!()
+    |> :erlang.binary_to_term()
+    |> from_storage_term(%{key: key, prefix: prefix})
   end
 
   def encode_to_binary(%Meta{} = meta) do
-    data = meta |> Map.from_struct() |> Map.drop([:key, :prefix])
-    Base.encode64(:erlang.term_to_binary(data))
+    meta
+    |> to_storage_term()
+    |> :erlang.term_to_binary()
+    |> Base.encode64()
+  end
+
+  def from_storage_term(%Meta{} = meta, %{key: key, prefix: prefix}) do
+    %{meta | key: key, prefix: prefix}
+  end
+
+  def from_storage_term(meta_map, %{key: key, prefix: prefix}) when is_map(meta_map) do
+    valid_keys = Map.keys(%__MODULE__{})
+    meta_map = Map.take(meta_map, valid_keys)
+
+    unless Map.has_key?(meta_map, :status) do
+      raise ArgumentError, "invalid meta storage term: #{inspect(meta_map)}"
+    end
+
+    %{struct!(Meta, meta_map) | key: key, prefix: prefix}
+  end
+
+  def to_storage_term(%Meta{} = meta) do
+    meta
+    |> Map.from_struct()
+    |> Map.drop([:key, :prefix])
   end
 
   def running?(%Meta{} = meta) do

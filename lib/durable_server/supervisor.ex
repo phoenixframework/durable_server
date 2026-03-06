@@ -86,7 +86,7 @@ defmodule DurableServer.Supervisor do
   - `:module_circuit_breaker_cooldown_ms` - Cooldown period when module circuit breaker opens
     (default: 600_000 = 10 minutes)
   - `:backend` - Optional storage backend spec:
-    `{:object_store, opts_or_store}`, `{:ekv, opts}`, or `{:migrating, opts}`
+    `{BackendModule, opts}` or a pre-initialized `%DurableServer.StorageBackend{}`
   - `:object_store` - Legacy object storage config (used when `:backend` is not set)
   - `:max_cpu` - Maximum CPU usage percentage before rejecting new children on this node.
     Values above 100 are valid since CPU load can exceed 100% when the run queue is larger than the core count.
@@ -135,6 +135,17 @@ defmodule DurableServer.Supervisor do
        prefix: "myapp/",
        discovery_interval_ms: 30_000,
        heartbeat_interval_ms: 15_000}
+
+      # With an explicit backend module
+      {DurableServer.Supervisor,
+       name: MyApp.DurableSup,
+       prefix: "myapp/",
+       backend:
+         {DurableServer.Backends.ObjectStore,
+          [
+            bucket: "my-bucket",
+            region: "iad"
+          ]}}
 
       # With resource limits
       {DurableServer.Supervisor,
@@ -561,7 +572,7 @@ defmodule DurableServer.Supervisor do
   - `:module_circuit_breaker_window_ms` - Module circuit breaker window (default: 300_000)
   - `:module_circuit_breaker_cooldown_ms` - Module circuit breaker cooldown (default: 600_000)
   - `:backend` - Optional storage backend spec:
-    `{:object_store, opts_or_store}`, `{:ekv, opts}`, or `{:migrating, opts}`
+    `{BackendModule, opts}` or a pre-initialized `%DurableServer.StorageBackend{}`
   - `:object_store` - Legacy object storage config (used when `:backend` is not set)
   - `:init_info` - Map of user-defined data passed to each server's `init/2` callback (default: `%{}`)
   - `:placement_region` - Optional region label used for placement timeout tuning.
@@ -2397,7 +2408,7 @@ defmodule DurableServer.Supervisor do
       if Keyword.has_key?(opts, :backend) do
         Keyword.fetch!(opts, :backend)
       else
-        {:object_store, Keyword.fetch!(opts, :object_store)}
+        {DurableServer.Backends.ObjectStore, Keyword.fetch!(opts, :object_store)}
       end
 
     backend = init_backend_spec(backend_spec, finch, task_sup)
@@ -2407,55 +2418,53 @@ defmodule DurableServer.Supervisor do
 
   defp init_backend_spec(%StorageBackend{} = backend, _finch, _task_sup), do: backend
 
-  defp init_backend_spec({:object_store, %ObjectStore{} = store}, _finch, _task_sup) do
-    init_backend!(DurableServer.StorageBackend.ObjectStore, store)
-  end
-
-  defp init_backend_spec({:object_store, object_store_opts}, finch, task_sup)
-       when is_list(object_store_opts) do
-    init_backend!(
-      DurableServer.StorageBackend.ObjectStore,
-      object_store_opts
-      |> Keyword.put_new(:finch, finch)
-      |> Keyword.put_new(:task_supervisor, task_sup)
-    )
-  end
-
-  defp init_backend_spec({:object_store, object_store_opts}, finch, task_sup)
-       when is_map(object_store_opts) do
-    init_backend_spec({:object_store, Map.to_list(object_store_opts)}, finch, task_sup)
-  end
-
-  defp init_backend_spec({:ekv, ekv_opts}, _finch, task_sup) do
-    ekv_opts =
-      ekv_opts
-      |> normalize_backend_opts()
-      |> Keyword.put_new(:task_supervisor, task_sup)
-
-    init_backend!(DurableServer.StorageBackend.EKV, ekv_opts)
-  end
-
-  defp init_backend_spec({:migrating, migrating_opts}, finch, task_sup) do
-    migrating_opts = normalize_backend_opts(migrating_opts)
-
-    primary =
-      migrating_opts |> Keyword.fetch!(:primary) |> init_backend_spec(finch, task_sup)
-
-    secondary =
-      migrating_opts |> Keyword.fetch!(:secondary) |> init_backend_spec(finch, task_sup)
-
-    init_backend!(
-      DurableServer.StorageBackend.Migrating,
-      migrating_opts
-      |> Keyword.put(:primary, primary)
-      |> Keyword.put(:secondary, secondary)
-    )
+  defp init_backend_spec({adapter, raw_opts}, finch, task_sup) when is_atom(adapter) do
+    raw_opts = prepare_backend_init_opts(adapter, raw_opts, finch, task_sup)
+    init_backend!(adapter, raw_opts)
   end
 
   defp init_backend_spec(spec, _finch, _task_sup) do
     raise ArgumentError,
-          "invalid :backend option #{inspect(spec)}. Expected {:object_store, ...}, {:ekv, ...}, {:migrating, ...}, or %DurableServer.StorageBackend{}"
+          "invalid :backend option #{inspect(spec)}. Expected {BackendModule, opts} or %DurableServer.StorageBackend{}"
   end
+
+  defp prepare_backend_init_opts(
+         DurableServer.Backends.ObjectStore,
+         %ObjectStore{} = store,
+         _finch,
+         _task_sup
+       ) do
+    store
+  end
+
+  defp prepare_backend_init_opts(DurableServer.Backends.ObjectStore, raw_opts, finch, task_sup) do
+    raw_opts
+    |> normalize_backend_opts()
+    |> Keyword.put_new(:finch, finch)
+    |> Keyword.put_new(:task_supervisor, task_sup)
+  end
+
+  defp prepare_backend_init_opts(DurableServer.Backends.EKVStore, raw_opts, _finch, task_sup) do
+    raw_opts
+    |> normalize_backend_opts()
+    |> Keyword.put_new(:task_supervisor, task_sup)
+  end
+
+  defp prepare_backend_init_opts(DurableServer.Backends.MigrationStore, raw_opts, finch, task_sup) do
+    migration_opts = normalize_backend_opts(raw_opts)
+
+    primary =
+      migration_opts |> Keyword.fetch!(:primary) |> init_backend_spec(finch, task_sup)
+
+    secondary =
+      migration_opts |> Keyword.fetch!(:secondary) |> init_backend_spec(finch, task_sup)
+
+    migration_opts
+    |> Keyword.put(:primary, primary)
+    |> Keyword.put(:secondary, secondary)
+  end
+
+  defp prepare_backend_init_opts(_adapter, raw_opts, _finch, _task_sup), do: raw_opts
 
   defp init_backend!(adapter, raw_opts) when is_atom(adapter) do
     case StorageBackend.init_backend(adapter, raw_opts) do
@@ -2476,7 +2485,7 @@ defmodule DurableServer.Supervisor do
   end
 
   defp maybe_extract_object_store(%StorageBackend{
-         adapter: DurableServer.StorageBackend.ObjectStore,
+         adapter: DurableServer.Backends.ObjectStore,
          state: %ObjectStore{} = store
        }) do
     store

@@ -396,7 +396,11 @@ defmodule DurableServer.LifecycleTest do
       updated_data = %{data | meta: encoded_meta}
 
       {:ok, _} =
-        ObjectStore.put_object(config.object_store, "#{prefix}#{key}", JSON.encode!(updated_data))
+        ObjectStore.put_object(
+          config.object_store,
+          "#{prefix}#{key}",
+          encode_legacy_stored_state(updated_data)
+        )
 
       # Use the real supervisor's LifecycleManager for actual restart testing
       {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
@@ -459,7 +463,7 @@ defmodule DurableServer.LifecycleTest do
 
       encoded_meta = Meta.encode_to_binary(crashed_meta)
       updated_data = %{data | meta: encoded_meta}
-      ObjectStore.put_object(store, "#{prefix}#{key}", JSON.encode!(updated_data))
+      ObjectStore.put_object(store, "#{prefix}#{key}", encode_legacy_stored_state(updated_data))
 
       # Use the real supervisor's LifecycleManager for actual restart testing
       {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
@@ -533,7 +537,11 @@ defmodule DurableServer.LifecycleTest do
       final_data = %{current_data | meta: encoded_meta}
 
       {:ok, %{etag: _}} =
-        ObjectStore.put_object(config.object_store, "#{prefix}#{key}", JSON.encode!(final_data))
+        ObjectStore.put_object(
+          config.object_store,
+          "#{prefix}#{key}",
+          encode_legacy_stored_state(final_data)
+        )
 
       # Use the real supervisor's LifecycleManager for actual restart testing
       {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
@@ -906,6 +914,19 @@ defmodule DurableServer.LifecycleTest do
     }
 
     ObjectStore.put_object(store, key, JSON.encode!(test_data))
+  end
+
+  defp encode_legacy_stored_state(%DurableServer.StoredState{
+         vsn: vsn,
+         state: state,
+         meta: meta_binary
+       })
+       when is_binary(meta_binary) do
+    JSON.encode!(%{
+      "vsn" => vsn,
+      "state" => state,
+      "meta" => meta_binary
+    })
   end
 
   # Helper to get LifecycleManager PID from the real supervisor (for restart tests)
