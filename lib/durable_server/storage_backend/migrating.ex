@@ -199,18 +199,26 @@ defmodule DurableServer.StorageBackend.Migrating do
   end
 
   @impl true
+  def init_backend(opts) when is_map(opts), do: opts |> Map.to_list() |> init_backend()
+
+  def init_backend(opts) when is_list(opts) do
+    state = normalize_opts(opts)
+    read_backend = backend(state, state.read_preference)
+
+    {:ok,
+     %{
+       state: state,
+       defaults: StorageBackend.defaults(read_backend),
+       features: StorageBackend.features(read_backend)
+     }}
+  end
+
+  @impl true
   def ensure_ready(%{} = state) do
     with :ok <- StorageBackend.ensure_ready(state.primary),
          :ok <- maybe_ensure_secondary(state) do
       :ok
     end
-  end
-
-  @impl true
-  def capabilities(%{} = state) do
-    state
-    |> backend(state.read_preference)
-    |> StorageBackend.capabilities()
   end
 
   @impl true

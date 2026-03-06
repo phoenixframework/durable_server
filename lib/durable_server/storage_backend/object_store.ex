@@ -6,18 +6,28 @@ defmodule DurableServer.StorageBackend.ObjectStore do
   alias DurableServer.ObjectStore
 
   @impl true
-  def ensure_ready(%ObjectStore{} = store) do
-    ObjectStore.ensure_bucket_exists(store)
+  def init_backend(%ObjectStore{} = store) do
+    {:ok,
+     %{
+       state: store,
+       defaults: %{
+         heartbeat_tracking_mode: :poll,
+         discovery_interval_ms: 60_000,
+         heartbeat_interval_ms: 10_000,
+         heartbeat_reconcile_interval_ms: 10_000
+       },
+       features: %{
+         heartbeat_subscribe?: false
+       }
+     }}
   end
 
+  def init_backend(opts) when is_list(opts), do: init_backend(ObjectStore.new(opts))
+  def init_backend(opts) when is_map(opts), do: opts |> Map.to_list() |> init_backend()
+
   @impl true
-  def capabilities(%ObjectStore{} = _store) do
-    %{
-      heartbeat_tracking_mode: :poll,
-      discovery_interval_ms: 60_000,
-      heartbeat_interval_ms: 10_000,
-      heartbeat_reconcile_interval_ms: 10_000
-    }
+  def ensure_ready(%ObjectStore{} = store) do
+    ObjectStore.ensure_bucket_exists(store)
   end
 
   @impl true

@@ -1,33 +1,12 @@
 defmodule DurableServer.EKVIntegrationTest do
   use ExUnit.Case, async: false
 
+  alias DurableServer.{LifecycleManager, Meta, StoredState}
   alias DurableServer.StorageBackend
+  alias DurableServer.TestCounterServer, as: CounterServer
 
   @moduletag :integration
   @moduletag :capture_log
-
-  defmodule CounterServer do
-    use DurableServer, vsn: 1
-
-    def dump_state(state), do: %{count: state.count}
-
-    def load_state(_old_vsn, persisted_state) when is_map(persisted_state) do
-      count = Map.get(persisted_state, :count, Map.get(persisted_state, "count", 0))
-      %{count: count}
-    end
-
-    def init(%{count: count}) when is_integer(count), do: {:ok, %{count: count}}
-    def init(_state), do: {:ok, %{count: 0}}
-
-    def handle_call(:get_count, _from, %{count: count} = state) do
-      {:reply, count, state}
-    end
-
-    def handle_call(:increment_and_sync, _from, %{count: count} = state) do
-      new_state = %{state | count: count + 1}
-      {:reply, new_state.count, new_state, :sync}
-    end
-  end
 
   setup do
     unique_id = System.unique_integer([:positive, :monotonic])
@@ -106,6 +85,44 @@ defmodule DurableServer.EKVIntegrationTest do
     assert config.heartbeat_interval_ms == 7_000
     assert config.heartbeat_tracking_mode == :poll
     assert config.heartbeat_reconcile_interval_ms == 21_000
+  end
+
+  test "subscribe heartbeat tracking updates cache from EKV events", %{
+    supervisor_name: supervisor_name,
+    prefix: prefix
+  } do
+    %{storage_backend: storage_backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    remote_node = "remote-heartbeat@ekv"
+    heartbeat_key = "#{prefix}__nodes/#{remote_node}"
+
+    heartbeat_body =
+      JSON.encode!(%{
+        "node" => remote_node,
+        "node_ref" => "remote-ref",
+        "last_heartbeat_at" => System.system_time(:millisecond),
+        "heartbeat_meta" => %{"region" => "iad", "placement_region" => "iad"}
+      })
+
+    assert {:ok, _} = StorageBackend.put_object(storage_backend, heartbeat_key, heartbeat_body)
+
+    assert_eventually(fn ->
+      case LifecycleManager.get_cluster_nodes(supervisor_name) do
+        %{^remote_node => %{heartbeat_meta: %{"region" => "iad", "placement_region" => "iad"}}} ->
+          true
+
+        _ ->
+          false
+      end
+    end)
+
+    assert :ok = StorageBackend.delete_object(storage_backend, heartbeat_key)
+
+    assert_eventually(fn ->
+      LifecycleManager.get_cluster_nodes(supervisor_name)
+      |> Map.has_key?(remote_node)
+      |> Kernel.not()
+    end)
   end
 
   test "persists and reloads state with existing: true", %{supervisor_name: supervisor_name} do
@@ -209,5 +226,228 @@ defmodule DurableServer.EKVIntegrationTest do
     assert "#{prefix}b" in listed_keys
   end
 
+  test "lifecycle manager discovers and restarts a seeded permanent object via shared EKV" do
+    ensure_distributed_node!()
+
+    unique_id = System.unique_integer([:positive, :monotonic])
+    peer_name = :"durable_ekv_peer_#{unique_id}"
+    ekv_name = :"durable_ekv_cluster_#{unique_id}"
+    supervisor_name = :"durable_ekv_cluster_sup_#{unique_id}"
+    prefix = "ekv_cluster/#{unique_id}/"
+    local_data_dir = Path.join(System.tmp_dir!(), "durable_server_ekv_local_#{unique_id}")
+    remote_data_dir = Path.join(System.tmp_dir!(), "durable_server_ekv_remote_#{unique_id}")
+    key = "seeded-restart"
+
+    File.rm_rf(local_data_dir)
+    File.rm_rf(remote_data_dir)
+
+    {:ok, peer, peer_node} = :peer.start_link(%{name: peer_name})
+
+    on_exit(fn ->
+      try do
+        :peer.stop(peer)
+      catch
+        :exit, _ -> :ok
+      end
+
+      File.rm_rf(local_data_dir)
+      File.rm_rf(remote_data_dir)
+    end)
+
+    assert Node.connect(peer_node)
+    :ok = bootstrap_remote_peer(peer_node)
+
+    start_supervised!(%{
+      id: {ekv_mod(), ekv_name},
+      start:
+        {ekv_mod(), :start_link,
+         [
+           [
+             name: ekv_name,
+             data_dir: local_data_dir,
+             cluster_size: 2,
+             node_id: 1,
+             log: false
+           ]
+         ]}
+    })
+
+    assert {:ok, _} =
+             :erpc.call(
+               peer_node,
+               Supervisor,
+               :start_child,
+               [
+                 EKV.AppSupervisor,
+                 {ekv_mod(),
+                  [
+                    name: ekv_name,
+                    data_dir: remote_data_dir,
+                    cluster_size: 2,
+                    node_id: 2,
+                    log: false
+                  ]}
+               ]
+             )
+
+    start_supervised!(%{
+      id: {DurableServer.Supervisor, supervisor_name},
+      start:
+        {DurableServer.Supervisor, :start_link,
+         [
+           [
+             name: supervisor_name,
+             prefix: prefix,
+             backend: {:ekv, [name: ekv_name]},
+             discovery_interval_ms: 200,
+             heartbeat_interval_ms: 250,
+             heartbeat_reconcile_interval_ms: 10_000,
+             graceful_shutdown_timeout_ms: 500,
+             dead_node_threshold_ms: 5_000
+           ]
+         ]}
+    })
+
+    assert {:ok, _} =
+             :erpc.call(
+               peer_node,
+               Supervisor,
+               :start_child,
+               [
+                 DurableServer.AppSupervisor,
+                 {DurableServer.Supervisor,
+                  [
+                    name: supervisor_name,
+                    prefix: prefix,
+                    backend: {:ekv, [name: ekv_name]},
+                    discovery_interval_ms: 200,
+                    heartbeat_interval_ms: 250,
+                    heartbeat_reconcile_interval_ms: 10_000,
+                    graceful_shutdown_timeout_ms: 500,
+                    dead_node_threshold_ms: 5_000
+                  ]}
+               ]
+             )
+
+    assert_eventually(
+      fn ->
+        peer_node in connected_ekv_peer_nodes(ekv_name) and
+          Node.self() in remote_connected_ekv_peer_nodes(peer_node, ekv_name)
+      end,
+      10_000
+    )
+
+    assert_eventually(
+      fn ->
+        LifecycleManager.get_cluster_nodes(supervisor_name)
+        |> Map.has_key?(to_string(peer_node))
+      end,
+      5_000
+    )
+
+    peer_node_string = to_string(peer_node)
+
+    %{storage_backend: storage_backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    remote_node_ref =
+      case LifecycleManager.lookup_node_health(%{
+             supervisor: supervisor_name,
+             node_str: peer_node_string
+           }) do
+        {:healthy, %{node_ref: node_ref}} when is_integer(node_ref) -> node_ref
+      end
+
+    seeded_meta = %Meta{
+      module: CounterServer,
+      permanent: true,
+      pid: self(),
+      status: :stopped_graceful,
+      key: key,
+      prefix: prefix,
+      supervisor: supervisor_name,
+      task_supervisor: DurableServer.TaskSupervisor,
+      node_ref: remote_node_ref,
+      node_str: peer_node_string,
+      last_heartbeat_at: System.system_time(:millisecond)
+    }
+
+    seeded_state = %StoredState{
+      vsn: 1,
+      state: %{count: 7},
+      meta: Meta.encode_to_binary(seeded_meta)
+    }
+
+    assert {:ok, _} =
+             StorageBackend.put_object(
+               storage_backend,
+               "#{prefix}#{key}",
+               JSON.encode!(seeded_state)
+             )
+
+    send(LifecycleManager.name(supervisor_name), :discover_and_restart)
+
+    assert_eventually(
+      fn ->
+        case DurableServer.Supervisor.lookup(supervisor_name, key) do
+          {pid, _meta} when is_pid(pid) ->
+            node(pid) == Node.self()
+
+          nil ->
+            false
+        end
+      end,
+      10_000
+    )
+
+    {restarted_pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+    assert 7 == GenServer.call(restarted_pid, :get_count)
+  end
+
   defp ekv_mod, do: :"Elixir.EKV"
+
+  defp bootstrap_remote_peer(peer_node) do
+    code_paths = :code.get_path()
+
+    assert :ok = :erpc.call(peer_node, :code, :add_paths, [code_paths])
+    assert {:ok, _} = :erpc.call(peer_node, Application, :ensure_all_started, [:ekv])
+    assert {:ok, _} = :erpc.call(peer_node, Application, :ensure_all_started, [:durable_server])
+    :ok
+  end
+
+  defp connected_ekv_peer_nodes(ekv_name) do
+    ekv_mod().info(ekv_name).connected_peers |> Enum.map(& &1.node)
+  end
+
+  defp remote_connected_ekv_peer_nodes(peer_node, ekv_name) do
+    :erpc.call(peer_node, ekv_mod(), :info, [ekv_name]).connected_peers |> Enum.map(& &1.node)
+  end
+
+  defp ensure_distributed_node! do
+    if Node.alive?() do
+      :ok
+    else
+      name = :"durable_server_test_#{System.unique_integer([:positive, :monotonic])}"
+      {:ok, _} = Node.start(name, :shortnames)
+      :ok
+    end
+  end
+
+  defp assert_eventually(fun, timeout \\ 2_000, interval \\ 25)
+       when is_function(fun, 0) and is_integer(timeout) and timeout > 0 do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_assert_eventually(fun, deadline, interval)
+  end
+
+  defp do_assert_eventually(fun, deadline, interval) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("eventual assertion timed out")
+      else
+        Process.sleep(interval)
+        do_assert_eventually(fun, deadline, interval)
+      end
+    end
+  end
 end

@@ -2166,13 +2166,13 @@ defmodule DurableServer.Supervisor do
     # Build storage backend from :backend or legacy :object_store options.
     {storage_backend, object_store} = build_storage_backend(opts, finch, task_sup)
     :ok = StorageBackend.ensure_ready(storage_backend)
-    backend_capabilities = StorageBackend.capabilities(storage_backend)
+    backend_defaults = StorageBackend.defaults(storage_backend)
 
     discovery_interval_ms =
       extract_backend_tuned_interval!(
         opts,
         :discovery_interval_ms,
-        backend_capabilities,
+        backend_defaults,
         @default_discovery_interval_ms
       )
 
@@ -2180,17 +2180,17 @@ defmodule DurableServer.Supervisor do
       extract_backend_tuned_interval!(
         opts,
         :heartbeat_interval_ms,
-        backend_capabilities,
+        backend_defaults,
         @default_heartbeat_interval_ms
       )
 
     heartbeat_tracking_mode =
-      extract_heartbeat_tracking_mode_config(opts, backend_capabilities)
+      extract_heartbeat_tracking_mode_config(opts, backend_defaults)
 
     heartbeat_reconcile_interval_ms =
       extract_heartbeat_reconcile_interval_config(
         opts,
-        backend_capabilities,
+        backend_defaults,
         heartbeat_tracking_mode
       )
 
@@ -2389,81 +2389,79 @@ defmodule DurableServer.Supervisor do
   end
 
   defp build_storage_backend(opts, finch, task_sup) do
-    if Keyword.has_key?(opts, :backend) do
-      backend_spec = Keyword.fetch!(opts, :backend)
-      backend = normalize_backend_spec(backend_spec, finch, task_sup)
-      object_store = maybe_extract_object_store(backend)
-      {backend, object_store}
-    else
-      object_store =
-        case Keyword.fetch!(opts, :object_store) do
-          %ObjectStore{} = store ->
-            store
+    backend_spec =
+      if Keyword.has_key?(opts, :backend) do
+        Keyword.fetch!(opts, :backend)
+      else
+        {:object_store, Keyword.fetch!(opts, :object_store)}
+      end
 
-          object_store_opts when is_list(object_store_opts) ->
-            ObjectStore.new(
-              object_store_opts
-              |> Keyword.put_new(:finch, finch)
-              |> Keyword.put_new(:task_supervisor, task_sup)
-            )
-        end
-
-      backend =
-        StorageBackend.new(DurableServer.StorageBackend.ObjectStore, object_store)
-
-      {backend, object_store}
-    end
+    backend = init_backend_spec(backend_spec, finch, task_sup)
+    object_store = maybe_extract_object_store(backend)
+    {backend, object_store}
   end
 
-  defp normalize_backend_spec(%StorageBackend{} = backend, _finch, _task_sup), do: backend
+  defp init_backend_spec(%StorageBackend{} = backend, _finch, _task_sup), do: backend
 
-  defp normalize_backend_spec({:object_store, %ObjectStore{} = store}, _finch, _task_sup) do
-    StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+  defp init_backend_spec({:object_store, %ObjectStore{} = store}, _finch, _task_sup) do
+    init_backend!(DurableServer.StorageBackend.ObjectStore, store)
   end
 
-  defp normalize_backend_spec({:object_store, object_store_opts}, finch, task_sup)
+  defp init_backend_spec({:object_store, object_store_opts}, finch, task_sup)
        when is_list(object_store_opts) do
-    store =
-      ObjectStore.new(
-        object_store_opts
-        |> Keyword.put_new(:finch, finch)
-        |> Keyword.put_new(:task_supervisor, task_sup)
-      )
-
-    StorageBackend.new(DurableServer.StorageBackend.ObjectStore, store)
+    init_backend!(
+      DurableServer.StorageBackend.ObjectStore,
+      object_store_opts
+      |> Keyword.put_new(:finch, finch)
+      |> Keyword.put_new(:task_supervisor, task_sup)
+    )
   end
 
-  defp normalize_backend_spec({:ekv, ekv_opts}, _finch, task_sup) do
+  defp init_backend_spec({:object_store, object_store_opts}, finch, task_sup)
+       when is_map(object_store_opts) do
+    init_backend_spec({:object_store, Map.to_list(object_store_opts)}, finch, task_sup)
+  end
+
+  defp init_backend_spec({:ekv, ekv_opts}, _finch, task_sup) do
     ekv_opts =
       ekv_opts
       |> normalize_backend_opts()
       |> Keyword.put_new(:task_supervisor, task_sup)
 
-    state = DurableServer.StorageBackend.EKV.normalize_opts(ekv_opts)
-    StorageBackend.new(DurableServer.StorageBackend.EKV, state)
+    init_backend!(DurableServer.StorageBackend.EKV, ekv_opts)
   end
 
-  defp normalize_backend_spec({:migrating, migrating_opts}, finch, task_sup) do
+  defp init_backend_spec({:migrating, migrating_opts}, finch, task_sup) do
     migrating_opts = normalize_backend_opts(migrating_opts)
 
     primary =
-      migrating_opts |> Keyword.fetch!(:primary) |> normalize_backend_spec(finch, task_sup)
+      migrating_opts |> Keyword.fetch!(:primary) |> init_backend_spec(finch, task_sup)
 
     secondary =
-      migrating_opts |> Keyword.fetch!(:secondary) |> normalize_backend_spec(finch, task_sup)
+      migrating_opts |> Keyword.fetch!(:secondary) |> init_backend_spec(finch, task_sup)
 
-    state =
+    init_backend!(
+      DurableServer.StorageBackend.Migrating,
       migrating_opts
       |> Keyword.put(:primary, primary)
       |> Keyword.put(:secondary, secondary)
-      |> DurableServer.StorageBackend.Migrating.normalize_opts()
-
-    StorageBackend.new(DurableServer.StorageBackend.Migrating, state)
+    )
   end
 
-  defp normalize_backend_spec(spec, _finch, _task_sup) do
+  defp init_backend_spec(spec, _finch, _task_sup) do
     raise ArgumentError,
           "invalid :backend option #{inspect(spec)}. Expected {:object_store, ...}, {:ekv, ...}, {:migrating, ...}, or %DurableServer.StorageBackend{}"
+  end
+
+  defp init_backend!(adapter, raw_opts) when is_atom(adapter) do
+    case StorageBackend.init_backend(adapter, raw_opts) do
+      {:ok, %StorageBackend{} = backend} ->
+        backend
+
+      {:error, reason} ->
+        raise ArgumentError,
+              "failed to initialize backend #{inspect(adapter)} with #{inspect(raw_opts)}: #{inspect(reason)}"
+    end
   end
 
   defp normalize_backend_opts(opts) when is_list(opts), do: opts
@@ -2668,11 +2666,11 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp extract_backend_tuned_interval!(opts, key, backend_capabilities, fallback_default)
-       when is_list(opts) and is_atom(key) and is_map(backend_capabilities) and
+  defp extract_backend_tuned_interval!(opts, key, backend_defaults, fallback_default)
+       when is_list(opts) and is_atom(key) and is_map(backend_defaults) and
               is_integer(fallback_default) and fallback_default > 0 do
     default =
-      case Map.get(backend_capabilities, key) do
+      case Map.get(backend_defaults, key) do
         value when is_integer(value) and value > 0 -> value
         _ -> fallback_default
       end
@@ -2680,11 +2678,11 @@ defmodule DurableServer.Supervisor do
     extract_positive_timeout!(opts, key, default)
   end
 
-  defp extract_heartbeat_tracking_mode_config(opts, backend_capabilities)
-       when is_list(opts) and is_map(backend_capabilities) do
+  defp extract_heartbeat_tracking_mode_config(opts, backend_defaults)
+       when is_list(opts) and is_map(backend_defaults) do
     default_mode =
       case Map.get(
-             backend_capabilities,
+             backend_defaults,
              :heartbeat_tracking_mode,
              @default_heartbeat_tracking_mode
            ) do
@@ -2707,10 +2705,10 @@ defmodule DurableServer.Supervisor do
 
   defp extract_heartbeat_reconcile_interval_config(
          opts,
-         backend_capabilities,
+         backend_defaults,
          heartbeat_tracking_mode
        )
-       when is_list(opts) and is_map(backend_capabilities) and
+       when is_list(opts) and is_map(backend_defaults) and
               heartbeat_tracking_mode in [:poll, :subscribe] do
     fallback_default =
       if heartbeat_tracking_mode == :subscribe do
@@ -2720,7 +2718,7 @@ defmodule DurableServer.Supervisor do
       end
 
     default =
-      case Map.get(backend_capabilities, :heartbeat_reconcile_interval_ms, fallback_default) do
+      case Map.get(backend_defaults, :heartbeat_reconcile_interval_ms, fallback_default) do
         value when is_integer(value) and value > 0 -> value
         _ -> fallback_default
       end

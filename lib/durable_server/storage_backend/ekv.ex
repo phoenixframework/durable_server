@@ -75,21 +75,30 @@ defmodule DurableServer.StorageBackend.EKV do
   end
 
   @impl true
+  def init_backend(opts) when is_map(opts), do: opts |> Map.to_list() |> init_backend()
+
+  def init_backend(opts) when is_list(opts) do
+    {:ok,
+     %{
+       state: normalize_opts(opts),
+       defaults: %{
+         heartbeat_tracking_mode: :subscribe,
+         discovery_interval_ms: 5_000,
+         heartbeat_interval_ms: 5_000,
+         heartbeat_reconcile_interval_ms: 30_000
+       },
+       features: %{
+         heartbeat_subscribe?: true
+       }
+     }}
+  end
+
+  @impl true
   def ensure_ready(%{name: name} = _state) do
     with {:ok, config} <- fetch_config(name),
          :ok <- ensure_cas_config(config) do
       :ok
     end
-  end
-
-  @impl true
-  def capabilities(%{} = _state) do
-    %{
-      heartbeat_tracking_mode: :subscribe,
-      discovery_interval_ms: 5_000,
-      heartbeat_interval_ms: 5_000,
-      heartbeat_reconcile_interval_ms: 30_000
-    }
   end
 
   @impl true
