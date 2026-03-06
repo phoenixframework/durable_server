@@ -3,6 +3,7 @@ defmodule DurableServer.StorageBackend.ObjectStore do
 
   @behaviour DurableServer.StorageBackend
 
+  alias DurableServer.{Meta, StoredState}
   alias DurableServer.ObjectStore
 
   @impl true
@@ -32,7 +33,16 @@ defmodule DurableServer.StorageBackend.ObjectStore do
 
   @impl true
   def get_object(%ObjectStore{} = store, key, opts) do
-    ObjectStore.get_object(store, key, opts)
+    case ObjectStore.get_object(store, key, opts) do
+      {:ok, %{body: encoded, etag: etag}} ->
+        case decode_body(encoded) do
+          {:ok, body} -> {:ok, %{body: body, etag: etag}}
+          {:error, reason} -> {:error, reason}
+        end
+
+      other ->
+        other
+    end
   end
 
   @impl true
@@ -42,7 +52,10 @@ defmodule DurableServer.StorageBackend.ObjectStore do
 
   @impl true
   def put_object(%ObjectStore{} = store, key, data, opts) do
-    ObjectStore.put_object(store, key, data, opts)
+    with {:ok, encoded} <- encode_body(data),
+         {:ok, %{etag: etag}} <- ObjectStore.put_object(store, key, encoded, opts) do
+      {:ok, %{body: data, etag: etag}}
+    end
   end
 
   @impl true
@@ -52,11 +65,69 @@ defmodule DurableServer.StorageBackend.ObjectStore do
 
   @impl true
   def try_claim(%ObjectStore{} = store, key, body) do
-    ObjectStore.try_claim(store, key, body)
+    with {:ok, encoded} <- encode_body(body) do
+      ObjectStore.try_claim(store, key, encoded)
+    end
   end
 
   @impl true
   def update_object(%ObjectStore{} = store, key, update_fn, opts) do
-    ObjectStore.update_object(store, key, update_fn, opts)
+    case ObjectStore.update_object(
+           store,
+           key,
+           fn %{body: encoded, etag: etag} ->
+             with {:ok, body} <- decode_body(encoded),
+                  {:ok, new_body} <- update_fn.(%{body: body, etag: etag}),
+                  {:ok, new_encoded} <- encode_body(new_body) do
+               {:ok, new_encoded}
+             end
+           end,
+           opts
+         ) do
+      {:ok, %{body: encoded, etag: etag}} ->
+        case decode_body(encoded) do
+          {:ok, body} -> {:ok, %{body: body, etag: etag}}
+          {:error, reason} -> {:error, reason}
+        end
+
+      other ->
+        other
+    end
   end
+
+  defp encode_body(%StoredState{meta: %Meta{} = meta} = data) do
+    encoded_meta = Meta.encode_to_binary(meta)
+    stored_state = %StoredState{data | meta: encoded_meta}
+    {:ok, JSON.encode!(stored_state)}
+  rescue
+    error in [ArgumentError, RuntimeError] -> {:error, error}
+  end
+
+  defp encode_body(data) do
+    {:ok, JSON.encode!(data)}
+  rescue
+    error in [ArgumentError, RuntimeError] -> {:error, error}
+  end
+
+  defp decode_body(encoded) when is_binary(encoded) do
+    data = JSON.decode!(encoded)
+
+    case data do
+      %{"vsn" => vsn, "state" => state, "meta" => meta_str} when is_binary(meta_str) ->
+        {:ok,
+         %StoredState{
+           vsn: vsn,
+           state: state,
+           meta: Meta.decode_from_binary(meta_str, %{key: nil, prefix: nil})
+         }}
+
+      other ->
+        {:ok, other}
+    end
+  catch
+    kind, reason ->
+      {:error, {kind, reason, encoded}}
+  end
+
+  defp decode_body(other), do: {:error, {:error, {:unexpected_encoded_value, other}, other}}
 end

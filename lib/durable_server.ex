@@ -952,12 +952,10 @@ defmodule DurableServer do
             end
 
           :error ->
-            # encode and decode to match load_state contract for initial start and restart merge
             client_init_state =
               init_state
               |> module.dump_state()
-              |> JSON.encode!()
-              |> JSON.decode!()
+              |> normalize_persisted_term!()
 
             # no existing state - old vsn is nil
             loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
@@ -1123,10 +1121,9 @@ defmodule DurableServer do
          init_state \\ nil
        ) do
     case init_state do
-      {:restart, obj} ->
-        %{body: _body, etag: _etag} = obj
-        {:ok, %StoredState{} = decoded} = decode_stored_state(obj, %{key: key, prefix: prefix})
-        {:ok, decoded}
+      {:restart, %{body: %StoredState{} = stored_state, etag: etag}} ->
+        {:ok,
+         attach_stored_state_context(%{stored_state | etag: etag}, %{key: key, prefix: prefix})}
 
       _ ->
         case fetch_stored_state(store, %{key: key, prefix: prefix}) do
@@ -1212,18 +1209,15 @@ defmodule DurableServer do
     deleting_data = %StoredState{
       vsn: 1,
       state: %{},
-      meta:
-        DurableServer.Meta.encode_to_binary(%DurableServer.Meta{
-          status: :deleting,
-          pid: nil,
-          node_str: Atom.to_string(Node.self()),
-          node_ref: nil,
-          last_heartbeat_at: System.system_time(:millisecond),
-          crash_history: []
-        })
+      meta: %DurableServer.Meta{
+        status: :deleting,
+        pid: nil,
+        node_str: Atom.to_string(Node.self()),
+        node_ref: nil,
+        last_heartbeat_at: System.system_time(:millisecond),
+        crash_history: []
+      }
     }
-
-    deleting_json = JSON.encode!(deleting_data)
 
     case StorageBackend.get_object(store, storage_key) do
       # object already deleted, so we proceed as normal
@@ -1245,39 +1239,33 @@ defmodule DurableServer do
               # someone raced us on the lock (different etag)
               # we don't need to check the lock because we know they just grabbed it
               # so their node is healhty
-              %{body: encoded_obj, etag: etag} when etag != current_etag ->
-                with {:ok, obj} <- JSON.decode(encoded_obj),
-                     %{"meta" => meta_str} = obj,
-                     %Meta{} =
-                       meta = Meta.decode_from_binary(meta_str, %{key: key, prefix: prefix}) do
-                  {:error, {:locked, meta.pid}}
+              %{body: %StoredState{meta: %Meta{} = meta}, etag: etag} when etag != current_etag ->
+                meta = %{meta | key: key, prefix: prefix}
+                {:error, {:locked, meta.pid}}
+
+              %{body: %StoredState{}, etag: etag} when etag != current_etag ->
+                {:error, {:locked, nil}}
+
+              %{body: %StoredState{} = stored_state, etag: ^current_etag} ->
+                stored_state =
+                  attach_stored_state_context(stored_state, %{key: key, prefix: prefix})
+
+                case check_lock(stored_state.meta) do
+                  :expired ->
+                    Logger.info("delete: #{storage_key} found to be expired, claimed expired key")
+
+                    {:ok, deleting_data}
+
+                  {:locked, lock_pid} ->
+                    Logger.info(
+                      "delete: cannot claim lock for delete on #{storage_key} - locked by #{inspect(lock_pid)}"
+                    )
+
+                    {:error, {:locked, lock_pid}}
                 end
 
-              # object still matches our etag, but the lock may still be healthy so we need to
-              # check it before we proceed
-              %{body: encoded_obj, etag: ^current_etag} ->
-                with {:ok, obj} <- JSON.decode(encoded_obj),
-                     %{"meta" => meta_str} = obj,
-                     %Meta{} =
-                       meta = Meta.decode_from_binary(meta_str, %{key: key, prefix: prefix}) do
-                  case check_lock(meta) do
-                    :expired ->
-                      Logger.info(
-                        "delete: #{storage_key} found to be expired, claimed expired key"
-                      )
-
-                      # lock expired, we can claim it for deletion
-                      {:ok, deleting_json}
-
-                    {:locked, lock_pid} ->
-                      Logger.info(
-                        "delete: cannot claim lock for delete on #{storage_key} - locked by #{inspect(lock_pid)}"
-                      )
-
-                      # still locked by active process
-                      {:error, {:locked, lock_pid}}
-                  end
-                end
+              %{body: other, etag: _etag} ->
+                {:error, {:unexpected_value_type, other}}
             end,
             timeout: :infinity,
             max_retries: 0
@@ -1458,10 +1446,11 @@ defmodule DurableServer do
             ttl_ms: ttl_ms
           })
 
-        updated_stored_state = %{stored_state | meta: Meta.encode_to_binary(updated_meta)}
-        data = JSON.encode!(updated_stored_state)
+        updated_stored_state = %{stored_state | meta: updated_meta}
 
-        case StorageBackend.put_object(store, storage_key, data, etag: stored_state.etag) do
+        case StorageBackend.put_object(store, storage_key, updated_stored_state,
+               etag: stored_state.etag
+             ) do
           {:ok, %{body: _, etag: _} = obj} -> {:ok, obj}
           # someone raced us b/w list_objects and update
           {:error, :conflict} -> {:error, :not_eligible}
@@ -1487,19 +1476,21 @@ defmodule DurableServer do
       when is_binary(key) do
     storage_key = prefix <> key
 
-    case decode_stored_state(%{body: body, etag: etag}, %{key: key, prefix: prefix}) do
-      {:ok, %StoredState{meta: meta} = stored_state} ->
-        updated_meta = Meta.clear_restart_attempt(meta)
-        updated = %{stored_state | meta: Meta.encode_to_binary(updated_meta)}
-        new_data = JSON.encode!(updated)
+    case body do
+      %StoredState{meta: %Meta{} = meta} = stored_state ->
+        stored_state =
+          attach_stored_state_context(%{stored_state | etag: etag}, %{key: key, prefix: prefix})
 
-        case StorageBackend.put_object(store, storage_key, new_data, etag: etag) do
+        updated_meta = Meta.clear_restart_attempt(meta)
+        updated = %{stored_state | meta: updated_meta}
+
+        case StorageBackend.put_object(store, storage_key, updated, etag: etag) do
           {:ok, _} -> :ok
           {:error, reason} -> {:error, reason}
         end
 
-      {:error, reason} ->
-        {:error, reason}
+      other ->
+        {:error, {:unexpected_value_type, other}}
     end
   end
 
@@ -1882,28 +1873,6 @@ defmodule DurableServer do
     end
   end
 
-  defp validate_decoded_structure!(data) when is_map(data) do
-    case data do
-      %{"vsn" => _, "state" => _, "meta" => meta} = data ->
-        if not is_binary(meta) do
-          raise ArgumentError, "decoded object meta field must be a binary string"
-        end
-
-        data
-
-      _ ->
-        keys = Map.keys(data)
-
-        raise ArgumentError,
-              "decoder must return a map with string keys including \"vsn\", " <>
-                "\"state\", and \"meta\", got keys: #{inspect(keys)}"
-    end
-  end
-
-  defp validate_decoded_structure!(data) do
-    raise ArgumentError, "decoder must return a map, got: #{inspect(data)}"
-  end
-
   defp dump_meta(%DurableServer{} = state) do
     sticky_placement = build_sticky_placement(state.supervisor, state.module)
 
@@ -2000,12 +1969,10 @@ defmodule DurableServer do
     data = %StoredState{
       vsn: state.vsn,
       state: dumped_user_state,
-      meta: Meta.encode_to_binary(final_dumped_meta)
+      meta: final_dumped_meta
     }
 
-    json_data = JSON.encode!(data)
-
-    case do_lock_object_json(state, json_data, state.supervisor) do
+    case do_lock_object(state, data, state.supervisor) do
       {:ok, %DurableServer{} = new_state} ->
         {:ok, new_state}
 
@@ -2414,12 +2381,10 @@ defmodule DurableServer do
       data = %StoredState{
         vsn: new_state.vsn,
         state: dumped_user_state,
-        meta: Meta.encode_to_binary(new_meta)
+        meta: new_meta
       }
 
-      json_data = JSON.encode!(data)
-
-      case put_object(new_state, storage_key(new_state), json_data) do
+      case put_object(new_state, storage_key(new_state), data) do
         {:ok, %DurableServer{} = new_state} ->
           {:ok, %{new_state | status: meta_overrides[:status] || new_state.status}}
 
@@ -2452,27 +2417,6 @@ defmodule DurableServer do
     end
   end
 
-  defp decode_stored_state(%{body: encoded, etag: etag} = _obj, %{key: key, prefix: prefix}) do
-    data = JSON.decode!(encoded)
-    validated_data = validate_decoded_structure!(data)
-    encoded_meta = Map.fetch!(validated_data, "meta")
-    %Meta{} = meta = Meta.decode_from_binary(encoded_meta, %{key: key, prefix: prefix})
-    %{"vsn" => vsn, "state" => state} = validated_data
-
-    {:ok,
-     %StoredState{
-       key: key,
-       prefix: prefix,
-       state: state,
-       meta: meta,
-       vsn: vsn,
-       etag: etag
-     }}
-  catch
-    kind, reason ->
-      {:error, {kind, reason, encoded}}
-  end
-
   @doc """
   Fetches the DurableServer's current state from storage.
   """
@@ -2489,11 +2433,12 @@ defmodule DurableServer do
 
   def fetch_stored_state(%StorageBackend{} = store, %{key: key, prefix: prefix}) do
     case StorageBackend.get_object(store, prefix <> key) do
-      {:ok, %{body: _encoded, etag: _etag} = obj} ->
-        case decode_stored_state(obj, %{key: key, prefix: prefix}) do
-          {:ok, %StoredState{} = decoded} -> {:ok, decoded}
-          {:error, reason} -> {:error, reason}
-        end
+      {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
+        {:ok,
+         attach_stored_state_context(%{stored_state | etag: etag}, %{key: key, prefix: prefix})}
+
+      {:ok, %{body: other}} ->
+        {:error, {:unexpected_value_type, other}}
 
       {:error, reason} ->
         {:error, reason}
@@ -2742,18 +2687,18 @@ defmodule DurableServer do
     end
   end
 
-  defp do_lock_object_json(
+  defp do_lock_object(
          %DurableServer{object_store: store} = state,
-         json_data,
+         data,
          supervisor_name
        )
        when is_atom(supervisor_name) do
     # if we have an etag, the object exists so jump straight to update based lock claim
     # if etag is nil, obj didn't exist at fetch time, so try to be first to claim it
     if state.etag do
-      try_lock_object_json_via_update(state, json_data)
+      try_lock_object_via_update(state, data)
     else
-      case StorageBackend.try_claim(store, storage_key(state), json_data) do
+      case StorageBackend.try_claim(store, storage_key(state), data) do
         # we won the first ever insert for this key
         {:ok, {:claimed, new_etag}} ->
           Logger.info(
@@ -2776,11 +2721,11 @@ defmodule DurableServer do
     end
   end
 
-  defp try_lock_object_json_via_update(
+  defp try_lock_object_via_update(
          %DurableServer{key: key, object_store: store} = state,
-         json_data
+         data
        ) do
-    case StorageBackend.put_object(store, storage_key(state), json_data, etag: state.etag) do
+    case StorageBackend.put_object(store, storage_key(state), data, etag: state.etag) do
       # obj still matched our etag, we got the claim
       {:ok, %{etag: new_etag}} ->
         Logger.info(
@@ -2828,19 +2773,20 @@ defmodule DurableServer do
       """
     end
 
-    hash = :crypto.hash(:sha256, :erlang.term_to_binary(dumped_state))
-    {%{state | last_synced_user_state_hash: hash}, dumped_state}
+    normalized_state = normalize_persisted_term!(dumped_state)
+    hash = :crypto.hash(:sha256, :erlang.term_to_binary(normalized_state))
+    {%{state | last_synced_user_state_hash: hash}, normalized_state}
   end
 
   defp load_user_state(module, old_vsn, persisted_state) do
     module.load_state(old_vsn, persisted_state)
   end
 
-  defp put_object(%DurableServer{} = state, storage_key, json_data) do
+  defp put_object(%DurableServer{} = state, storage_key, data) do
     opts = [max_retries: @max_sync_retries]
     put_opts = if state.etag, do: Keyword.put(opts, :etag, state.etag), else: opts
 
-    case StorageBackend.put_object(state.object_store, storage_key, json_data, put_opts) do
+    case StorageBackend.put_object(state.object_store, storage_key, data, put_opts) do
       {:ok, %{etag: new_etag}} -> {:ok, %{state | etag: new_etag}}
       {:error, reason} -> {:error, reason}
     end
@@ -2853,25 +2799,67 @@ defmodule DurableServer do
     store = state.object_store
 
     case StorageBackend.get_object(store, storage_key) do
-      {:ok, %{body: body, etag: etag}} ->
-        case JSON.decode(body) do
-          {:ok, data} ->
-            encoded_meta = Meta.encode_to_binary(updated_meta)
-            updated_data = Map.put(data, "meta", encoded_meta)
-            json_data = JSON.encode!(updated_data)
+      {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
+        updated_data =
+          stored_state
+          |> attach_stored_state_context(%{key: state.key, prefix: state.prefix})
+          |> Map.put(:meta, updated_meta)
 
-            case put_object(%{state | etag: etag}, storage_key, json_data) do
-              {:ok, %DurableServer{} = new_state} -> {:ok, new_state}
-              {:error, reason} -> {:error, reason}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
+        case put_object(%{state | etag: etag}, storage_key, updated_data) do
+          {:ok, %DurableServer{} = new_state} -> {:ok, new_state}
+          {:error, reason} -> {:error, reason}
         end
+
+      {:ok, %{body: other}} ->
+        {:error, {:unexpected_value_type, other}}
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp attach_stored_state_context(%StoredState{meta: %Meta{} = meta} = stored_state, %{
+         key: key,
+         prefix: prefix
+       }) do
+    %StoredState{
+      stored_state
+      | key: key,
+        prefix: prefix,
+        meta: %{meta | key: key, prefix: prefix}
+    }
+  end
+
+  defp normalize_persisted_term!(term)
+       when is_binary(term) or is_boolean(term) or is_number(term) or is_nil(term),
+       do: term
+
+  defp normalize_persisted_term!(list) when is_list(list) do
+    Enum.map(list, &normalize_persisted_term!/1)
+  end
+
+  defp normalize_persisted_term!(%{} = map) do
+    if is_struct(map) do
+      raise ArgumentError,
+            "dump_state/1 must return a plain map without structs, got: #{inspect(map)}"
+    end
+
+    Enum.into(map, %{}, fn
+      {key, value} when is_atom(key) ->
+        {Atom.to_string(key), normalize_persisted_term!(value)}
+
+      {key, value} when is_binary(key) ->
+        {key, normalize_persisted_term!(value)}
+
+      {key, _value} ->
+        raise ArgumentError,
+              "dump_state/1 maps must use atom or string keys, got: #{inspect(key)}"
+    end)
+  end
+
+  defp normalize_persisted_term!(other) do
+    raise ArgumentError,
+          "dump_state/1 must return JSON-compatible data, got: #{inspect(other)}"
   end
 
   defp update_server_status_directly(%DurableServer{} = state, status) do

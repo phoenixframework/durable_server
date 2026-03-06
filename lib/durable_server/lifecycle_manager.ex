@@ -783,19 +783,13 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp apply_storage_heartbeat_put(%LifecycleManager{} = state, key, value)
-       when is_binary(key) and is_binary(value) do
+       when is_binary(key) do
     if heartbeat_key_for_supervisor?(state, key) do
-      case JSON.decode(value) do
-        {:ok, data} ->
-          case parse_heartbeat_data(data) do
-            {:ok, heartbeat_tuple} ->
-              :ets.insert(state.heartbeat_table, heartbeat_tuple)
+      case parse_heartbeat_data(value) do
+        {:ok, heartbeat_tuple} ->
+          :ets.insert(state.heartbeat_table, heartbeat_tuple)
 
-            {:error, :invalid_format} ->
-              :ok
-          end
-
-        {:error, _reason} ->
+        {:error, :invalid_format} ->
           :ok
       end
     end
@@ -861,18 +855,16 @@ defmodule DurableServer.LifecycleManager do
 
     heartbeat_data =
       %{
-        node: node_str,
-        node_ref: node_ref,
-        last_heartbeat_at: current_time
+        "node" => node_str,
+        "node_ref" => node_ref,
+        "last_heartbeat_at" => current_time
       }
-      |> maybe_put(:capacity, capacity)
-      |> maybe_put(:resources, resources)
-      |> maybe_put(:env_vars, env_vars)
-      |> maybe_put(:heartbeat_meta, heartbeat_meta)
+      |> maybe_put("capacity", normalize_heartbeat_term(capacity))
+      |> maybe_put("resources", normalize_heartbeat_term(resources))
+      |> maybe_put("env_vars", normalize_heartbeat_term(env_vars))
+      |> maybe_put("heartbeat_meta", normalize_heartbeat_term(heartbeat_meta))
 
     key = "#{state.prefix}__nodes/#{node_str}"
-    json_data = JSON.encode!(heartbeat_data)
-
     # Calculate remaining time until deadline for the PUT operation
     # On initial heartbeat (in init), last_successful_heartbeat_at is nil - use full deadline
     put_opts =
@@ -888,7 +880,7 @@ defmodule DurableServer.LifecycleManager do
 
     entry = {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
 
-    case StorageBackend.put_object(state.object_store, key, json_data, put_opts) do
+    case StorageBackend.put_object(state.object_store, key, heartbeat_data, put_opts) do
       {:ok, _} ->
         # update local ets cache with full capacity info
         :ets.insert(state.heartbeat_table, entry)
@@ -965,24 +957,17 @@ defmodule DurableServer.LifecycleManager do
         fn key ->
           case StorageBackend.get_object(state.object_store, key) do
             {:ok, %{body: body}} ->
-              case JSON.decode(body) do
-                {:ok, data} ->
-                  case parse_heartbeat_data(data) do
-                    {:ok,
-                     {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
-                      if current_time - timestamp > dead_node_threshold_ms do
-                        {:dead, key, node, node_ref, timestamp}
-                      else
-                        {:alive, node, node_ref, timestamp, capacity, resources, env_vars,
-                         heartbeat_meta}
-                      end
-
-                    {:error, :invalid_format} ->
-                      {:fetch_error, key, :invalid_format}
+              case parse_heartbeat_data(body) do
+                {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
+                  if current_time - timestamp > dead_node_threshold_ms do
+                    {:dead, key, node, node_ref, timestamp}
+                  else
+                    {:alive, node, node_ref, timestamp, capacity, resources, env_vars,
+                     heartbeat_meta}
                   end
 
-                {:error, decode_reason} ->
-                  {:fetch_error, key, {:json_decode, decode_reason}}
+                {:error, :invalid_format} ->
+                  {:fetch_error, key, :invalid_format}
               end
 
             {:error, :not_found} ->
@@ -1235,26 +1220,20 @@ defmodule DurableServer.LifecycleManager do
 
     case StorageBackend.get_object(storage_backend, key) do
       {:ok, %{body: body}} ->
-        case JSON.decode(body) do
-          {:ok, data} ->
-            case parse_heartbeat_data(data) do
-              {:ok,
-               {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
-                current_time = System.system_time(:millisecond)
+        case parse_heartbeat_data(body) do
+          {:ok,
+           {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
+            current_time = System.system_time(:millisecond)
 
-                if current_time - timestamp > heartbeat_interval_ms * 2 do
-                  :stale
-                else
-                  # Cache the fetched heartbeat so subsequent lookups are fast
-                  cache_fetched_heartbeat(supervisor_name, data)
-                  {:healthy, %{node_ref: node_ref}}
-                end
-
-              {:error, :invalid_format} ->
-                {:error, :invalid_heartbeat_format}
+            if current_time - timestamp > heartbeat_interval_ms * 2 do
+              :stale
+            else
+              # Cache the fetched heartbeat so subsequent lookups are fast
+              cache_fetched_heartbeat(supervisor_name, body)
+              {:healthy, %{node_ref: node_ref}}
             end
 
-          {:error, _reason} ->
+          {:error, :invalid_format} ->
             {:error, :invalid_heartbeat_format}
         end
 
@@ -2100,6 +2079,32 @@ defmodule DurableServer.LifecycleManager do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
+  defp normalize_heartbeat_term(nil), do: nil
+
+  defp normalize_heartbeat_term(term) when is_binary(term) or is_boolean(term) or is_number(term),
+    do: term
+
+  defp normalize_heartbeat_term(term) when is_atom(term), do: Atom.to_string(term)
+
+  defp normalize_heartbeat_term(list) when is_list(list) do
+    Enum.map(list, &normalize_heartbeat_term/1)
+  end
+
+  defp normalize_heartbeat_term(%{} = map) do
+    Enum.into(map, %{}, fn
+      {key, value} when is_atom(key) ->
+        {Atom.to_string(key), normalize_heartbeat_term(value)}
+
+      {key, value} when is_binary(key) ->
+        {key, normalize_heartbeat_term(value)}
+    end)
+  end
+
+  defp normalize_heartbeat_term(other) do
+    raise ArgumentError,
+          "heartbeat data must be JSON-compatible, got: #{inspect(other)}"
+  end
+
   defp parse_capacity(nil), do: nil
 
   defp parse_capacity(capacity) when is_map(capacity) do
@@ -2136,7 +2141,7 @@ defmodule DurableServer.LifecycleManager do
   defp parse_heartbeat_meta(%{} = heartbeat_meta),
     do: normalize_heartbeat_meta_keys(heartbeat_meta)
 
-  # Parses decoded heartbeat JSON into a structured tuple for ETS storage
+  # Parses persisted heartbeat data into a structured tuple for ETS storage
   # Returns {:ok, {node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}}
   # or {:error, :invalid_format}
   defp parse_heartbeat_data(

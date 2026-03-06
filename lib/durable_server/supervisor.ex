@@ -166,7 +166,16 @@ defmodule DurableServer.Supervisor do
   @durable :durable
 
   alias DurableServer
-  alias DurableServer.{LifecycleManager, Terminator, CircuitBreaker, Meta, SingleflightGuard}
+
+  alias DurableServer.{
+    LifecycleManager,
+    Terminator,
+    CircuitBreaker,
+    Meta,
+    SingleflightGuard,
+    StoredState
+  }
+
   alias DurableServer.ObjectStore
   alias DurableServer.StorageBackend
 
@@ -1024,17 +1033,12 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp extract_meta_from_body(key, supervisor_name, body) do
+  defp extract_meta_from_body(key, supervisor_name, %StoredState{meta: %Meta{} = meta}) do
     config = __get_config__(supervisor_name)
-
-    case JSON.decode(body) do
-      {:ok, %{"meta" => meta_str}} when is_binary(meta_str) ->
-        Meta.decode_from_binary(meta_str, %{key: key, prefix: config.prefix})
-
-      _ ->
-        nil
-    end
+    %{meta | key: key, prefix: config.prefix}
   end
+
+  defp extract_meta_from_body(_key, _supervisor_name, _body), do: nil
 
   # Get the sticky placement for a key, augmented with any new module config levels
   # This is the single source of truth for getting sticky placement - it handles:

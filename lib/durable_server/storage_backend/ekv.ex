@@ -162,11 +162,8 @@ defmodule DurableServer.StorageBackend.EKV do
         {:ok, {_value = nil, _vsn = nil}} ->
           {:error, :not_found}
 
-        {:ok, {value, vsn}} when is_binary(value) ->
+        {:ok, {value, vsn}} ->
           {:ok, %{body: value, etag: encode_vsn(vsn)}}
-
-        {:ok, {value, _vsn}} ->
-          {:error, {:unexpected_value_type, value}}
 
         {:error, reason} ->
           {:error, reason}
@@ -197,7 +194,7 @@ defmodule DurableServer.StorageBackend.EKV do
   end
 
   @impl true
-  def put_object(%{} = state, key, data, opts) when is_binary(key) and is_binary(data) do
+  def put_object(%{} = state, key, data, opts) when is_binary(key) do
     opts = normalize_put_opts!(opts)
     timeout = Keyword.get(opts, :timeout, state.timeout)
 
@@ -232,7 +229,7 @@ defmodule DurableServer.StorageBackend.EKV do
   end
 
   @impl true
-  def try_claim(%{} = state, key, body) when is_binary(key) and is_binary(body) do
+  def try_claim(%{} = state, key, body) when is_binary(key) do
     with_ekv(state, fn ->
       case ekv_put(state.name, key, body,
              if_vsn: nil,

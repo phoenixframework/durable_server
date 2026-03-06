@@ -96,13 +96,12 @@ defmodule DurableServer.EKVIntegrationTest do
     remote_node = "remote-heartbeat@ekv"
     heartbeat_key = "#{prefix}__nodes/#{remote_node}"
 
-    heartbeat_body =
-      JSON.encode!(%{
-        "node" => remote_node,
-        "node_ref" => "remote-ref",
-        "last_heartbeat_at" => System.system_time(:millisecond),
-        "heartbeat_meta" => %{"region" => "iad", "placement_region" => "iad"}
-      })
+    heartbeat_body = %{
+      "node" => remote_node,
+      "node_ref" => "remote-ref",
+      "last_heartbeat_at" => System.system_time(:millisecond),
+      "heartbeat_meta" => %{"region" => "iad", "placement_region" => "iad"}
+    }
 
     assert {:ok, _} = StorageBackend.put_object(storage_backend, heartbeat_key, heartbeat_body)
 
@@ -374,14 +373,14 @@ defmodule DurableServer.EKVIntegrationTest do
     seeded_state = %StoredState{
       vsn: 1,
       state: %{count: 7},
-      meta: Meta.encode_to_binary(seeded_meta)
+      meta: seeded_meta
     }
 
     assert {:ok, _} =
              StorageBackend.put_object(
                storage_backend,
                "#{prefix}#{key}",
-               JSON.encode!(seeded_state)
+               seeded_state
              )
 
     send(LifecycleManager.name(supervisor_name), :discover_and_restart)

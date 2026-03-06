@@ -12,7 +12,7 @@ defmodule DurableServer.StorageBackend do
         }
 
   @type object :: %{
-          required(:body) => binary(),
+          required(:body) => term(),
           required(:etag) => String.t()
         }
 
@@ -44,16 +44,16 @@ defmodule DurableServer.StorageBackend do
               {:ok, object()} | {:error, term()}
   @callback list_all_objects_stream(state :: term(), prefix :: String.t(), opts :: keyword()) ::
               Enumerable.t()
-  @callback put_object(state :: term(), key :: String.t(), data :: binary(), opts :: keyword()) ::
+  @callback put_object(state :: term(), key :: String.t(), data :: term(), opts :: keyword()) ::
               {:ok, object()} | {:error, term()}
   @callback delete_object(state :: term(), key :: String.t()) ::
               :ok | {:error, term()}
-  @callback try_claim(state :: term(), key :: String.t(), body :: binary()) ::
+  @callback try_claim(state :: term(), key :: String.t(), body :: term()) ::
               {:ok, {:claimed, String.t()}} | {:error, term()}
   @callback update_object(
               state :: term(),
               key :: String.t(),
-              update_fn :: (object() -> {:ok, binary()} | {:error, term()}),
+              update_fn :: (object() -> {:ok, term()} | {:error, term()}),
               opts :: keyword()
             ) ::
               {:ok, object()} | {:error, term()}
@@ -224,10 +224,10 @@ defmodule DurableServer.StorageBackend do
     adapter.list_all_objects_stream(state, prefix, opts)
   end
 
-  @spec put_object(t(), String.t(), binary(), keyword()) ::
+  @spec put_object(t(), String.t(), term(), keyword()) ::
           {:ok, object()} | {:error, term()}
   def put_object(%__MODULE__{adapter: adapter, state: state}, key, data, opts \\ [])
-      when is_binary(key) and is_binary(data) and is_list(opts) do
+      when is_binary(key) and is_list(opts) do
     adapter.put_object(state, key, data, opts)
   end
 
@@ -236,16 +236,15 @@ defmodule DurableServer.StorageBackend do
     adapter.delete_object(state, key)
   end
 
-  @spec try_claim(t(), String.t(), binary()) :: {:ok, {:claimed, String.t()}} | {:error, term()}
-  def try_claim(%__MODULE__{adapter: adapter, state: state}, key, body)
-      when is_binary(key) and is_binary(body) do
+  @spec try_claim(t(), String.t(), term()) :: {:ok, {:claimed, String.t()}} | {:error, term()}
+  def try_claim(%__MODULE__{adapter: adapter, state: state}, key, body) when is_binary(key) do
     adapter.try_claim(state, key, body)
   end
 
   @spec update_object(
           t(),
           String.t(),
-          (object() -> {:ok, binary()} | {:error, term()}),
+          (object() -> {:ok, term()} | {:error, term()}),
           keyword()
         ) ::
           {:ok, object()} | {:error, term()}
