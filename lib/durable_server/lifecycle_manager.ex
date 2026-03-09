@@ -153,6 +153,7 @@ defmodule DurableServer.LifecycleManager do
   @discovery_skip_ttl_ms :timer.minutes(10)
   @discovery_skip_sweep_interval_ms :timer.minutes(5)
   @heartbeat_group_key "__heartbeat"
+  @heartbeat_write_retry_backoff_ms {50, 250}
 
   def name(supervisor_name), do: :"#{supervisor_name}_lifecycle_manager"
 
@@ -688,7 +689,7 @@ defmodule DurableServer.LifecycleManager do
           # we must fail the DurableSupervisor tree (one_for_all) if we fail to heartbeat because our
           # children will become orphan claimable and if we can't reach object storage we are in a failed state
           raise RuntimeError,
-                "failed to write node heartbeat after #{@max_heartbeat_retries} attempts (#{put_duration}ms): #{inspect(reason)}"
+                "failed to write node heartbeat before deadline (#{put_duration}ms elapsed): #{inspect(reason)}"
       end
 
     put_duration = System.monotonic_time(:millisecond) - put_start
@@ -865,22 +866,11 @@ defmodule DurableServer.LifecycleManager do
       |> maybe_put("heartbeat_meta", normalize_heartbeat_term(heartbeat_meta))
 
     key = "#{state.prefix}__nodes/#{node_str}"
-    # Calculate remaining time until deadline for the PUT operation
-    # On initial heartbeat (in init), last_successful_heartbeat_at is nil - use full deadline
-    put_opts =
-      case state.last_successful_heartbeat_at do
-        nil ->
-          [max_retries: @max_heartbeat_retries, timeout: heartbeat_hard_deadline_ms()]
-
-        last_heartbeat_at ->
-          deadline_at = last_heartbeat_at + heartbeat_hard_deadline_ms()
-          remaining_ms = max(deadline_at - System.system_time(:millisecond), 0)
-          [max_retries: @max_heartbeat_retries, timeout: remaining_ms]
-      end
-
     entry = {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
 
-    case StorageBackend.put_object(state.object_store, key, heartbeat_data, put_opts) do
+    deadline_at = heartbeat_deadline_at(state.last_successful_heartbeat_at)
+
+    case put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at) do
       {:ok, _} ->
         # update local ets cache with full capacity info
         :ets.insert(state.heartbeat_table, entry)
@@ -890,6 +880,76 @@ defmodule DurableServer.LifecycleManager do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp put_heartbeat_until_deadline(%LifecycleManager{} = state, key, heartbeat_data, deadline_at) do
+    do_put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at, 0)
+  end
+
+  defp do_put_heartbeat_until_deadline(
+         %LifecycleManager{} = state,
+         key,
+         heartbeat_data,
+         deadline_at,
+         attempt
+       ) do
+    remaining_ms = max(deadline_at - System.system_time(:millisecond), 0)
+
+    if remaining_ms <= 0 do
+      {:error, :heartbeat_deadline_exceeded}
+    else
+      put_opts = [max_retries: @max_heartbeat_retries, timeout: remaining_ms]
+
+      case StorageBackend.put_object(state.object_store, key, heartbeat_data, put_opts) do
+        {:ok, _} = ok ->
+          ok
+
+        {:error, reason} ->
+          if heartbeat_write_retryable?(reason) do
+            sleep_ms = min(heartbeat_write_backoff_ms(attempt), remaining_ms)
+
+            if sleep_ms > 0 do
+              Process.sleep(sleep_ms)
+            end
+
+            do_put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at, attempt + 1)
+          else
+            {:error, reason}
+          end
+      end
+    end
+  end
+
+  defp heartbeat_deadline_at(nil),
+    do: System.system_time(:millisecond) + heartbeat_hard_deadline_ms()
+
+  defp heartbeat_deadline_at(last_successful_heartbeat_at)
+       when is_integer(last_successful_heartbeat_at) do
+    last_successful_heartbeat_at + heartbeat_hard_deadline_ms()
+  end
+
+  defp heartbeat_write_retryable?({:mirror_failed, reason}),
+    do: heartbeat_write_retryable?(reason)
+
+  defp heartbeat_write_retryable?(reason) do
+    reason in [
+      :no_quorum,
+      :quorum_timeout,
+      :unavailable,
+      :cluster_overflow,
+      :cluster_not_ready,
+      :timeout
+    ]
+  end
+
+  defp heartbeat_write_backoff_ms(attempt) do
+    backoff_for_range(@heartbeat_write_retry_backoff_ms, attempt)
+  end
+
+  defp backoff_for_range({min_ms, max_ms}, _attempt) when min_ms == max_ms, do: min_ms
+
+  defp backoff_for_range({min_ms, max_ms}, _attempt) do
+    :rand.uniform(max_ms - min_ms + 1) + min_ms - 1
   end
 
   defp resolve_heartbeat_meta(nil), do: %{}

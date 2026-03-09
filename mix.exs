@@ -47,7 +47,7 @@ defmodule DurableServer.MixProject do
       {:finch, "~> 0.18"},
       {:sweet_xml, "~> 0.7"},
       {:ex_doc, "~> 0.30", only: :dev, runtime: false},
-      {:ekv, path: "../ekv", optional: true}
+      {:ekv, github: "chrismccord/ekv", branch: "main", optional: true}
     ]
   end
 end

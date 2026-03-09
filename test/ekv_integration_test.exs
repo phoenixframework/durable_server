@@ -5,6 +5,7 @@ defmodule DurableServer.EKVIntegrationTest do
   alias DurableServer.{LifecycleManager, Meta, StoredState}
   alias DurableServer.StorageBackend
   alias DurableServer.TestCounterServer, as: CounterServer
+  alias DurableServer.TestTemporalServer
 
   @moduletag :integration
   @moduletag :capture_log
@@ -125,6 +126,28 @@ defmodule DurableServer.EKVIntegrationTest do
     end)
   end
 
+  test "EKV first boot passes native terms to load_state/2", %{supervisor_name: supervisor_name} do
+    key = "temporal-native-first-boot"
+    occurred_at = ~U[2026-03-06 19:26:44.533821Z]
+
+    {:ok, {pid, _meta}} =
+      DurableServer.Supervisor.start_child(
+        supervisor_name,
+        {TestTemporalServer,
+         %{
+           key: key,
+           occurred_at: occurred_at,
+           nested: %{occurred_at: occurred_at}
+         }}
+      )
+
+    assert :native_term == GenServer.call(pid, :get_loaded_shape)
+
+    snapshot = GenServer.call(pid, :get_snapshot)
+    assert %DateTime{} = snapshot.occurred_at
+    assert %DateTime{} = snapshot.nested.occurred_at
+  end
+
   test "persists and reloads state with existing: true", %{supervisor_name: supervisor_name} do
     key = "counter-restart"
 
@@ -152,6 +175,43 @@ defmodule DurableServer.EKVIntegrationTest do
     assert 1 == GenServer.call(restarted_pid, :get_count)
   end
 
+  test "EKV restart passes native persisted terms to load_state/2", %{
+    supervisor_name: supervisor_name
+  } do
+    key = "temporal-native"
+    occurred_at = ~U[2026-03-06 19:26:44.533821Z]
+
+    {:ok, {pid, _meta}} =
+      DurableServer.Supervisor.start_child(
+        supervisor_name,
+        {TestTemporalServer,
+         %{
+           key: key,
+           occurred_at: occurred_at,
+           nested: %{occurred_at: occurred_at}
+         }}
+      )
+
+    assert :ok = GenServer.call(pid, :sync_now)
+
+    monitor_ref = Process.monitor(pid)
+    assert :ok = DurableServer.Supervisor.terminate_child(supervisor_name, pid)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^pid, _reason}, 5_000
+
+    {:ok, {restarted_pid, _meta}} =
+      DurableServer.Supervisor.start_child(
+        supervisor_name,
+        {TestTemporalServer, %{key: key}},
+        existing: true
+      )
+
+    assert :native_term == GenServer.call(restarted_pid, :get_loaded_shape)
+
+    snapshot = GenServer.call(restarted_pid, :get_snapshot)
+    assert %DateTime{} = snapshot.occurred_at
+    assert %DateTime{} = snapshot.nested.occurred_at
+  end
+
   test "persists a minimal explicit stored-state envelope in EKV", %{
     supervisor_name: supervisor_name,
     prefix: prefix,
@@ -169,7 +229,7 @@ defmodule DurableServer.EKVIntegrationTest do
 
     assert_eventually(fn ->
       case ekv_mod().lookup(ekv_name, "#{prefix}#{key}") do
-        {%{vsn: 1, state: %{"count" => 5}, meta: meta}, _vsn}
+        {%{vsn: 1, state: %{count: 5}, meta: meta}, _vsn}
         when is_map(meta) and not is_struct(meta) ->
           Map.keys(meta) |> Enum.member?(:status)
 
@@ -450,11 +510,11 @@ defmodule DurableServer.EKVIntegrationTest do
   end
 
   defp connected_ekv_peer_nodes(ekv_name) do
-    ekv_mod().info(ekv_name).connected_peers |> Enum.map(& &1.node)
+    ekv_mod().info(ekv_name).connected_members |> Enum.map(& &1.node)
   end
 
   defp remote_connected_ekv_peer_nodes(peer_node, ekv_name) do
-    :erpc.call(peer_node, ekv_mod(), :info, [ekv_name]).connected_peers |> Enum.map(& &1.node)
+    :erpc.call(peer_node, ekv_mod(), :info, [ekv_name]).connected_members |> Enum.map(& &1.node)
   end
 
   defp ensure_distributed_node! do

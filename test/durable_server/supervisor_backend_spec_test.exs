@@ -90,6 +90,12 @@ defmodule DurableServer.SupervisorBackendSpecTest do
       end
     end
 
+    @impl true
+    def encode(_state, data), do: {:ok, data}
+
+    @impl true
+    def decode(_state, data), do: {:ok, data}
+
     defp next_etag do
       System.unique_integer([:positive, :monotonic])
       |> Integer.to_string()

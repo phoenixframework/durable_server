@@ -85,8 +85,8 @@ defmodule DurableServer.Backends.EKVStore do
        state: normalize_opts(opts),
        defaults: %{
          heartbeat_tracking_mode: :subscribe,
-         discovery_interval_ms: 5_000,
-         heartbeat_interval_ms: 5_000,
+         discovery_interval_ms: 3_000,
+         heartbeat_interval_ms: 10_000,
          heartbeat_reconcile_interval_ms: 30_000
        },
        features: %{
@@ -291,6 +291,12 @@ defmodule DurableServer.Backends.EKVStore do
       end
     end)
   end
+
+  @impl true
+  def encode(%{} = _state, data), do: encode_body(data)
+
+  @impl true
+  def decode(%{} = _state, data), do: decode_body(data)
 
   defp do_update(state, key, update_fn, max_retries, attempt) do
     if attempt > max_retries do

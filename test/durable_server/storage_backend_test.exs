@@ -29,6 +29,12 @@ defmodule DurableServer.StorageBackendTest do
 
     @impl true
     def update_object(_state, _key, _update_fn, _opts), do: {:error, :unsupported}
+
+    @impl true
+    def encode(_state, data), do: {:ok, data}
+
+    @impl true
+    def decode(_state, data), do: {:ok, data}
   end
 
   test "accepts valid init result with defaults and features" do

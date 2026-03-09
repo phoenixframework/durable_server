@@ -57,6 +57,8 @@ defmodule DurableServer.StorageBackend do
               opts :: keyword()
             ) ::
               {:ok, object()} | {:error, term()}
+  @callback encode(state :: term(), data :: term()) :: {:ok, term()} | {:error, term()}
+  @callback decode(state :: term(), data :: term()) :: {:ok, term()} | {:error, term()}
   @callback subscribe(
               state :: term(),
               subscriber :: pid(),
@@ -251,6 +253,16 @@ defmodule DurableServer.StorageBackend do
   def update_object(%__MODULE__{adapter: adapter, state: state}, key, update_fn, opts \\ [])
       when is_binary(key) and is_function(update_fn, 1) and is_list(opts) do
     adapter.update_object(state, key, update_fn, opts)
+  end
+
+  @spec encode(t(), term()) :: {:ok, term()} | {:error, term()}
+  def encode(%__MODULE__{adapter: adapter, state: state}, data) do
+    adapter.encode(state, data)
+  end
+
+  @spec decode(t(), term()) :: {:ok, term()} | {:error, term()}
+  def decode(%__MODULE__{adapter: adapter, state: state}, data) do
+    adapter.decode(state, data)
   end
 
   @spec subscribe(t(), pid(), String.t(), keyword()) :: {:ok, term()} | {:error, term()}

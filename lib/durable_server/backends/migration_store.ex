@@ -329,6 +329,14 @@ defmodule DurableServer.Backends.MigrationStore do
   end
 
   @impl true
+  def encode(%{} = state, data),
+    do: StorageBackend.encode(backend(state, state.read_preference), data)
+
+  @impl true
+  def decode(%{} = state, data),
+    do: StorageBackend.decode(backend(state, state.read_preference), data)
+
+  @impl true
   def subscribe(%{} = state, subscriber, prefix, opts)
       when is_pid(subscriber) and is_binary(prefix) and is_list(opts) do
     read_preference = state.read_preference

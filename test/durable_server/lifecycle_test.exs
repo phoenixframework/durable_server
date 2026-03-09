@@ -93,6 +93,49 @@ defmodule DurableServer.LifecycleTest do
     def terminate(_reason, _state), do: :ok
   end
 
+  defmodule HeartbeatRetryBackend do
+    @behaviour DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts), do: {:ok, %{state: Map.new(opts)}}
+
+    @impl true
+    def ensure_ready(_state), do: :ok
+
+    @impl true
+    def get_object(_state, _key, _opts), do: {:error, :not_found}
+
+    @impl true
+    def list_all_objects_stream(_state, _prefix, _opts), do: []
+
+    @impl true
+    def put_object(%{table: table, fail_count: fail_count}, _key, data, _opts) do
+      attempt = :ets.update_counter(table, :attempts, {2, 1}, {:attempts, 0})
+
+      if attempt <= fail_count do
+        {:error, {:mirror_failed, :no_quorum}}
+      else
+        :ets.insert(table, {:last_write, data})
+        {:ok, %{body: data, etag: Integer.to_string(attempt)}}
+      end
+    end
+
+    @impl true
+    def delete_object(_state, _key), do: :ok
+
+    @impl true
+    def try_claim(_state, _key, _body), do: {:error, :unsupported}
+
+    @impl true
+    def update_object(_state, _key, _update_fn, _opts), do: {:error, :unsupported}
+
+    @impl true
+    def encode(_state, data), do: {:ok, data}
+
+    @impl true
+    def decode(_state, data), do: {:ok, data}
+  end
+
   setup do
     # Create test supervisor for this test
     supervisor_name = :"test_supervisor_#{DurableServer.UUID.uuid4()}"
@@ -1535,6 +1578,32 @@ defmodule DurableServer.LifecycleTest do
       # Manager should still be alive and ready for next cycle
       assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
+    end
+
+    test "retries retryable heartbeat write failures until success within deadline", %{
+      supervisor_name: supervisor_name,
+      config: config
+    } do
+      table = :ets.new(__MODULE__.HeartbeatRetryBackend, [:set, :public])
+
+      storage_backend =
+        DurableServer.StorageBackend.new(HeartbeatRetryBackend, %{
+          table: table,
+          fail_count: 2
+        })
+
+      test_config =
+        config
+        |> Map.put(:object_store, storage_backend)
+        |> Map.put(:storage_backend, storage_backend)
+
+      {:ok, _pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+
+      assert [{:attempts, attempts}] = :ets.lookup(table, :attempts)
+      assert attempts >= 3
+      assert [{:last_write, heartbeat_data}] = :ets.lookup(table, :last_write)
+      assert is_map(heartbeat_data)
+      assert Map.has_key?(heartbeat_data, "last_heartbeat_at")
     end
   end
 

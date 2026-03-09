@@ -9,11 +9,7 @@ defmodule GroupTest do
 
     def dump_state(state), do: state
 
-    def load_state(_old_vsn, persisted_state) do
-      persisted_state
-      |> Enum.map(fn {k, v} -> {String.to_atom(k), v} end)
-      |> Map.new()
-    end
+    def load_state(_old_vsn, persisted_state), do: persisted_state
 
     def init(loaded_state) do
       {:ok, Map.put_new(loaded_state, :count, 0), auto_sync: false, meta: %{module: __MODULE__}}

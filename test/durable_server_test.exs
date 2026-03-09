@@ -5,6 +5,7 @@ defmodule DurableServerTest do
   alias DurableServer
   alias DurableServer.StoredState
   alias DurableServer.ObjectStore
+  alias DurableServer.TestTemporalServer
   alias DurableServerTest.EdgeCaseTestServer
   alias DurableServerTest.ValidatorTestServer
 
@@ -1050,6 +1051,30 @@ defmodule DurableServerTest do
   end
 
   describe "state persistence and recovery" do
+    test "object store first boot passes backend-shaped JSON-decoded state to load_state/2", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "temporal-object-store-first-boot-#{DurableServer.UUID.uuid4()}"
+      occurred_at = ~U[2026-03-06 19:26:44.533821Z]
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestTemporalServer,
+           %{
+             key: key,
+             occurred_at: occurred_at,
+             nested: %{occurred_at: occurred_at}
+           }}
+        )
+
+      assert :json_string == GenServer.call(pid, :get_loaded_shape)
+
+      snapshot = GenServer.call(pid, :get_snapshot)
+      assert is_binary(snapshot.occurred_at)
+      assert is_binary(snapshot.nested["occurred_at"])
+    end
+
     test "persists state on termination and allows recovery", %{
       supervisor_name: supervisor_name,
       prefix: _prefix
@@ -1130,6 +1155,43 @@ defmodule DurableServerTest do
       # Give more time for async operation
       :sys.get_state(pid)
       assert GenServer.call(pid, :get_count) == 3
+    end
+
+    test "object store restart passes backend-shaped JSON-decoded state to load_state/2", %{
+      supervisor_name: supervisor_name
+    } do
+      key = "temporal-object-store-#{DurableServer.UUID.uuid4()}"
+      occurred_at = ~U[2026-03-06 19:26:44.533821Z]
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestTemporalServer,
+           %{
+             key: key,
+             occurred_at: occurred_at,
+             nested: %{occurred_at: occurred_at}
+           }}
+        )
+
+      assert :ok = GenServer.call(pid, :sync_now)
+
+      monitor_ref = Process.monitor(pid)
+      assert :ok = DurableServer.Supervisor.terminate_child(supervisor_name, pid)
+      assert_receive {:DOWN, ^monitor_ref, :process, ^pid, _reason}, 5_000
+
+      {:ok, {restarted_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestTemporalServer, %{key: key}},
+          existing: true
+        )
+
+      assert :json_string == GenServer.call(restarted_pid, :get_loaded_shape)
+
+      snapshot = GenServer.call(restarted_pid, :get_snapshot)
+      assert is_binary(snapshot.occurred_at)
+      assert is_binary(snapshot.nested["occurred_at"])
     end
   end
 
@@ -2118,8 +2180,8 @@ defmodule DurableServerTest do
 
     def load_state(_old_vsn, encoded_state) do
       %{
-        key: encoded_state["key"],
-        user_meta: encoded_state["user_meta"],
+        key: encoded_state[:key] || encoded_state["key"],
+        user_meta: encoded_state[:user_meta] || encoded_state["user_meta"],
         test_pid: nil
       }
     end

@@ -71,10 +71,16 @@ defmodule DurableServer.MigratingBackendE2ETest do
     assert 3 == GenServer.call(pid, :increment_and_sync)
 
     assert_eventually(fn ->
-      with {:ok, %{body: %StoredState{state: %{"count" => 3}}}} <-
-             StorageBackend.get_object(context.primary_backend, storage_key),
-           {:ok, %{body: %StoredState{state: %{"count" => 3}}}} <-
-             StorageBackend.get_object(context.secondary_backend, storage_key) do
+      with true <-
+             stored_object_has_count?(
+               StorageBackend.get_object(context.primary_backend, storage_key),
+               3
+             ),
+           true <-
+             stored_object_has_count?(
+               StorageBackend.get_object(context.secondary_backend, storage_key),
+               3
+             ) do
         true
       else
         _ -> false
@@ -195,8 +201,10 @@ defmodule DurableServer.MigratingBackendE2ETest do
 
     backfill_prefix!(context.primary_backend, context.secondary_backend, context.prefix)
 
-    assert {:ok, %{body: %StoredState{state: %{"count" => 12}}}} =
-             StorageBackend.get_object(context.secondary_backend, storage_key)
+    assert stored_object_has_count?(
+             StorageBackend.get_object(context.secondary_backend, storage_key),
+             12
+           )
 
     {:ok, %{body: %StoredState{} = primary_state, etag: primary_etag}} =
       StorageBackend.get_object(context.primary_backend, storage_key)
@@ -238,14 +246,18 @@ defmodule DurableServer.MigratingBackendE2ETest do
     assert {:ok, %{body: %StoredState{state: %{"count" => 1}}}} =
              StorageBackend.get_object(context.primary_backend, storage_key)
 
-    assert {:ok, %{body: %StoredState{state: %{"count" => 12}}}} =
-             StorageBackend.get_object(context.secondary_backend, storage_key)
+    assert stored_object_has_count?(
+             StorageBackend.get_object(context.secondary_backend, storage_key),
+             12
+           )
 
     assert {:ok, %{body: %StoredState{state: %{"count" => 31}}}} =
              StorageBackend.get_object(context.primary_backend, new_storage_key)
 
-    assert {:ok, %{body: %StoredState{state: %{"count" => 31}}}} =
-             StorageBackend.get_object(context.secondary_backend, new_storage_key)
+    assert stored_object_has_count?(
+             StorageBackend.get_object(context.secondary_backend, new_storage_key),
+             31
+           )
   end
 
   test "phase 4 write cutover keeps EKV authoritative and mirrors updates back to object store",
@@ -324,10 +336,16 @@ defmodule DurableServer.MigratingBackendE2ETest do
     assert 22 == GenServer.call(restarted_pid, :increment_and_sync)
 
     assert_eventually(fn ->
-      with {:ok, %{body: %StoredState{state: %{"count" => 22}}}} <-
-             StorageBackend.get_object(context.secondary_backend, storage_key),
-           {:ok, %{body: %StoredState{state: %{"count" => 22}}}} <-
-             StorageBackend.get_object(context.primary_backend, storage_key) do
+      with true <-
+             stored_object_has_count?(
+               StorageBackend.get_object(context.secondary_backend, storage_key),
+               22
+             ),
+           true <-
+             stored_object_has_count?(
+               StorageBackend.get_object(context.primary_backend, storage_key),
+               22
+             ) do
         true
       else
         _ -> false
@@ -371,6 +389,13 @@ defmodule DurableServer.MigratingBackendE2ETest do
       {:ok, _} = StorageBackend.put_object(secondary_backend, key, body)
     end)
   end
+
+  defp stored_object_has_count?({:ok, %{body: %StoredState{state: state}}}, expected_count)
+       when is_map(state) do
+    Map.get(state, "count") == expected_count or Map.get(state, :count) == expected_count
+  end
+
+  defp stored_object_has_count?(_, _expected_count), do: false
 
   defp shadow_backend_spec(context) do
     strict_shadow_backend_spec(context.object_store, context.ekv_name)

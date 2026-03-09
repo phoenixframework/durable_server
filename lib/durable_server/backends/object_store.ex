@@ -95,16 +95,22 @@ defmodule DurableServer.Backends.ObjectStore do
     end
   end
 
+  @impl true
+  def encode(%ObjectStore{} = _store, data), do: encode_body(data)
+
+  @impl true
+  def decode(%ObjectStore{} = _store, data), do: decode_body(data)
+
   defp encode_body(%StoredState{meta: %Meta{}} = data) do
     {:ok, JSON.encode!(StoredState.to_object_store_term(data))}
   rescue
-    error in [ArgumentError, RuntimeError] -> {:error, error}
+    error in [ArgumentError, RuntimeError, Protocol.UndefinedError] -> {:error, error}
   end
 
   defp encode_body(data) do
     {:ok, JSON.encode!(data)}
   rescue
-    error in [ArgumentError, RuntimeError] -> {:error, error}
+    error in [ArgumentError, RuntimeError, Protocol.UndefinedError] -> {:error, error}
   end
 
   defp decode_body(encoded) when is_binary(encoded) do

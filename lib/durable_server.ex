@@ -679,12 +679,26 @@ defmodule DurableServer do
               {:ok, new_state :: term()} | {:error, reason :: term()}
 
   @doc """
-  Transform user state into a JSON-encodable map for persistence.
+  Transform user state into a map for persistence.
 
-  This required callback is used when saving state to object storage. It allows you to:
+  This required callback is used when saving state through the configured storage backend.
+  It allows you to:
   - Filter out keys that shouldn't be persisted (like PIDs, refs, etc.)
   - Transform the state shape for storage
   - Remove ephemeral data
+
+  The returned value must be a plain map at the top level. Nested values are passed
+  through to the configured backend as-is, so they only need to be encodable by the
+  backend you are using.
+
+  This means persisted shapes may differ by backend. For example:
+
+  - `DurableServer.Backends.ObjectStore` typically encodes to and decodes from JSON-shaped data
+    with string keys
+  - `DurableServer.Backends.EKVStore` may preserve richer Elixir terms
+
+  If you plan to move data between backends, `load_state/2` should be prepared to
+  handle multiple persisted shapes during the migration window.
 
   ## Examples
 
@@ -696,12 +710,26 @@ defmodule DurableServer do
   @callback dump_state(state :: term()) :: map()
 
   @doc """
-  Transform raw JSON-decoded state back into user state format.
+  Transform backend-decoded persisted state back into user state format.
 
-  This required callback is used when loading state from object storage. It allows you to:
-  - Convert string keys from JSON back to atom keys
+  This required callback is used when loading state from the configured backend.
+  It allows you to:
+  - Convert backend-specific persisted shapes into your runtime state format
   - Set default values for missing keys
   - Initialize ephemeral state that wasn't persisted
+
+  On first boot for a never-before-persisted server, DurableServer encodes and
+  decodes the result of `dump_state/1` through the configured backend before
+  calling `load_state/2`. This keeps the first-boot shape consistent with the
+  shape you will receive on later restarts for that backend.
+
+  Persisted state is backend-dependent. For example:
+
+  - `DurableServer.Backends.ObjectStore` usually passes JSON-decoded maps with string keys
+  - `DurableServer.Backends.EKVStore` may pass maps with atom keys or other native Elixir terms
+
+  During backend migrations, it is valid for `load_state/2` to receive multiple
+  historical shapes until the migration is complete.
 
   For a server that has never been persisted, the old_vsn will be `nil`.
 
@@ -952,14 +980,18 @@ defmodule DurableServer do
             end
 
           :error ->
-            client_init_state =
-              init_state
-              |> module.dump_state()
-              |> normalize_persisted_term!()
-
-            # no existing state - old vsn is nil
-            loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
-            {:ok, {loaded_user_state, _old_vsn = nil, _etag = nil, _meta = nil}}
+            with dumped_init_state <-
+                   init_state
+                   |> module.dump_state()
+                   |> validate_dumped_state!(module),
+                 {:ok, encoded_init_state} <-
+                   StorageBackend.encode(object_store, dumped_init_state),
+                 {:ok, client_init_state} <-
+                   StorageBackend.decode(object_store, encoded_init_state) do
+              # no existing state - old vsn is nil
+              loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
+              {:ok, {loaded_user_state, _old_vsn = nil, _etag = nil, _meta = nil}}
+            end
         end
 
       case load_result do
@@ -2761,21 +2793,13 @@ defmodule DurableServer do
   end
 
   defp dump_user_state(%DurableServer{} = state) do
-    dumped_state = state.module.dump_state(state.user_state)
+    dumped_state =
+      state.user_state
+      |> state.module.dump_state()
+      |> validate_dumped_state!(state.module)
 
-    if is_struct(dumped_state) do
-      raise ArgumentError, """
-      DurableServer cannot persist struct state as it may cause issues across version changes, got:
-
-          #{inspect(dumped_state)}
-
-      Ensure your #{inspect(state.module)}.dump_state/1 converts your state into a raw map with JSON encodable fields
-      """
-    end
-
-    normalized_state = normalize_persisted_term!(dumped_state)
-    hash = :crypto.hash(:sha256, :erlang.term_to_binary(normalized_state))
-    {%{state | last_synced_user_state_hash: hash}, normalized_state}
+    hash = :crypto.hash(:sha256, :erlang.term_to_binary(dumped_state))
+    {%{state | last_synced_user_state_hash: hash}, dumped_state}
   end
 
   defp load_user_state(module, old_vsn, persisted_state) do
@@ -2830,36 +2854,25 @@ defmodule DurableServer do
     }
   end
 
-  defp normalize_persisted_term!(term)
-       when is_binary(term) or is_boolean(term) or is_number(term) or is_nil(term),
-       do: term
+  defp validate_dumped_state!(dumped_state, module) when is_atom(module) do
+    cond do
+      is_struct(dumped_state) ->
+        raise ArgumentError, """
+        DurableServer cannot persist a top-level struct from #{inspect(module)}.dump_state/1, got:
 
-  defp normalize_persisted_term!(list) when is_list(list) do
-    Enum.map(list, &normalize_persisted_term!/1)
-  end
+            #{inspect(dumped_state)}
 
-  defp normalize_persisted_term!(%{} = map) do
-    if is_struct(map) do
-      raise ArgumentError,
-            "dump_state/1 must return a plain map without structs, got: #{inspect(map)}"
-    end
+        Return a plain map at the top level and move any struct encoding into your
+        app-level dump_state/1 and load_state/2 callbacks if needed.
+        """
 
-    Enum.into(map, %{}, fn
-      {key, value} when is_atom(key) ->
-        {Atom.to_string(key), normalize_persisted_term!(value)}
+      is_map(dumped_state) ->
+        dumped_state
 
-      {key, value} when is_binary(key) ->
-        {key, normalize_persisted_term!(value)}
-
-      {key, _value} ->
+      true ->
         raise ArgumentError,
-              "dump_state/1 maps must use atom or string keys, got: #{inspect(key)}"
-    end)
-  end
-
-  defp normalize_persisted_term!(other) do
-    raise ArgumentError,
-          "dump_state/1 must return JSON-compatible data, got: #{inspect(other)}"
+              "#{inspect(module)}.dump_state/1 must return a map, got: #{inspect(dumped_state)}"
+    end
   end
 
   defp update_server_status_directly(%DurableServer{} = state, status) do
