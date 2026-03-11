@@ -20,7 +20,8 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
     def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
 
     @impl true
-    def get_object(%{delegate: delegate}, key, opts), do: StorageBackend.get_object(delegate, key, opts)
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
 
     @impl true
     def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
@@ -33,7 +34,8 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
     def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
 
     @impl true
-    def try_claim(%{delegate: delegate}, key, body), do: StorageBackend.try_claim(delegate, key, body)
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
 
     @impl true
     def update_object(%{delegate: delegate}, key, update_fn, opts),
