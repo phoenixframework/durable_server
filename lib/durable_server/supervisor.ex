@@ -819,9 +819,35 @@ defmodule DurableServer.Supervisor do
         monitor_ref = Process.monitor(pid)
 
         receive do
-          {^init_ref, {:error, reason}} -> {:error, reason}
-          {^init_ref, meta} -> {:ok, {pid, meta}}
-          {:DOWN, ^monitor_ref, :process, ^pid, reason} -> {:error, reason}
+          {^init_ref, :ignore} ->
+            Process.demonitor(monitor_ref, [:flush])
+            :ignore
+
+          {^init_ref, {:error, reason}} ->
+            Process.demonitor(monitor_ref, [:flush])
+            {:error, reason}
+
+          {^init_ref, meta} ->
+            Process.demonitor(monitor_ref, [:flush])
+            {:ok, {pid, meta}}
+
+          {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:durable, :ignored}}} ->
+            :ignore
+
+          {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:durable, {:init_failed, reason}}}} ->
+            {:error, reason}
+
+          {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+            receive do
+              {^init_ref, :ignore} ->
+                :ignore
+
+              {^init_ref, {:error, init_reason}} ->
+                {:error, init_reason}
+            after
+              0 ->
+                {:error, reason}
+            end
         end
 
       :ignore ->

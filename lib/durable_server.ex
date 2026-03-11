@@ -769,6 +769,7 @@ defmodule DurableServer do
             prefix: nil,
             etag: nil,
             pid: nil,
+            bootstrapped: false,
             init_from_ref: nil,
             init_from_pid: nil,
             status: nil,
@@ -811,6 +812,7 @@ defmodule DurableServer do
   @durable :durable
   @max_crash_reason_length 500
   @max_sync_retries 5
+  @bootstrap_continue {@durable, :bootstrap}
 
   defmacro __using__(opts) do
     vsn =
@@ -956,161 +958,43 @@ defmodule DurableServer do
     # bypass disk check if this is a sticky restart (data already on this node's disk)
     capacity_opts = if is_sticky_local, do: [bypass_disk_check: true], else: []
 
-    with :ok <- CircuitBreaker.check_global_lock_circuit_breaker(circuit_breaker),
-         :ok <- LifecycleManager.check_capacity(supervisor_name, module, capacity_opts) do
-      # prepare the state that will be passed to user's init
-      # for new starts merge init_state is what's loaded, for existing starts current
-      # state is provided and init_state is not included
-      load_result =
-        case fetch_existing_state_raw(object_store, %{key: key, prefix: prefix}, init_state) do
-          {:ok, %StoredState{} = existing} ->
-            %{meta: %Meta{} = meta, vsn: old_vsn, state: raw_existing_state, etag: etag} =
-              existing
+    state = %DurableServer{
+      object_store: object_store,
+      key: key,
+      prefix: prefix,
+      module: module,
+      supervisor: supervisor_name,
+      dynamic_supervisor: DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name),
+      task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
+      circuit_breaker: circuit_breaker,
+      node_str: to_string(Node.self()),
+      pid: self(),
+      node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
+      init_from_ref: from_ref,
+      init_from_pid: from_pid,
+      sticky_placement_history_limit: sticky_placement_history_limit
+    }
 
-            # object exists, but may be held by an expired lock, so we check lock health
-            case check_lock(meta) do
-              {:locked, lock_pid} ->
-                {:error, {:already_started, lock_pid}}
+    bootstrap = %{
+      init_from: init_from,
+      init_arg: init_state,
+      config: config,
+      capacity_opts: capacity_opts
+    }
 
-              :expired ->
-                # found existing state - existing state wins over init args
-                # pass through load_state for user customization
-                loaded_state = load_user_state(module, old_vsn, raw_existing_state)
-                {:ok, {loaded_state, old_vsn, etag, meta}}
-            end
-
-          :error ->
-            with dumped_init_state <-
-                   init_state
-                   |> module.dump_state()
-                   |> validate_dumped_state!(module),
-                 {:ok, encoded_init_state} <-
-                   StorageBackend.encode(object_store, dumped_init_state),
-                 {:ok, client_init_state} <-
-                   StorageBackend.decode(object_store, encoded_init_state) do
-              # no existing state - old vsn is nil
-              loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
-              {:ok, {loaded_user_state, _old_vsn = nil, _etag = nil, _meta = nil}}
-            end
-        end
-
-      case load_result do
-        {:ok, {loaded_init_state, old_vsn, etag, meta}} ->
-          # Check if permanently crashed and if this is an automatic restart from the same caller.
-          # We store the caller (init_from ref/pid) and node (node_ref/node_str) in meta on first start.
-          # If the server crashes and DynamicSupervisor tries to restart it, the caller and node
-          # will be the same. If a user explicitly calls start_child, they will be different.
-          current_node_str = to_string(Node.self())
-          current_node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
-
-          same_caller? =
-            meta && meta.init_from_ref == from_ref && meta.init_from_pid == from_pid &&
-              meta.node_str == current_node_str && meta.node_ref == current_node_ref
-
-          crashed_with_same_caller? = meta && Meta.permanently_crashed?(meta) && same_caller?
-
-          if crashed_with_same_caller? do
-            Logger.info(
-              "Refusing to restart permanently crashed server (same caller, automatic restart): #{key}"
-            )
-
-            send(from_pid, {from_ref, {:error, :permanently_crashed}})
-            :ignore
-          else
-            case aquire_init_lock(%{
-                   module: module,
-                   key: key,
-                   prefix: prefix,
-                   object_store: object_store,
-                   user_state: loaded_init_state,
-                   old_vsn: old_vsn,
-                   etag: etag,
-                   meta: meta,
-                   supervisor_name: supervisor_name,
-                   circuit_breake: circuit_breaker,
-                   init_from: init_from,
-                   sticky_placement_history_limit: sticky_placement_history_limit
-                 }) do
-              {:ok, %DurableServer{} = state} ->
-                # Build info map with built-in values
-                info = %{
-                  supervisor: supervisor_name,
-                  task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
-                  dynamic_supervisor:
-                    DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
-                }
-
-                # Merge user's init_info from supervisor config
-                init_info = Map.fetch!(config, :init_info)
-                info = Map.merge(info, init_info)
-
-                # Try init/2 first, fall back to init/1
-                init_result =
-                  if function_exported?(module, :init, 2) do
-                    module.init(loaded_init_state, info)
-                  else
-                    module.init(loaded_init_state)
-                  end
-
-                case init_result do
-                  :ignore ->
-                    handle_ignore(state, init_from)
-
-                  {:ok, user_state} ->
-                    handle_init(state, user_state, [], _continue_or_timeout = nil)
-
-                  {:ok, user_state, opts} when is_list(opts) ->
-                    handle_init(state, user_state, opts, _continue_or_timeout = nil)
-
-                  {:ok, user_state, {tag, _} = continue_or_timeout}
-                  when tag in [:continue, :timeout] ->
-                    handle_init(state, user_state, [], continue_or_timeout)
-
-                  {:ok, user_state, {tag, _} = continue_or_timeout, opts}
-                  when tag in [:continue, :timeout] and is_list(opts) ->
-                    handle_init(state, user_state, opts, continue_or_timeout)
-
-                  other ->
-                    Logger.error("Invalid init return from #{module}: #{inspect(other)}")
-                    {:stop, {:bad_init_return, other}}
-                end
-
-              {:error, reason} ->
-                send(from_pid, {from_ref, {:error, reason}})
-                :ignore
-            end
-          end
-
-        {:error, reason} ->
-          send(from_pid, {from_ref, {:error, reason}})
-          :ignore
-      end
-    else
-      {:circuit_open, cooldown_ms} ->
-        Logger.error(
-          "global lock circuit breaker open for #{cooldown_ms}ms, refusing lock acquisition for #{inspect(key)}"
-        )
-
-        send(from_pid, {from_ref, {:error, {:circuit_open, :network_partition}}})
-        :ignore
-
-      {:error, {:limit_reached, reason, details}} ->
-        log_capacity_limit(reason, details, supervisor_name, module)
-        send(from_pid, {from_ref, {:error, {:capacity_limit, reason}}})
-        :ignore
-    end
+    {:ok, state, {:continue, {@bootstrap_continue, bootstrap}}}
   end
 
   defp handle_ignore(%DurableServer{} = state, {from_ref, from_pid} = _init_from) do
     case sync_to_storage(state, meta: %{status: :stopped_graceful}) do
       {:ok, %DurableServer{} = _new_state} ->
         send(from_pid, {from_ref, :ignore})
-        :ignore
+        {:stop, {:shutdown, {@durable, :ignored}}, state}
 
       {:error, sync_reason} ->
         Logger.error("Failed to update status before :ignore: #{inspect(sync_reason)}")
         send(from_pid, {from_ref, :ignore})
-        :ignore
+        {:stop, {:shutdown, {@durable, :ignored}}, state}
     end
   end
 
@@ -1133,15 +1017,15 @@ defmodule DurableServer do
     case sync_to_storage(new_state, meta: %{status: :running}) do
       {:ok, new_state} ->
         # schedule our first sync
-        new_state = schedule_sync(new_state)
+        new_state = %{schedule_sync(new_state) | bootstrapped: true}
 
         # send caller that called start_child our metadata
         send(new_state.init_from_pid, {new_state.init_from_ref, new_state.user_meta})
 
         if continue_or_timeout do
-          {:ok, new_state, continue_or_timeout}
+          {:noreply, new_state, continue_or_timeout}
         else
-          {:ok, new_state}
+          {:noreply, new_state}
         end
 
       {:error, reason} ->
@@ -1150,7 +1034,7 @@ defmodule DurableServer do
         )
 
         send(state.init_from_pid, {state.init_from_ref, {:error, reason}})
-        {:stop, reason}
+        {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, state}
     end
   end
 
@@ -1658,10 +1542,20 @@ defmodule DurableServer do
   end
 
   @impl true
+  def handle_continue({@bootstrap_continue, bootstrap}, %DurableServer{} = state) do
+    bootstrap_init(state, bootstrap)
+  end
+
+  @impl true
   def handle_continue(continue, %DurableServer{} = state) do
     state = maybe_migrate_on_callback(state)
     result = state.module.handle_continue(continue, state.user_state)
     process_callback_result(result, state)
+  end
+
+  @impl true
+  def terminate(_reason, %DurableServer{bootstrapped: false}) do
+    :ok
   end
 
   @impl true
@@ -1685,6 +1579,161 @@ defmodule DurableServer do
       end
 
     maybe_invoke_after_terminate(state, terminate_return, reason, final_status, sync_result)
+  end
+
+  defp bootstrap_init(
+         %DurableServer{
+           module: module,
+           supervisor: supervisor_name,
+           object_store: object_store,
+           key: key,
+           prefix: prefix,
+           circuit_breaker: circuit_breaker,
+           init_from_ref: from_ref,
+           init_from_pid: from_pid,
+           sticky_placement_history_limit: sticky_placement_history_limit
+         } = state,
+         %{
+           init_from: init_from,
+           init_arg: init_state,
+           config: config,
+           capacity_opts: capacity_opts
+         }
+       ) do
+    with :ok <- CircuitBreaker.check_global_lock_circuit_breaker(circuit_breaker),
+         :ok <- LifecycleManager.check_capacity(supervisor_name, module, capacity_opts) do
+      load_result =
+        case fetch_existing_state_raw(object_store, %{key: key, prefix: prefix}, init_state) do
+          {:ok, %StoredState{} = existing} ->
+            %{meta: %Meta{} = meta, vsn: old_vsn, state: raw_existing_state, etag: etag} =
+              existing
+
+            case check_lock(meta) do
+              {:locked, lock_pid} ->
+                {:error, {:already_started, lock_pid}}
+
+              :expired ->
+                loaded_state = load_user_state(module, old_vsn, raw_existing_state)
+                {:ok, {loaded_state, old_vsn, etag, meta}}
+            end
+
+          :error ->
+            with dumped_init_state <-
+                   init_state
+                   |> module.dump_state()
+                   |> validate_dumped_state!(module),
+                 {:ok, encoded_init_state} <-
+                   StorageBackend.encode(object_store, dumped_init_state),
+                 {:ok, client_init_state} <-
+                   StorageBackend.decode(object_store, encoded_init_state) do
+              loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
+              {:ok, {loaded_user_state, _old_vsn = nil, _etag = nil, _meta = nil}}
+            end
+        end
+
+      case load_result do
+        {:ok, {loaded_init_state, old_vsn, etag, meta}} ->
+          current_node_str = to_string(Node.self())
+          current_node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
+
+          same_caller? =
+            meta && meta.init_from_ref == from_ref && meta.init_from_pid == from_pid &&
+              meta.node_str == current_node_str && meta.node_ref == current_node_ref
+
+          crashed_with_same_caller? = meta && Meta.permanently_crashed?(meta) && same_caller?
+
+          if crashed_with_same_caller? do
+            Logger.info(
+              "Refusing to restart permanently crashed server (same caller, automatic restart): #{key}"
+            )
+
+            send(from_pid, {from_ref, {:error, :permanently_crashed}})
+            {:stop, {:shutdown, {@durable, {:init_failed, :permanently_crashed}}}, state}
+          else
+            case aquire_init_lock(%{
+                   module: module,
+                   key: key,
+                   prefix: prefix,
+                   object_store: object_store,
+                   user_state: loaded_init_state,
+                   old_vsn: old_vsn,
+                   etag: etag,
+                   meta: meta,
+                   supervisor_name: supervisor_name,
+                   circuit_breake: circuit_breaker,
+                   init_from: init_from,
+                   sticky_placement_history_limit: sticky_placement_history_limit
+                 }) do
+              {:ok, %DurableServer{} = locked_state} ->
+                info = %{
+                  supervisor: supervisor_name,
+                  task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
+                  dynamic_supervisor:
+                    DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
+                }
+
+                init_info = Map.fetch!(config, :init_info)
+                info = Map.merge(info, init_info)
+
+                init_result =
+                  if function_exported?(module, :init, 2) do
+                    module.init(loaded_init_state, info)
+                  else
+                    module.init(loaded_init_state)
+                  end
+
+                case init_result do
+                  :ignore ->
+                    handle_ignore(locked_state, init_from)
+
+                  {:ok, user_state} ->
+                    handle_init(locked_state, user_state, [], _continue_or_timeout = nil)
+
+                  {:ok, user_state, opts} when is_list(opts) ->
+                    handle_init(locked_state, user_state, opts, _continue_or_timeout = nil)
+
+                  {:ok, user_state, {tag, _} = continue_or_timeout}
+                  when tag in [:continue, :timeout] ->
+                    handle_init(locked_state, user_state, [], continue_or_timeout)
+
+                  {:ok, user_state, {tag, _} = continue_or_timeout, opts}
+                  when tag in [:continue, :timeout] and is_list(opts) ->
+                    handle_init(locked_state, user_state, opts, continue_or_timeout)
+
+                  other ->
+                    Logger.error("Invalid init return from #{module}: #{inspect(other)}")
+                    send(from_pid, {from_ref, {:error, {:bad_init_return, other}}})
+
+                    {:stop, {:shutdown, {@durable, {:init_failed, {:bad_init_return, other}}}},
+                     state}
+                end
+
+              {:error, reason} ->
+                send(from_pid, {from_ref, {:error, reason}})
+                {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, state}
+            end
+          end
+
+        {:error, reason} ->
+          send(from_pid, {from_ref, {:error, reason}})
+          {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, state}
+      end
+    else
+      {:circuit_open, cooldown_ms} ->
+        Logger.error(
+          "global lock circuit breaker open for #{cooldown_ms}ms, refusing lock acquisition for #{inspect(key)}"
+        )
+
+        send(from_pid, {from_ref, {:error, {:circuit_open, :network_partition}}})
+
+        {:stop, {:shutdown, {@durable, {:init_failed, {:circuit_open, :network_partition}}}},
+         state}
+
+      {:error, {:limit_reached, reason, details}} ->
+        log_capacity_limit(reason, details, supervisor_name, module)
+        send(from_pid, {from_ref, {:error, {:capacity_limit, reason}}})
+        {:stop, {:shutdown, {@durable, {:init_failed, {:capacity_limit, reason}}}}, state}
+    end
   end
 
   # user-initiated termination

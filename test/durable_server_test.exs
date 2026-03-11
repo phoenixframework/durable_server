@@ -1593,6 +1593,58 @@ defmodule DurableServerTest do
         )
       end
     end
+
+    test "blocked child bootstrap does not block starting later children", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      blocked_key = "blocked-test-#{DurableServer.UUID.uuid4()}"
+      fast_key = "fast-test-#{DurableServer.UUID.uuid4()}"
+      dynamic_supervisor = DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
+
+      before_children =
+        dynamic_supervisor
+        |> DynamicSupervisor.which_children()
+        |> Enum.map(&elem(&1, 1))
+        |> MapSet.new()
+
+      blocked_task =
+        Task.async(fn ->
+          DurableServer.Supervisor.start_child(
+            supervisor_name,
+            {DurableServerTest.BlockingInitServer, %{key: blocked_key, block_on_init: true}}
+          )
+        end)
+
+      Process.sleep(200)
+      assert Task.yield(blocked_task, 0) == nil
+
+      blocked_children =
+        dynamic_supervisor
+        |> DynamicSupervisor.which_children()
+        |> Enum.map(&elem(&1, 1))
+        |> MapSet.new()
+        |> MapSet.difference(before_children)
+        |> MapSet.to_list()
+
+      assert [blocked_pid] = blocked_children
+      assert Process.alive?(blocked_pid)
+
+      {elapsed_us, fast_result} =
+        :timer.tc(fn ->
+          DurableServer.Supervisor.start_child(
+            supervisor_name,
+            {DurableServerTest.BlockingInitServer, %{key: fast_key}}
+          )
+        end)
+
+      assert {:ok, {fast_pid, _meta}} = fast_result
+      assert Process.alive?(fast_pid)
+      assert div(elapsed_us, 1000) < 2_000
+
+      send(blocked_pid, :continue_init)
+      assert {:ok, {^blocked_pid, _meta}} = Task.await(blocked_task, 2_000)
+    end
   end
 
   describe "crash recovery" do
@@ -1796,6 +1848,28 @@ defmodule DurableServerTest do
 
     def handle_info(:crash, _state) do
       raise "Intentional crash in info"
+    end
+  end
+
+  defmodule BlockingInitServer do
+    use DurableServer,
+      vsn: 1
+
+    def dump_state(state), do: state
+
+    def load_state(_old_vsn, persisted_state) do
+      DurableServerTest.atomify_keys(persisted_state)
+    end
+
+    def init(%{block_on_init: true} = state) do
+      receive do
+        :continue_init ->
+          {:ok, Map.delete(state, :block_on_init), auto_sync: false}
+      end
+    end
+
+    def init(state) do
+      {:ok, state, auto_sync: false}
     end
   end
 
