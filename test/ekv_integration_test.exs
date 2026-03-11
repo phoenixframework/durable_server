@@ -54,8 +54,8 @@ defmodule DurableServer.EKVIntegrationTest do
     config = DurableServer.Supervisor.__get_config__(supervisor_name)
 
     assert config.heartbeat_tracking_mode == :subscribe
-    assert config.discovery_interval_ms == 5_000
-    assert config.heartbeat_interval_ms == 5_000
+    assert config.discovery_interval_ms == 3_000
+    assert config.heartbeat_interval_ms == 10_000
     assert config.heartbeat_reconcile_interval_ms == 30_000
   end
 
@@ -87,6 +87,26 @@ defmodule DurableServer.EKVIntegrationTest do
     assert config.heartbeat_interval_ms == 7_000
     assert config.heartbeat_tracking_mode == :poll
     assert config.heartbeat_reconcile_interval_ms == 21_000
+  end
+
+  test "EKV backend accepts client-mode EKV instances" do
+    unique_id = System.unique_integer([:positive, :monotonic])
+    client_name = :"durable_ekv_client_only_#{unique_id}"
+
+    start_supervised!(
+      {ekv_mod(),
+       [
+         name: client_name,
+         mode: :client,
+         region: "ord",
+         region_routing: ["ord"],
+         log: false
+       ]}
+    )
+
+    {:ok, backend} = StorageBackend.init_backend(EKVStore, name: client_name)
+
+    assert :ok = StorageBackend.ensure_ready(backend)
   end
 
   test "subscribe heartbeat tracking updates cache from EKV events", %{

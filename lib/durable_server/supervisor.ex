@@ -819,6 +819,7 @@ defmodule DurableServer.Supervisor do
         monitor_ref = Process.monitor(pid)
 
         receive do
+          {^init_ref, {:error, reason}} -> {:error, reason}
           {^init_ref, meta} -> {:ok, {pid, meta}}
           {:DOWN, ^monitor_ref, :process, ^pid, reason} -> {:error, reason}
         end
@@ -2450,7 +2451,7 @@ defmodule DurableServer.Supervisor do
     |> Keyword.put_new(:task_supervisor, task_sup)
   end
 
-  defp prepare_backend_init_opts(DurableServer.Backends.MigrationStore, raw_opts, finch, task_sup) do
+  defp prepare_backend_init_opts(DurableServer.Backends.MirrorStore, raw_opts, finch, task_sup) do
     migration_opts = normalize_backend_opts(raw_opts)
 
     primary =

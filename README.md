@@ -106,7 +106,7 @@ GenServer.call(pid, :get_count)  # => 2
 {DurableServer.Supervisor,
  name: MyDurableSup,
  prefix: "my_app/",
- backend: {:object_store,
+ backend: {DurableServer.Backends.ObjectStore,
   [
     bucket: "my-bucket",
     access_key_id: "...",
@@ -130,22 +130,22 @@ children = [
   {DurableServer.Supervisor,
    name: MyDurableSup,
    prefix: "my_app/",
-   backend: {:ekv, [name: :durable_ekv]}}
+   backend: {DurableServer.Backends.EKVStore, [name: :durable_ekv]}}
 ]
 ```
 
 If you use EKV backend, add EKV to your app's dependencies.
 
-### Live Migration Backend (Object Storage -> EKV)
+### Mirror Backend (Object Storage -> EKV)
 
-Use the migrating backend to dual-write while you cut over reads/writes in phases:
+Use the mirror backend to dual-write while you cut over reads/writes in phases:
 
 ```elixir
 backend:
-  {:migrating,
+  {DurableServer.Backends.MirrorStore,
    [
-     primary: {:object_store, object_store_opts},
-     secondary: {:ekv, [name: :durable_ekv]},
+     primary: {DurableServer.Backends.ObjectStore, object_store_opts},
+     secondary: {DurableServer.Backends.EKVStore, [name: :durable_ekv]},
      read_preference: :primary,
      write_target: :primary,
      mirror_writes: true,
@@ -157,9 +157,9 @@ backend:
 Recommended rollout:
 
 1. Shadow phase: `read_preference: :primary`, `write_target: :primary`, `mirror_writes: true`
-2. Read cutover: `read_preference: :secondary`, `write_target: :primary` (or switch both if validated)
+2. Backfill historical objects into EKV
 3. Full cutover: `read_preference: :secondary`, `write_target: :secondary`
-4. Finalize: replace migrating backend with pure `{:ekv, ...}`
+4. Finalize: replace the mirror backend with pure `{DurableServer.Backends.EKVStore, ...}`
 
 `promote_on_fallback: true` ensures fallback reads are copied into the active read backend so returned CAS etags remain backend-local and safe for subsequent lock updates.
 

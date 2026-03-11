@@ -1130,18 +1130,27 @@ defmodule DurableServer do
     new_state = register_pid(new_state)
     # always sync status to :running on startup, since if we're starting up, we're running
     # this ensures that crashed servers get their status updated when restarted
-    {:ok, new_state} = sync_to_storage(new_state, meta: %{status: :running})
+    case sync_to_storage(new_state, meta: %{status: :running}) do
+      {:ok, new_state} ->
+        # schedule our first sync
+        new_state = schedule_sync(new_state)
 
-    # schedule our first sync
-    new_state = schedule_sync(new_state)
+        # send caller that called start_child our metadata
+        send(new_state.init_from_pid, {new_state.init_from_ref, new_state.user_meta})
 
-    # send caller that called start_child our metadata
-    send(new_state.init_from_pid, {new_state.init_from_ref, new_state.user_meta})
+        if continue_or_timeout do
+          {:ok, new_state, continue_or_timeout}
+        else
+          {:ok, new_state}
+        end
 
-    if continue_or_timeout do
-      {:ok, new_state, continue_or_timeout}
-    else
-      {:ok, new_state}
+      {:error, reason} ->
+        Logger.error(
+          "#{inspect(state.module)} (key=#{state.key}) failed to sync startup status :running: #{inspect(reason)}"
+        )
+
+        send(state.init_from_pid, {state.init_from_ref, {:error, reason}})
+        {:stop, reason}
     end
   end
 

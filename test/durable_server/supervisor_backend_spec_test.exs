@@ -1,7 +1,7 @@
 defmodule DurableServer.SupervisorBackendSpecTest do
   use ExUnit.Case, async: false
 
-  alias DurableServer.Backends.MigrationStore
+  alias DurableServer.Backends.MirrorStore
   alias DurableServer.StorageBackend
 
   defmodule InMemoryBackend do
@@ -134,7 +134,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
          name: supervisor_name,
          prefix: prefix,
          backend:
-           {MigrationStore,
+           {MirrorStore,
             [
               primary: {InMemoryBackend, name: :primary},
               secondary: {InMemoryBackend, name: :secondary},
@@ -151,7 +151,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     %{storage_backend: storage_backend, object_store: object_store} =
       DurableServer.Supervisor.__get_config__(supervisor_name)
 
-    assert storage_backend.adapter == MigrationStore
+    assert storage_backend.adapter == MirrorStore
     assert storage_backend.state.primary.adapter == InMemoryBackend
     assert storage_backend.state.secondary.adapter == InMemoryBackend
     assert storage_backend.state.primary.state.name == :primary

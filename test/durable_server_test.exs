@@ -5,6 +5,8 @@ defmodule DurableServerTest do
   alias DurableServer
   alias DurableServer.StoredState
   alias DurableServer.ObjectStore
+  alias DurableServer.Backends.ObjectStore, as: ObjectStoreBackend
+  alias DurableServer.StorageBackend
   alias DurableServer.TestTemporalServer
   alias DurableServerTest.EdgeCaseTestServer
   alias DurableServerTest.ValidatorTestServer
@@ -25,24 +27,30 @@ defmodule DurableServerTest do
 
   def atomify_keys(other), do: other
 
-  defp start_test_supervisor do
+  defp start_test_supervisor(extra_opts \\ []) do
     unique_id = "#{System.system_time(:microsecond)}_#{DurableServer.UUID.uuid4()}"
     supervisor_name = :"test_supervisor_#{unique_id}"
     prefix = "test_#{unique_id}/"
 
+    base_opts = [
+      name: supervisor_name,
+      prefix: prefix,
+      graceful_shutdown_timeout_ms: 500
+    ]
+
+    base_opts =
+      if Keyword.has_key?(extra_opts, :backend) do
+        base_opts
+      else
+        Keyword.put(base_opts, :object_store, test_object_store_opts())
+      end
+
+    supervisor_opts = Keyword.merge(base_opts, extra_opts)
+
     # create a child spec with unique ID to avoid ExUnit conflicts
     child_spec = %{
       id: {DurableServer.Supervisor, supervisor_name},
-      start:
-        {DurableServer.Supervisor, :start_link,
-         [
-           [
-             name: supervisor_name,
-             prefix: prefix,
-             object_store: test_object_store_opts(),
-             graceful_shutdown_timeout_ms: 500
-           ]
-         ]},
+      start: {DurableServer.Supervisor, :start_link, [supervisor_opts]},
       type: :supervisor
     }
 
@@ -52,6 +60,65 @@ defmodule DurableServerTest do
   end
 
   # Test implementation modules
+  defmodule RejectingStartupSyncBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+    alias DurableServer.Backends.ObjectStore, as: ObjectStoreBackend
+
+    @impl true
+    def init_backend(opts) when is_list(opts) do
+      delegate_opts = Keyword.fetch!(opts, :delegate_opts)
+      {:ok, delegate} = StorageBackend.init_backend(ObjectStoreBackend, delegate_opts)
+      {:ok, %{state: %{delegate: delegate}}}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts) do
+      if String.contains?(key, "__nodes/") do
+        StorageBackend.put_object(delegate, key, data, opts)
+      else
+        {:error, :startup_sync_rejected}
+      end
+    end
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+
+    @impl true
+    def subscribe(%{delegate: delegate}, subscriber, prefix, opts),
+      do: StorageBackend.subscribe(delegate, subscriber, prefix, opts)
+
+    @impl true
+    def unsubscribe(%{delegate: delegate}, subscription_ref),
+      do: StorageBackend.unsubscribe(delegate, subscription_ref)
+  end
+
   defmodule TestServer do
     use DurableServer,
       vsn: 1
@@ -419,6 +486,27 @@ defmodule DurableServerTest do
 
       assert message =~ "unknown keys [:invalid_opt]"
       assert message =~ "allowed keys are: [:auto_sync, :sync_every_ms, :meta, :permanent]"
+    end
+
+    test "returns startup sync failure to caller and logs the error" do
+      {supervisor_name, _supervisor_pid, _prefix} =
+        start_test_supervisor(
+          backend: {RejectingStartupSyncBackend, delegate_opts: test_object_store_opts()}
+        )
+
+      key = "startup-sync-fail-#{DurableServer.UUID.uuid4()}"
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, :startup_sync_rejected} =
+                   DurableServer.Supervisor.start_child(
+                     supervisor_name,
+                     {TestServer, %{key: key}}
+                   )
+        end)
+
+      assert log =~ "failed to sync startup status :running"
+      assert log =~ key
     end
 
     test "sets up node reference in persistent term", %{

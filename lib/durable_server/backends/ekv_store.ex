@@ -566,6 +566,10 @@ defmodule DurableServer.Backends.EKVStore do
     end
   end
 
+  defp ensure_cas_config(%{mode: :client}) do
+    :ok
+  end
+
   defp ensure_cas_config(%{cluster_size: nil}) do
     {:error, :ekv_cas_not_configured}
   end
@@ -651,8 +655,9 @@ defmodule DurableServer.Backends.EKVStore do
   end
 
   defp ekv_mod, do: :"Elixir.EKV"
+  defp ekv_supervisor_mod, do: :"Elixir.EKV.Supervisor"
 
-  defp ekv_get_config(name), do: apply(ekv_mod(), :get_config, [name])
+  defp ekv_get_config(name), do: apply(ekv_supervisor_mod(), :get_config, [name])
   defp ekv_keys(name, prefix), do: apply(ekv_mod(), :keys, [name, prefix])
   defp ekv_lookup(name, key), do: apply(ekv_mod(), :lookup, [name, key])
   defp ekv_put(name, key, value, opts), do: apply(ekv_mod(), :put, [name, key, value, opts])
