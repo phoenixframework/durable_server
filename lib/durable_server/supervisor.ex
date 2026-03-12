@@ -195,6 +195,7 @@ defmodule DurableServer.Supervisor do
   @remote_placement_ready_timeout 500
   @shutdown_placement_attempt_wait_timeout :timer.seconds(1)
   @default_placement_timeout :timer.seconds(15)
+  @default_start_child_timeout 5_000
   @default_discovery_interval_ms 60_000
   @default_heartbeat_interval_ms 10_000
   @default_heartbeat_tracking_mode :poll
@@ -211,11 +212,14 @@ defmodule DurableServer.Supervisor do
   @doc """
   Checks if the DurableServer.Supervisor is ready to handle requests.
 
-  Returns `true` if the supervisor process is registered, `false` otherwise.
+  Returns `true` once the supervisor and its lifecycle manager child are
+  registered, `false` otherwise.
+
   This is safe to call at any time, even if the supervisor hasn't started yet.
   """
   def ready?(supervisor_name) when is_atom(supervisor_name) do
-    Process.whereis(supervisor_name) != nil
+    Process.whereis(supervisor_name) != nil and
+      Process.whereis(LifecycleManager.name(supervisor_name)) != nil
   end
 
   @doc """
@@ -625,6 +629,9 @@ defmodule DurableServer.Supervisor do
     If all placement attempts fail, the caller retries with fresh eligible nodes every
     #{@placement_retry_interval}ms until the deadline. Useful during rolling deploys when
     nodes are temporarily unavailable. Set to `nil` to disable. Default: `#{@default_placement_timeout}`ms.
+  - `:timeout` - Maximum total time in milliseconds to wait for the child bootstrap to
+    complete, including internal retries. Returns `{:error, :timeout}` on expiration.
+    Set to `:infinity` to disable. Default: `#{@default_start_child_timeout}`ms.
 
   ## Examples
 
@@ -659,20 +666,27 @@ defmodule DurableServer.Supervisor do
   """
   def start_child(supervisor, {module, init_arg}, opts \\ []) do
     opts =
-      Keyword.validate!(opts, [:max_placement_retries, :local_only, :placement_timeout, :existing])
+      Keyword.validate!(opts, [
+        :max_placement_retries,
+        :local_only,
+        :placement_timeout,
+        :existing,
+        :timeout
+      ])
 
-    with {:ok, init_arg} <-
-           check_existing(supervisor, init_arg, Keyword.get(opts, :existing, false)) do
-      local_only = Keyword.get(opts, :local_only, false)
+    local_only = Keyword.get(opts, :local_only, false)
+    timeout = caller_timeout!(opts)
+    caller_deadline_ms = deadline_after_timeout(timeout)
+    reply_to = :erlang.alias()
 
+    try do
       max_placement_retries =
         if local_only, do: 0, else: Keyword.get(opts, :max_placement_retries, 3)
 
       placement_timeout = Keyword.get(opts, :placement_timeout, @default_placement_timeout)
 
       # When max_placement_retries is 0, this is a remote placement call from another node.
-      # Wait for the supervisor to be ready to handle the race where RPC arrives before
-      # ETS tables are created during node startup/rolling deploys.
+      # Wait for the supervisor tree to be ready before touching ETS/Group-backed state.
       if max_placement_retries == 0 do
         case wait_until_ready(supervisor,
                timeout: @remote_placement_ready_timeout,
@@ -686,39 +700,40 @@ defmodule DurableServer.Supervisor do
               "DurableServer.Supervisor #{inspect(supervisor)} not ready after #{@remote_placement_ready_timeout}ms on remote placement"
             )
 
-            # Return error so caller can try another node
             throw({:error, :not_ready})
         end
       end
 
-      child_spec = {module, init_arg}
+      with {:ok, init_arg} <-
+             check_existing(supervisor, init_arg, Keyword.get(opts, :existing, false)) do
+        child_spec = {module, init_arg}
 
-      case do_start_child(supervisor, child_spec, 0) do
-        {:ok, result} ->
-          {:ok, result}
+        case do_start_child(supervisor, child_spec, 0, caller_deadline_ms, reply_to) do
+          {:ok, result} ->
+            {:ok, result}
 
-        {:error, {:capacity_limit, reason}} when max_placement_retries > 0 ->
-          Logger.info("""
-          DurableServer local capacity exceeded for #{inspect(module)} on #{Node.self()}
-          Reason: #{inspect(reason)}
-          Attempting remote placement (max retries: #{max_placement_retries})
-          """)
+          {:error, {:capacity_limit, reason}} when max_placement_retries > 0 ->
+            Logger.info("""
+            DurableServer local capacity exceeded for #{inspect(module)} on #{Node.self()}
+            Reason: #{inspect(reason)}
+            Attempting remote placement (max retries: #{max_placement_retries})
+            """)
 
-          deadline =
-            if placement_timeout,
-              do: System.monotonic_time(:millisecond) + placement_timeout,
-              else: nil
+            placement_deadline_ms = deadline_after_optional_timeout(placement_timeout)
 
-          try_remote_placement_with_retry(
-            supervisor,
-            child_spec,
-            max_placement_retries,
-            deadline
-          )
+            try_remote_placement_with_retry(
+              supervisor,
+              child_spec,
+              max_placement_retries,
+              earlier_deadline(caller_deadline_ms, placement_deadline_ms)
+            )
 
-        error ->
-          error
+          error ->
+            error
+        end
       end
+    after
+      :erlang.unalias(reply_to)
     end
   end
 
@@ -747,7 +762,61 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp do_start_child(supervisor, {module, init_arg}, retries)
+  defp caller_timeout!(opts) when is_list(opts) do
+    case Keyword.get(opts, :timeout, @default_start_child_timeout) do
+      :infinity ->
+        :infinity
+
+      timeout when is_integer(timeout) and timeout > 0 ->
+        timeout
+
+      other ->
+        raise ArgumentError,
+              ":timeout must be a positive integer or :infinity, got: #{inspect(other)}"
+    end
+  end
+
+  defp deadline_after_timeout(:infinity), do: nil
+
+  defp deadline_after_timeout(timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0 do
+    System.monotonic_time(:millisecond) + timeout_ms
+  end
+
+  defp deadline_after_optional_timeout(nil), do: nil
+  defp deadline_after_optional_timeout(:infinity), do: nil
+
+  defp deadline_after_optional_timeout(timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0 do
+    System.monotonic_time(:millisecond) + timeout_ms
+  end
+
+  defp earlier_deadline(nil, nil), do: nil
+  defp earlier_deadline(deadline_ms, nil), do: deadline_ms
+  defp earlier_deadline(nil, deadline_ms), do: deadline_ms
+
+  defp earlier_deadline(left_deadline_ms, right_deadline_ms),
+    do: min(left_deadline_ms, right_deadline_ms)
+
+  defp deadline_exceeded?(nil), do: false
+
+  defp deadline_exceeded?(deadline_ms) when is_integer(deadline_ms) do
+    remaining_timeout_ms(deadline_ms) == 0
+  end
+
+  defp remaining_timeout_ms(nil), do: :infinity
+
+  defp remaining_timeout_ms(deadline_ms) when is_integer(deadline_ms) do
+    max(deadline_ms - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp timeout_option(deadline_ms) do
+    case remaining_timeout_ms(deadline_ms) do
+      :infinity -> :infinity
+      timeout_ms -> max(timeout_ms, 1)
+    end
+  end
+
+  defp do_start_child(supervisor, {module, init_arg}, retries, _deadline_ms, _reply_to)
        when retries > @max_start_child_tries do
     key =
       case init_arg do
@@ -762,44 +831,56 @@ defmodule DurableServer.Supervisor do
           "#{inspect(supervisor)} failed to `DurableServer.Supervisor.start_child` for #{inspect(module)} (key=#{key}) after #{@max_start_child_tries} tries"
   end
 
-  defp do_start_child(supervisor, {module, init_arg}, retries) do
-    key =
-      case init_arg do
-        {:restart, %{key: key}} ->
-          key
+  defp do_start_child(supervisor, {module, init_arg}, retries, deadline_ms, reply_to) do
+    if deadline_exceeded?(deadline_ms) do
+      {:error, :timeout}
+    else
+      key =
+        case init_arg do
+          {:restart, %{key: key}} ->
+            key
 
-        %{key: key} ->
-          key
+          %{key: key} ->
+            key
 
-        _ ->
-          raise ArgumentError,
-                "start_child expects a map with :key field, got: #{inspect(init_arg)}"
-      end
-
-    # Check group first to avoid spawning a process that will just fail at registration
-    case lookup(supervisor, key) do
-      {pid, meta} when node(pid) == node() ->
-        # Local pid - verify it's actually alive before returning already_started
-        if Process.alive?(pid) do
-          {:error, {:already_started, {pid, meta}}}
-        else
-          do_start_child_inner(supervisor, module, init_arg, key, retries)
+          _ ->
+            raise ArgumentError,
+                  "start_child expects a map with :key field, got: #{inspect(init_arg)}"
         end
 
-      {pid, meta} ->
-        # Remote pid - trust syn
-        {:error, {:already_started, {pid, meta}}}
+      # Check group first to avoid spawning a process that will just fail at registration
+      case lookup(supervisor, key) do
+        {pid, meta} when node(pid) == node() ->
+          # Local pid - verify it's actually alive before returning already_started
+          if Process.alive?(pid) do
+            {:error, {:already_started, {pid, meta}}}
+          else
+            do_start_child_inner(
+              supervisor,
+              module,
+              init_arg,
+              key,
+              retries,
+              deadline_ms,
+              reply_to
+            )
+          end
 
-      nil ->
-        do_start_child_inner(supervisor, module, init_arg, key, retries)
+        {pid, meta} ->
+          # Remote pid - trust syn
+          {:error, {:already_started, {pid, meta}}}
+
+        nil ->
+          do_start_child_inner(supervisor, module, init_arg, key, retries, deadline_ms, reply_to)
+      end
     end
   end
 
-  defp do_start_child_inner(supervisor, module, init_arg, key, retries) do
+  defp do_start_child_inner(supervisor, module, init_arg, key, retries, deadline_ms, reply_to) do
     dynamic_sup = get_dynamic_supervisor(supervisor)
     config = __get_config__(supervisor)
     init_ref = make_ref()
-    init_from = {init_ref, self()}
+    init_from = {init_ref, self(), reply_to}
 
     child_spec =
       Supervisor.child_spec(
@@ -817,119 +898,222 @@ defmodule DurableServer.Supervisor do
     case DynamicSupervisor.start_child(dynamic_sup, child_spec) do
       {:ok, pid} ->
         monitor_ref = Process.monitor(pid)
+        timeout_ms = remaining_timeout_ms(deadline_ms)
 
-        receive do
-          {^init_ref, :ignore} ->
-            Process.demonitor(monitor_ref, [:flush])
-            :ignore
-
-          {^init_ref, {:error, reason}} ->
-            Process.demonitor(monitor_ref, [:flush])
-            {:error, reason}
-
-          {^init_ref, meta} ->
-            Process.demonitor(monitor_ref, [:flush])
-            {:ok, {pid, meta}}
-
-          {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:durable, :ignored}}} ->
-            :ignore
-
-          {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:durable, {:init_failed, reason}}}} ->
-            {:error, reason}
-
-          {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        result =
+          if timeout_ms == :infinity do
             receive do
               {^init_ref, :ignore} ->
                 :ignore
 
-              {^init_ref, {:error, init_reason}} ->
-                {:error, init_reason}
-            after
-              0 ->
+              {^init_ref, {:error, reason}} ->
                 {:error, reason}
-            end
-        end
 
-      :ignore ->
-        receive do
-          {^init_ref, :ignore} ->
-            :ignore
+              {^init_ref, meta} ->
+                {:ok, {pid, meta}}
 
-          {^init_ref, {:error, {:already_started, pid}}} ->
-            # wait up to 100ms * max retries (2.5s) for metadata to be synced before giving up on retries
-            if retries > 0, do: Process.sleep(250)
-            # we raced a start, retry start child to grab raced pid's metadata
-            # node-local group meta will be immediately there, but remote node meta could still be in flight (or pid is already DOWN)
-            # if we find there is nothing in the registry, we RPC out to get remote node's meta.
-            # if we find nothing there, we retry the start + lookup combo which will either get
-            # the already started pid and its now synced metadata, or we end up starting ourselves up to @max_start_child_tries tries
-            # and with a max caller wait time of 2.5s
-            case lookup(supervisor, key) do
-              {pid, meta} ->
-                {:error, {:already_started, {pid, meta}}}
+              {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:durable, :ignored}}} ->
+                :ignore
 
-              nil ->
-                remote_node = node(pid)
+              {:DOWN, ^monitor_ref, :process, ^pid,
+               {:shutdown, {:durable, {:init_failed, reason}}}} ->
+                {:error, reason}
 
-                # If we raced group registration, immediately try to rpc out to the owning node for its node-local
-                # group metadata - as long as the node appears healthy.
-                #
-                # If the node does not appear healthy, we retry the start
-                case LifecycleManager.lookup_node_health(%{
-                       supervisor: supervisor,
-                       node_str: to_string(remote_node)
-                     }) do
-                  {:healthy, _node_ref} ->
-                    try do
-                      report_placement_diagnostic(supervisor, :race_lookup_erpc_attempt)
+              {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+                receive do
+                  {^init_ref, :ignore} ->
+                    :ignore
 
-                      case safe_erpc_call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
-                        {pid, meta} when is_pid(pid) ->
-                          {:error, {:already_started, {pid, meta}}}
-
-                        nil ->
-                          Logger.info(
-                            "node-local metadata missing from #{inspect(node(pid))} so assuming raced pid is gone. Retrying start for #{inspect(key)}"
-                          )
-
-                          do_start_child(supervisor, {module, init_arg}, retries + 1)
-                      end
-                    catch
-                      # erpc infrastructure failures (noconnection, timeout, etc.)
-                      # Node appeared healthy but RPC failed - retry start since the
-                      # "winning" process is likely gone
-                      :error, {:erpc, erpc_reason} ->
-                        report_placement_diagnostic(supervisor, :race_lookup_erpc_error)
-
-                        report_placement_diagnostic(
-                          supervisor,
-                          {:race_lookup_erpc_error, erpc_reason}
-                        )
-
-                        Logger.info(
-                          "erpc to #{inspect(node(pid))} failed (#{inspect(erpc_reason)}), retrying start for #{inspect(key)}"
-                        )
-
-                        do_start_child(supervisor, {module, init_arg}, retries + 1)
-                    end
-
-                  unhealthy when unhealthy in [:stale, :unknown] ->
-                    Logger.info(
-                      "node #{inspect(node(pid))} no longer healthy, so assuming raced pid is gone. Retrying start for #{inspect(key)}"
-                    )
-
-                    do_start_child(supervisor, {module, init_arg}, retries + 1)
+                  {^init_ref, {:error, init_reason}} ->
+                    {:error, init_reason}
+                after
+                  0 ->
+                    {:error, reason}
                 end
             end
+          else
+            receive do
+              {^init_ref, :ignore} ->
+                :ignore
 
-          {^init_ref, {:error, reason}} ->
-            {:error, reason}
-        after
-          1000 -> exit(:timeout)
+              {^init_ref, {:error, reason}} ->
+                {:error, reason}
+
+              {^init_ref, meta} ->
+                {:ok, {pid, meta}}
+
+              {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:durable, :ignored}}} ->
+                :ignore
+
+              {:DOWN, ^monitor_ref, :process, ^pid,
+               {:shutdown, {:durable, {:init_failed, reason}}}} ->
+                {:error, reason}
+
+              {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+                receive do
+                  {^init_ref, :ignore} ->
+                    :ignore
+
+                  {^init_ref, {:error, init_reason}} ->
+                    {:error, init_reason}
+                after
+                  0 ->
+                    {:error, reason}
+                end
+            after
+              timeout_ms ->
+                {:error, :timeout}
+            end
+          end
+
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      :ignore ->
+        timeout_ms = remaining_timeout_ms(deadline_ms)
+
+        if timeout_ms == :infinity do
+          receive do
+            {^init_ref, :ignore} ->
+              :ignore
+
+            {^init_ref, {:error, {:already_started, pid}}} ->
+              handle_already_started_race(
+                supervisor,
+                module,
+                init_arg,
+                key,
+                pid,
+                retries,
+                deadline_ms,
+                reply_to
+              )
+
+            {^init_ref, {:error, reason}} ->
+              {:error, reason}
+          end
+        else
+          receive do
+            {^init_ref, :ignore} ->
+              :ignore
+
+            {^init_ref, {:error, {:already_started, pid}}} ->
+              handle_already_started_race(
+                supervisor,
+                module,
+                init_arg,
+                key,
+                pid,
+                retries,
+                deadline_ms,
+                reply_to
+              )
+
+            {^init_ref, {:error, reason}} ->
+              {:error, reason}
+          after
+            timeout_ms ->
+              {:error, :timeout}
+          end
         end
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp handle_already_started_race(
+         supervisor,
+         module,
+         init_arg,
+         key,
+         pid,
+         retries,
+         deadline_ms,
+         reply_to
+       ) do
+    # wait up to 100ms * max retries (2.5s) for metadata to be synced before giving up on retries
+    if retries > 0, do: Process.sleep(250)
+
+    # we raced a start, retry start child to grab raced pid's metadata
+    # node-local group meta will be immediately there, but remote node meta could still be in flight (or pid is already DOWN)
+    # if we find there is nothing in the registry, we RPC out to get remote node's meta.
+    # if we find nothing there, we retry the start + lookup combo which will either get
+    # the already started pid and its now synced metadata, or we end up starting ourselves up to @max_start_child_tries tries
+    case lookup(supervisor, key) do
+      {pid, meta} ->
+        {:error, {:already_started, {pid, meta}}}
+
+      nil ->
+        remote_node = node(pid)
+
+        # If we raced group registration, immediately try to rpc out to the owning node for its node-local
+        # group metadata - as long as the node appears healthy.
+        #
+        # If the node does not appear healthy, we retry the start
+        case LifecycleManager.lookup_node_health(%{
+               supervisor: supervisor,
+               node_str: to_string(remote_node)
+             }) do
+          {:healthy, _node_ref} ->
+            try do
+              report_placement_diagnostic(supervisor, :race_lookup_erpc_attempt)
+
+              case safe_erpc_call(node(pid), __MODULE__, :lookup, [supervisor, key]) do
+                {pid, meta} when is_pid(pid) ->
+                  {:error, {:already_started, {pid, meta}}}
+
+                nil ->
+                  Logger.info(
+                    "node-local metadata missing from #{inspect(node(pid))} so assuming raced pid is gone. Retrying start for #{inspect(key)}"
+                  )
+
+                  do_start_child(
+                    supervisor,
+                    {module, init_arg},
+                    retries + 1,
+                    deadline_ms,
+                    reply_to
+                  )
+              end
+            catch
+              # erpc infrastructure failures (noconnection, timeout, etc.)
+              # Node appeared healthy but RPC failed - retry start since the
+              # "winning" process is likely gone
+              :error, {:erpc, erpc_reason} ->
+                report_placement_diagnostic(supervisor, :race_lookup_erpc_error)
+
+                report_placement_diagnostic(
+                  supervisor,
+                  {:race_lookup_erpc_error, erpc_reason}
+                )
+
+                Logger.info(
+                  "erpc to #{inspect(node(pid))} failed (#{inspect(erpc_reason)}), retrying start for #{inspect(key)}"
+                )
+
+                do_start_child(
+                  supervisor,
+                  {module, init_arg},
+                  retries + 1,
+                  deadline_ms,
+                  reply_to
+                )
+            end
+
+          unhealthy when unhealthy in [:stale, :unknown] ->
+            Logger.info(
+              "node #{inspect(node(pid))} no longer healthy, so assuming raced pid is gone. Retrying start for #{inspect(key)}"
+            )
+
+            do_start_child(
+              supervisor,
+              {module, init_arg},
+              retries + 1,
+              deadline_ms,
+              reply_to
+            )
+        end
     end
   end
 
@@ -1326,6 +1510,9 @@ defmodule DurableServer.Supervisor do
   - `:placement_timeout` - Maximum time in milliseconds to keep retrying remote placement.
     When set, if all placement attempts fail, retries with fresh eligible nodes every
     #{@placement_retry_interval}ms until the deadline. Default: `nil` (no retry).
+  - `:timeout` - Maximum total time in milliseconds to wait for the process to be
+    found or bootstrapped. Returns `{:error, :timeout}` on expiration. Set to
+    `:infinity` to disable. Default: `#{@default_start_child_timeout}`ms.
 
   ## Returns
 
@@ -1354,27 +1541,70 @@ defmodule DurableServer.Supervisor do
       )
   """
   def ensure_started_child(supervisor, {module, init_arg} = child_spec, opts \\ []) do
+    opts =
+      Keyword.validate!(opts, [
+        :max_placement_retries,
+        :local_only,
+        :placement_timeout,
+        :existing,
+        :timeout
+      ])
+
     key = ensure_started_child_key!(init_arg)
     singleflight_key = {:ensure_started_child, key, module}
-    singleflight_wait_timeout_ms = ensure_started_singleflight_wait_timeout_ms(opts)
+    deadline_ms = deadline_after_timeout(caller_timeout!(opts))
 
-    case with_ensure_started_singleflight(
-           supervisor,
-           singleflight_key,
-           singleflight_wait_timeout_ms,
-           fn ->
-             do_ensure_started_child(supervisor, module, key, child_spec, opts)
-           end
-         ) do
-      {:result, result} ->
-        result
+    do_ensure_started_child_with_deadline(
+      supervisor,
+      module,
+      key,
+      child_spec,
+      opts,
+      singleflight_key,
+      deadline_ms
+    )
+  end
 
-      :retry ->
-        ensure_started_child(supervisor, child_spec, opts)
+  defp do_ensure_started_child_with_deadline(
+         supervisor,
+         module,
+         key,
+         child_spec,
+         opts,
+         singleflight_key,
+         deadline_ms
+       ) do
+    if deadline_exceeded?(deadline_ms) do
+      {:error, :timeout}
+    else
+      singleflight_wait_timeout_ms = ensure_started_singleflight_wait_timeout_ms(deadline_ms)
+
+      case with_ensure_started_singleflight(
+             supervisor,
+             singleflight_key,
+             singleflight_wait_timeout_ms,
+             fn ->
+               do_ensure_started_child(supervisor, module, key, child_spec, opts, deadline_ms)
+             end
+           ) do
+        {:result, result} ->
+          result
+
+        :retry ->
+          do_ensure_started_child_with_deadline(
+            supervisor,
+            module,
+            key,
+            child_spec,
+            opts,
+            singleflight_key,
+            deadline_ms
+          )
+      end
     end
   end
 
-  defp do_ensure_started_child(supervisor, module, key, child_spec, opts) do
+  defp do_ensure_started_child(supervisor, module, key, child_spec, opts, deadline_ms) do
     case lookup(supervisor, key) do
       {pid, meta} ->
         {:ok, {pid, meta}}
@@ -1384,6 +1614,9 @@ defmodule DurableServer.Supervisor do
         # ensure_started_child should be single-attempt by default so hot paths
         # can control retry policy at the caller boundary.
         placement_timeout = Keyword.get(opts, :placement_timeout, nil)
+
+        placement_deadline_ms =
+          earlier_deadline(deadline_ms, deadline_after_optional_timeout(placement_timeout))
 
         # Try to fetch stored object to check sticky placement before attempting local start
         config = __get_config__(supervisor)
@@ -1483,11 +1716,6 @@ defmodule DurableServer.Supervisor do
                 "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
               )
 
-              deadline =
-                if placement_timeout,
-                  do: System.monotonic_time(:millisecond) + placement_timeout,
-                  else: nil
-
               await_sticky_placement(
                 supervisor,
                 module,
@@ -1495,7 +1723,7 @@ defmodule DurableServer.Supervisor do
                 stored_object,
                 child_spec_with_restart,
                 matching_level,
-                deadline
+                placement_deadline_ms
               )
 
             true ->
@@ -1504,6 +1732,7 @@ defmodule DurableServer.Supervisor do
                 opts
                 |> Keyword.delete(:existing)
                 |> Keyword.put_new(:placement_timeout, nil)
+                |> Keyword.put(:timeout, timeout_option(deadline_ms))
 
               case start_child(
                      supervisor,
@@ -1514,8 +1743,7 @@ defmodule DurableServer.Supervisor do
                   {:ok, {pid, meta}}
 
                 {:error, {:already_started, other}} ->
-                  {other_pid, other_meta} = other
-                  {:ok, {other_pid, other_meta}}
+                  normalize_already_started_result(supervisor, key, other)
 
                 {:error, reason} ->
                   {:error, reason}
@@ -1525,6 +1753,7 @@ defmodule DurableServer.Supervisor do
     end
   end
 
+  defp ensure_started_child_key!({:restart, %{key: key}}), do: key
   defp ensure_started_child_key!(%{key: key}), do: key
 
   defp ensure_started_child_key!(init_arg) do
@@ -1532,13 +1761,26 @@ defmodule DurableServer.Supervisor do
           "ensure_started_child expects a map with :key field, got: #{inspect(init_arg)}"
   end
 
-  defp ensure_started_singleflight_wait_timeout_ms(opts) when is_list(opts) do
-    case Keyword.get(opts, :placement_timeout) do
-      timeout when is_integer(timeout) and timeout > 0 ->
-        max(timeout, @ensure_started_singleflight_wait_timeout_ms)
+  defp ensure_started_singleflight_wait_timeout_ms(deadline_ms) do
+    case remaining_timeout_ms(deadline_ms) do
+      :infinity ->
+        @ensure_started_singleflight_wait_timeout_ms
+
+      timeout_ms ->
+        min(timeout_ms, @ensure_started_singleflight_wait_timeout_ms)
+    end
+  end
+
+  defp normalize_already_started_result(_supervisor, _key, {pid, meta}) when is_pid(pid),
+    do: {:ok, {pid, meta}}
+
+  defp normalize_already_started_result(supervisor, key, pid) when is_pid(pid) do
+    case lookup(supervisor, key) do
+      {^pid, meta} ->
+        {:ok, {pid, meta}}
 
       _ ->
-        @ensure_started_singleflight_wait_timeout_ms
+        {:error, {:already_started, pid}}
     end
   end
 
@@ -1808,13 +2050,15 @@ defmodule DurableServer.Supervisor do
   end
 
   defp fallback_to_local_start(supervisor, child_spec) do
+    {_, init_arg} = child_spec
+    key = ensure_started_child_key!(init_arg)
+
     case start_child(supervisor, child_spec, max_placement_retries: 0) do
       {:ok, {pid, meta}} ->
         {:ok, {pid, meta}}
 
       {:error, {:already_started, other}} ->
-        {other_pid, other_meta} = other
-        {:ok, {other_pid, other_meta}}
+        normalize_already_started_result(supervisor, key, other)
 
       {:error, reason} ->
         {:error, reason}
@@ -1911,6 +2155,9 @@ defmodule DurableServer.Supervisor do
 
     key =
       case init_arg do
+        {:restart, %{key: key}} ->
+          key
+
         %{key: key} ->
           key
 
@@ -2014,9 +2261,14 @@ defmodule DurableServer.Supervisor do
             Logger.info("No remote nodes available, trying local for rehoming #{key}")
 
             case start_child(supervisor, child_spec, max_placement_retries: 0) do
-              {:ok, {pid, meta}} -> {:ok, {pid, meta}}
-              {:error, {:already_started, other}} -> {:ok, other}
-              {:error, reason} -> {:error, reason}
+              {:ok, {pid, meta}} ->
+                {:ok, {pid, meta}}
+
+              {:error, {:already_started, other}} ->
+                normalize_already_started_result(supervisor, key, other)
+
+              {:error, reason} ->
+                {:error, reason}
             end
 
           nodes ->

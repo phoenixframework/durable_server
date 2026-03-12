@@ -109,6 +109,109 @@ defmodule DurableServer.EKVIntegrationTest do
     assert :ok = StorageBackend.ensure_ready(backend)
   end
 
+  test "EKV.update accepts MFA tuples", %{ekv_name: ekv_name} do
+    key = "mfa-update"
+
+    assert {:ok, "v1", _vsn} =
+             ekv_mod().update(
+               ekv_name,
+               key,
+               {__MODULE__, :replace_value, ["v1"]},
+               resolve_unconfirmed: true
+             )
+
+    assert {:ok, "v2", _vsn} =
+             ekv_mod().update(
+               ekv_name,
+               key,
+               {__MODULE__, :replace_value, ["v2"]},
+               resolve_unconfirmed: true
+             )
+  end
+
+  test "EKVStore client backend can update an existing remote key without etag" do
+    ensure_distributed_node!()
+
+    unique_id = System.unique_integer([:positive, :monotonic])
+    peer_name = :"durable_ekv_client_peer_#{unique_id}"
+    ekv_name = :"durable_ekv_client_cluster_#{unique_id}"
+
+    remote_data_dir =
+      Path.join(System.tmp_dir!(), "durable_server_ekv_client_remote_#{unique_id}")
+
+    key = "client-existing-key"
+
+    File.rm_rf(remote_data_dir)
+
+    {:ok, peer, peer_node} = :peer.start_link(%{name: peer_name})
+
+    on_exit(fn ->
+      try do
+        :peer.stop(peer)
+      catch
+        :exit, _ -> :ok
+      end
+
+      File.rm_rf(remote_data_dir)
+    end)
+
+    assert Node.connect(peer_node)
+    :ok = bootstrap_remote_peer(peer_node)
+
+    assert {:ok, _} =
+             :erpc.call(
+               peer_node,
+               Supervisor,
+               :start_child,
+               [
+                 EKV.AppSupervisor,
+                 {ekv_mod(),
+                  [
+                    name: ekv_name,
+                    region: "fra",
+                    data_dir: remote_data_dir,
+                    cluster_size: 1,
+                    node_id: 1,
+                    log: false
+                  ]}
+               ]
+             )
+
+    start_supervised!(
+      {ekv_mod(),
+       [
+         name: ekv_name,
+         mode: :client,
+         region: "ams",
+         region_routing: ["fra"],
+         wait_for_route: 5_000,
+         wait_for_quorum: 5_000,
+         log: false
+       ]}
+    )
+
+    assert_eventually(fn ->
+      case EKV.ClientRouter.backend(ekv_name) do
+        {:ok, ^peer_node} -> true
+        _ -> false
+      end
+    end)
+
+    assert {:ok, _vsn} =
+             :erpc.call(peer_node, ekv_mod(), :put, [
+               ekv_name,
+               key,
+               "v1",
+               [if_vsn: nil, resolve_unconfirmed: true]
+             ])
+
+    {:ok, backend} = StorageBackend.init_backend(EKVStore, name: ekv_name)
+
+    assert {:ok, %{body: "v1"}} = StorageBackend.get_object(backend, key)
+    assert {:ok, %{body: "v2"}} = StorageBackend.put_object(backend, key, "v2", max_retries: 0)
+    assert {:ok, %{body: "v3"}} = StorageBackend.put_object(backend, key, "v3", max_retries: 0)
+  end
+
   test "subscribe heartbeat tracking updates cache from EKV events", %{
     supervisor_name: supervisor_name,
     prefix: prefix
@@ -519,6 +622,8 @@ defmodule DurableServer.EKVIntegrationTest do
   end
 
   defp ekv_mod, do: :"Elixir.EKV"
+
+  def replace_value(_current_value, new_value), do: new_value
 
   defp bootstrap_remote_peer(peer_node) do
     code_paths = :code.get_path()

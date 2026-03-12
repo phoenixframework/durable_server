@@ -1151,9 +1151,13 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_meta: heartbeat_meta
     }
 
-    Group.join(sup, @heartbeat_group_key, meta)
-  rescue
-    _ -> :ok
+    try do
+      Group.join(sup, @heartbeat_group_key, meta)
+    rescue
+      _ -> :ok
+    catch
+      :exit, _ -> :ok
+    end
   end
 
   @doc """

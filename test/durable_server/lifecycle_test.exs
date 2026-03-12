@@ -1605,6 +1605,50 @@ defmodule DurableServer.LifecycleTest do
       assert is_map(heartbeat_data)
       assert Map.has_key?(heartbeat_data, "last_heartbeat_at")
     end
+
+    test "group heartbeat join timeout does not crash the lifecycle manager handler", %{
+      supervisor_name: supervisor_name
+    } do
+      shard = Group.Replica.shard_for(supervisor_name, nil, "__heartbeat")
+      ref = make_ref()
+
+      state = %LifecycleManager{
+        supervisor_name: supervisor_name,
+        heartbeat_interval_ms: 10_000,
+        current_heartbeat_task: %Task{
+          mfa: {:erlang, :apply, []},
+          owner: self(),
+          pid: self(),
+          ref: ref
+        }
+      }
+
+      heartbeat_entry =
+        {"node@test", 123, System.system_time(:millisecond), %{}, %{}, %{}, %{"region" => "ord"}}
+
+      :sys.suspend(shard)
+
+      try do
+        {us, result} =
+          :timer.tc(fn ->
+            LifecycleManager.handle_info(
+              {ref, {:heartbeat, {%{total_ms: 10, put_ms: 5, cache_ms: 5}, heartbeat_entry}}},
+              state
+            )
+          end)
+
+        assert us >= 5_000_000
+        assert {:noreply, %LifecycleManager{current_heartbeat_task: nil}} = result
+      after
+        :sys.resume(shard)
+
+        receive do
+          :heartbeat -> :ok
+        after
+          0 -> :ok
+        end
+      end
+    end
   end
 
   describe "dead node cleanup" do

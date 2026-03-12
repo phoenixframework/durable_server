@@ -159,6 +159,37 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert object_store == nil
   end
 
+  test "ready? requires lifecycle manager, not just the supervisor pid" do
+    supervisor_name = unique_supervisor_name("not_ready")
+    pid = spawn(fn -> Process.sleep(:infinity) end)
+    true = Process.register(pid, supervisor_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :kill)
+      end
+    end)
+
+    refute DurableServer.Supervisor.ready?(supervisor_name)
+  end
+
+  test "ready? returns true for a started supervisor" do
+    supervisor_name = unique_supervisor_name("ready")
+    prefix = unique_prefix("ready")
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend: {InMemoryBackend, name: :ready},
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    assert DurableServer.Supervisor.ready?(supervisor_name)
+  end
+
   defp unique_supervisor_name(label) do
     :"durable_backend_spec_#{label}_#{System.unique_integer([:positive, :monotonic])}"
   end

@@ -59,6 +59,26 @@ defmodule DurableServerTest do
     {supervisor_name, supervisor_pid, prefix}
   end
 
+  defp await_lookup(supervisor_name, key, timeout_ms \\ 2_000) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_lookup(supervisor_name, key, deadline_ms)
+  end
+
+  defp do_await_lookup(supervisor_name, key, deadline_ms) do
+    case DurableServer.Supervisor.lookup(supervisor_name, key) do
+      {pid, meta} ->
+        {:ok, {pid, meta}}
+
+      nil ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          :timeout
+        else
+          Process.sleep(25)
+          do_await_lookup(supervisor_name, key, deadline_ms)
+        end
+    end
+  end
+
   # Test implementation modules
   defmodule RejectingStartupSyncBackend do
     @behaviour DurableServer.StorageBackend
@@ -625,6 +645,35 @@ defmodule DurableServerTest do
                  supervisor_name,
                  {TestServer, %{key: key}},
                  existing: true
+               )
+
+      assert Process.alive?(pid2)
+      assert pid2 != pid
+    end
+
+    test "ensure_started_child accepts internal restart init arg shape", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      key = "existing-restart-shape-#{DurableServer.UUID.uuid4()}"
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(supervisor_name, {TestServer, %{key: key}})
+
+      GenServer.call(pid, :increment_and_sync)
+      ref = Process.monitor(pid)
+      GenServer.call(pid, :stop_normal)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+      {:ok, %{etag: etag} = body} =
+        DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix})
+
+      assert {:ok, {pid2, _meta}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 supervisor_name,
+                 {TestServer, {:restart, %{key: key, body: body, etag: etag}}},
+                 local_only: true
                )
 
       assert Process.alive?(pid2)
@@ -1644,6 +1693,97 @@ defmodule DurableServerTest do
 
       send(blocked_pid, :continue_init)
       assert {:ok, {^blocked_pid, _meta}} = Task.await(blocked_task, 2_000)
+    end
+
+    test "start_child returns timeout for blocked bootstrap without exiting caller", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      blocked_key = "blocked-timeout-#{DurableServer.UUID.uuid4()}"
+      dynamic_supervisor = DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
+
+      before_children =
+        dynamic_supervisor
+        |> DynamicSupervisor.which_children()
+        |> Enum.map(&elem(&1, 1))
+        |> MapSet.new()
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          DurableServer.Supervisor.start_child(
+            supervisor_name,
+            {DurableServerTest.BlockingInitServer, %{key: blocked_key, block_on_init: true}},
+            timeout: 100
+          )
+        end)
+
+      assert {:error, :timeout} = result
+      assert div(elapsed_us, 1000) < 1_000
+
+      blocked_children =
+        dynamic_supervisor
+        |> DynamicSupervisor.which_children()
+        |> Enum.map(&elem(&1, 1))
+        |> MapSet.new()
+        |> MapSet.difference(before_children)
+        |> MapSet.to_list()
+
+      assert [blocked_pid] = blocked_children
+      assert Process.alive?(blocked_pid)
+
+      send(blocked_pid, :continue_init)
+
+      assert {:ok, {^blocked_pid, _meta}} = await_lookup(supervisor_name, blocked_key)
+
+      ref = Process.monitor(blocked_pid)
+      assert :ok = DurableServer.Supervisor.terminate_child(supervisor_name, blocked_pid)
+      assert_receive {:DOWN, ^ref, :process, ^blocked_pid, _reason}, 2_000
+    end
+
+    test "ensure_started_child returns timeout for blocked bootstrap without exiting caller", %{
+      supervisor_name: supervisor_name,
+      prefix: _prefix
+    } do
+      blocked_key = "ensure-timeout-#{DurableServer.UUID.uuid4()}"
+      dynamic_supervisor = DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
+
+      before_children =
+        dynamic_supervisor
+        |> DynamicSupervisor.which_children()
+        |> Enum.map(&elem(&1, 1))
+        |> MapSet.new()
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          DurableServer.Supervisor.ensure_started_child(
+            supervisor_name,
+            {DurableServerTest.BlockingInitServer, %{key: blocked_key, block_on_init: true}},
+            local_only: true,
+            timeout: 100
+          )
+        end)
+
+      assert {:error, :timeout} = result
+      assert div(elapsed_us, 1000) < 1_000
+
+      blocked_children =
+        dynamic_supervisor
+        |> DynamicSupervisor.which_children()
+        |> Enum.map(&elem(&1, 1))
+        |> MapSet.new()
+        |> MapSet.difference(before_children)
+        |> MapSet.to_list()
+
+      assert [blocked_pid] = blocked_children
+      assert Process.alive?(blocked_pid)
+
+      send(blocked_pid, :continue_init)
+
+      assert {:ok, {^blocked_pid, _meta}} = await_lookup(supervisor_name, blocked_key)
+
+      ref = Process.monitor(blocked_pid)
+      assert :ok = DurableServer.Supervisor.terminate_child(supervisor_name, blocked_pid)
+      assert_receive {:DOWN, ^ref, :process, ^blocked_pid, _reason}, 2_000
     end
   end
 

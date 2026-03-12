@@ -772,6 +772,7 @@ defmodule DurableServer do
             bootstrapped: false,
             init_from_ref: nil,
             init_from_pid: nil,
+            init_reply_to: nil,
             status: nil,
             last_heartbeat_at: nil,
             vsn: nil,
@@ -920,12 +921,13 @@ defmodule DurableServer do
   @impl true
   def init(%{
         module: module,
-        init_from: {from_ref, from_pid} = init_from,
+        init_from: init_from,
         init_arg: init_state,
         supervisor_name: supervisor_name,
         config: config
       })
       when is_atom(supervisor_name) and is_map(config) do
+    {from_ref, from_pid, reply_to} = normalize_init_from(init_from)
     prefix = Map.fetch!(config, :prefix)
     circuit_breaker = Map.fetch!(config, :circuit_breaker)
     object_store = Map.fetch!(config, :storage_backend)
@@ -972,6 +974,7 @@ defmodule DurableServer do
       node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
       init_from_ref: from_ref,
       init_from_pid: from_pid,
+      init_reply_to: reply_to,
       sticky_placement_history_limit: sticky_placement_history_limit
     }
 
@@ -985,15 +988,15 @@ defmodule DurableServer do
     {:ok, state, {:continue, {@bootstrap_continue, bootstrap}}}
   end
 
-  defp handle_ignore(%DurableServer{} = state, {from_ref, from_pid} = _init_from) do
+  defp handle_ignore(%DurableServer{} = state, _init_from) do
     case sync_to_storage(state, meta: %{status: :stopped_graceful}) do
       {:ok, %DurableServer{} = _new_state} ->
-        send(from_pid, {from_ref, :ignore})
+        send(state.init_reply_to, {state.init_from_ref, :ignore})
         {:stop, {:shutdown, {@durable, :ignored}}, state}
 
       {:error, sync_reason} ->
         Logger.error("Failed to update status before :ignore: #{inspect(sync_reason)}")
-        send(from_pid, {from_ref, :ignore})
+        send(state.init_reply_to, {state.init_from_ref, :ignore})
         {:stop, {:shutdown, {@durable, :ignored}}, state}
     end
   end
@@ -1020,7 +1023,7 @@ defmodule DurableServer do
         new_state = %{schedule_sync(new_state) | bootstrapped: true}
 
         # send caller that called start_child our metadata
-        send(new_state.init_from_pid, {new_state.init_from_ref, new_state.user_meta})
+        send(new_state.init_reply_to, {new_state.init_from_ref, new_state.user_meta})
 
         if continue_or_timeout do
           {:noreply, new_state, continue_or_timeout}
@@ -1033,7 +1036,7 @@ defmodule DurableServer do
           "#{inspect(state.module)} (key=#{state.key}) failed to sync startup status :running: #{inspect(reason)}"
         )
 
-        send(state.init_from_pid, {state.init_from_ref, {:error, reason}})
+        send(state.init_reply_to, {state.init_from_ref, {:error, reason}})
         {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, state}
     end
   end
@@ -1069,9 +1072,10 @@ defmodule DurableServer do
          meta: meta,
          supervisor_name: supervisor_name,
          circuit_breake: circuit_breaker,
-         init_from: {init_from_ref, init_from_pid} = _init_from,
+         init_from: init_from,
          sticky_placement_history_limit: history_limit
        }) do
+    {init_from_ref, init_from_pid, init_reply_to} = normalize_init_from(init_from)
     config = module.__durable_server_config__()
 
     # Load existing placement history from meta, or start with empty list for new servers
@@ -1105,6 +1109,7 @@ defmodule DurableServer do
       node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
       init_from_ref: init_from_ref,
       init_from_pid: init_from_pid,
+      init_reply_to: init_reply_to,
       sticky_placement_history: sticky_placement_history,
       sticky_placement_history_limit: history_limit
     }
@@ -1591,6 +1596,7 @@ defmodule DurableServer do
            circuit_breaker: circuit_breaker,
            init_from_ref: from_ref,
            init_from_pid: from_pid,
+           init_reply_to: reply_to,
            sticky_placement_history_limit: sticky_placement_history_limit
          } = state,
          %{
@@ -1647,7 +1653,7 @@ defmodule DurableServer do
               "Refusing to restart permanently crashed server (same caller, automatic restart): #{key}"
             )
 
-            send(from_pid, {from_ref, {:error, :permanently_crashed}})
+            send(reply_to, {from_ref, {:error, :permanently_crashed}})
             {:stop, {:shutdown, {@durable, {:init_failed, :permanently_crashed}}}, state}
           else
             case aquire_init_lock(%{
@@ -1702,20 +1708,20 @@ defmodule DurableServer do
 
                   other ->
                     Logger.error("Invalid init return from #{module}: #{inspect(other)}")
-                    send(from_pid, {from_ref, {:error, {:bad_init_return, other}}})
+                    send(reply_to, {from_ref, {:error, {:bad_init_return, other}}})
 
                     {:stop, {:shutdown, {@durable, {:init_failed, {:bad_init_return, other}}}},
                      state}
                 end
 
               {:error, reason} ->
-                send(from_pid, {from_ref, {:error, reason}})
+                send(reply_to, {from_ref, {:error, reason}})
                 {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, state}
             end
           end
 
         {:error, reason} ->
-          send(from_pid, {from_ref, {:error, reason}})
+          send(reply_to, {from_ref, {:error, reason}})
           {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, state}
       end
     else
@@ -1724,16 +1730,26 @@ defmodule DurableServer do
           "global lock circuit breaker open for #{cooldown_ms}ms, refusing lock acquisition for #{inspect(key)}"
         )
 
-        send(from_pid, {from_ref, {:error, {:circuit_open, :network_partition}}})
+        send(reply_to, {from_ref, {:error, {:circuit_open, :network_partition}}})
 
         {:stop, {:shutdown, {@durable, {:init_failed, {:circuit_open, :network_partition}}}},
          state}
 
       {:error, {:limit_reached, reason, details}} ->
         log_capacity_limit(reason, details, supervisor_name, module)
-        send(from_pid, {from_ref, {:error, {:capacity_limit, reason}}})
+        send(reply_to, {from_ref, {:error, {:capacity_limit, reason}}})
         {:stop, {:shutdown, {@durable, {:init_failed, {:capacity_limit, reason}}}}, state}
     end
+  end
+
+  defp normalize_init_from({from_ref, from_pid, reply_to})
+       when is_reference(from_ref) and is_pid(from_pid) do
+    {from_ref, from_pid, reply_to}
+  end
+
+  defp normalize_init_from({from_ref, from_pid})
+       when is_reference(from_ref) and is_pid(from_pid) do
+    {from_ref, from_pid, from_pid}
   end
 
   # user-initiated termination

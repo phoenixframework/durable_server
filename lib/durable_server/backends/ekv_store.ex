@@ -446,14 +446,12 @@ defmodule DurableServer.Backends.EKVStore do
   end
 
   defp do_put_latest(state, key, encoded_data, data, retries, timeout, attempt) do
-    expected_vsn = current_vsn(state, key)
-
-    case ekv_put(state.name, key, encoded_data,
-           if_vsn: expected_vsn,
+    case ekv_update(state.name, key, {__MODULE__, :put_latest_update, [encoded_data]},
            timeout: timeout,
+           retries: 0,
            resolve_unconfirmed: true
          ) do
-      {:ok, vsn} ->
+      {:ok, _new_value, vsn} ->
         {:ok, %{etag: encode_vsn(vsn), body: data}}
 
       {:error, :conflict} when attempt < retries ->
@@ -475,6 +473,9 @@ defmodule DurableServer.Backends.EKVStore do
         {:error, reason}
     end
   end
+
+  @doc false
+  def put_latest_update(_current_value, encoded_data), do: encoded_data
 
   defp current_vsn(state, key) do
     case ekv_lookup(state.name, key) do
@@ -661,6 +662,7 @@ defmodule DurableServer.Backends.EKVStore do
   defp ekv_keys(name, prefix), do: apply(ekv_mod(), :keys, [name, prefix])
   defp ekv_lookup(name, key), do: apply(ekv_mod(), :lookup, [name, key])
   defp ekv_put(name, key, value, opts), do: apply(ekv_mod(), :put, [name, key, value, opts])
+  defp ekv_update(name, key, fun, opts), do: apply(ekv_mod(), :update, [name, key, fun, opts])
   defp ekv_get(name, key, opts), do: apply(ekv_mod(), :get, [name, key, opts])
   defp ekv_delete(name, key, opts), do: apply(ekv_mod(), :delete, [name, key, opts])
   defp ekv_subscribe(name, prefix), do: apply(ekv_mod(), :subscribe, [name, prefix])
