@@ -358,6 +358,7 @@ defmodule Group do
 
   def register(name, key, meta, opts)
       when is_atom(name) and is_binary(key) and is_map(meta) and is_list(opts) do
+    validate_key!(key)
     cluster = Keyword.get(opts, :cluster)
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
@@ -390,6 +391,7 @@ defmodule Group do
 
   def unregister(name, key, opts)
       when is_atom(name) and is_binary(key) and is_list(opts) do
+    validate_key!(key)
     cluster = Keyword.get(opts, :cluster)
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
@@ -540,6 +542,7 @@ defmodule Group do
   def join(name, group, meta, opts)
       when is_atom(name) and is_binary(group) and is_map(meta) and
              is_list(opts) do
+    validate_key!(group)
     cluster = Keyword.get(opts, :cluster)
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
@@ -569,6 +572,7 @@ defmodule Group do
 
   def leave(name, group, opts)
       when is_atom(name) and is_binary(group) and is_list(opts) do
+    validate_key!(group)
     cluster = Keyword.get(opts, :cluster)
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
@@ -593,7 +597,7 @@ defmodule Group do
   ## Parameters
 
   - `name` - The Group name
-  - `group` - The group to query (string). Trailing `"/"` triggers prefix match.
+  - `group` - The group to query (string). Append `"/"` for prefix matching.
   - `opts` - Keyword list of options
 
   ## Options
@@ -614,18 +618,24 @@ defmodule Group do
     num_shards = get_config(name).num_shards
 
     if String.ends_with?(group, "/") do
-      # Prefix query — scan all shards
-      Enum.flat_map(0..(num_shards - 1), fn shard ->
-        Data.pg_members_by_prefix(name, shard, cluster, group)
-        |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
-      end)
+      members_by_prefix(name, num_shards, cluster, group, extract_meta_fn)
     else
-      # Exact match — single shard
-      shard = Replica.shard_index_for(cluster, group, num_shards)
-
-      Data.pg_members(name, shard, cluster, group)
-      |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
+      members_exact(name, num_shards, cluster, group, extract_meta_fn)
     end
+  end
+
+  defp members_exact(name, num_shards, cluster, group, extract_meta_fn) do
+    shard = Replica.shard_index_for(cluster, group, num_shards)
+
+    Data.pg_members(name, shard, cluster, group)
+    |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
+  end
+
+  defp members_by_prefix(name, num_shards, cluster, prefix, extract_meta_fn) do
+    Enum.flat_map(0..(num_shards - 1), fn shard ->
+      Data.pg_members_by_prefix(name, shard, cluster, prefix)
+      |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
+    end)
   end
 
   @doc """
@@ -829,6 +839,13 @@ defmodule Group do
   # ===========================================================================
   # Internal
   # ===========================================================================
+
+  defp validate_key!(key) do
+    if String.ends_with?(key, "/") do
+      raise ArgumentError,
+            "key #{inspect(key)} must not end with \"/\" — trailing slash is reserved for prefix queries"
+    end
+  end
 
   defp validate_cluster_connected!(_name, nil), do: :ok
 

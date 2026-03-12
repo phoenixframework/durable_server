@@ -261,7 +261,17 @@ defmodule GroupTest do
       assert Group.members(name, "nonexistent/key") == []
     end
 
-    test "does not include registered processes", %{name: name} do
+    test "does not return registered processes", %{name: name} do
+      key = "registered/#{System.unique_integer([:positive])}"
+
+      :ok = Group.register(name, key, %{type: :server})
+
+      assert Group.members(name, key) == []
+    end
+
+    test "returns only joined processes when both registered and joined entries exist", %{
+      name: name
+    } do
       key = "both/#{System.unique_integer([:positive])}"
 
       :ok = Group.register(name, key, %{type: :server})
@@ -282,73 +292,155 @@ defmodule GroupTest do
       end
 
       members = Group.members(name, key)
-      assert length(members) == 1
-      assert {^joiner, %{type: :client}} = hd(members)
+      assert [{^joiner, %{type: :client}}] = members
+    end
+  end
+
+  describe "prefix members" do
+    test "returns joined processes matching prefix", %{name: name} do
+      prefix = "room/#{System.unique_integer([:positive])}/"
+      key1 = prefix <> "a"
+      key2 = prefix <> "b"
+      other_key = "other/key"
+
+      :ok = Group.join(name, key1, %{id: 1})
+      :ok = Group.join(name, key2, %{id: 2})
+      :ok = Group.join(name, other_key, %{id: 3})
+
+      members = Group.members(name, prefix)
+      assert length(members) == 2
+      metas = Enum.map(members, fn {_pid, meta} -> meta end) |> Enum.sort_by(& &1.id)
+      assert metas == [%{id: 1}, %{id: 2}]
     end
 
-    test "prefix query returns matching PG members across shards", %{name: name} do
+    test "does not return registered processes matching prefix", %{name: name} do
+      prefix = "user/#{System.unique_integer([:positive])}/"
+      key1 = prefix <> "alice"
+      key2 = prefix <> "bob"
+      other_key = "other/reg"
+
       test_pid = self()
 
-      pids =
-        for i <- 1..5 do
+      for {key, meta} <- [
+            {key1, %{name: "alice"}},
+            {key2, %{name: "bob"}},
+            {other_key, %{name: "other"}}
+          ] do
+        pid =
           spawn(fn ->
-            :ok = Group.join(name, "room/1/user/#{i}", %{i: i})
-            send(test_pid, {:joined, self()})
+            :ok = Group.register(name, key, meta)
+            send(test_pid, {:registered, self()})
             Process.sleep(:infinity)
           end)
+
+        receive do
+          {:registered, ^pid} -> pid
+        after
+          1000 -> flunk("register timed out")
         end
 
-      for _ <- 1..5 do
-        receive do
-          {:joined, _} -> :ok
-        after
-          1000 -> flunk("timeout")
-        end
+        pid
       end
 
-      # Also join a non-matching key
-      spawn(fn ->
-        :ok = Group.join(name, "room/2/user/1", %{i: 99})
-        send(test_pid, {:joined, self()})
-        Process.sleep(:infinity)
-      end)
+      assert Group.members(name, prefix) == []
+    end
+
+    test "returns only joined processes matching prefix", %{name: name} do
+      prefix = "mixed/#{System.unique_integer([:positive])}/"
+      reg_key = prefix <> "server"
+      join_key = prefix <> "client"
+
+      test_pid = self()
+
+      reg_pid =
+        spawn(fn ->
+          :ok = Group.register(name, reg_key, %{type: :server})
+          send(test_pid, {:registered, self()})
+          Process.sleep(:infinity)
+        end)
 
       receive do
-        {:joined, _} -> :ok
+        {:registered, ^reg_pid} -> :ok
       after
-        1000 -> flunk("timeout")
+        1000 -> flunk("register timed out")
       end
 
-      members = Group.members(name, "room/1/")
-      assert length(members) == 5
-      member_pids = Enum.map(members, &elem(&1, 0)) |> Enum.sort()
-      assert member_pids == Enum.sort(pids)
+      :ok = Group.join(name, join_key, %{type: :client})
+
+      members = Group.members(name, prefix)
+      assert [{_, %{type: :client}}] = members
     end
 
-    test "prefix query returns empty list when no matches", %{name: name} do
-      assert Group.members(name, "no/match/") == []
+    test "returns empty list for prefix with no matches", %{name: name} do
+      assert Group.members(name, "nonexistent/prefix/") == []
     end
 
-    test "prefix query works with cluster option", %{name: name} do
-      cluster = "prefix_cluster"
+    test "exact key lookup still works (no trailing slash)", %{name: name} do
+      key = "exact/#{System.unique_integer([:positive])}"
+      :ok = Group.join(name, key, %{exact: true})
+
+      members = Group.members(name, key)
+      assert length(members) == 1
+    end
+
+    test "prefix works with named clusters", %{name: name} do
+      cluster = "game_#{System.unique_integer([:positive])}"
+      prefix = "room/#{System.unique_integer([:positive])}/"
+
       :ok = Group.connect(name, cluster)
 
-      :ok = Group.join(name, "ns/a", %{v: 1}, cluster: cluster)
-      :ok = Group.join(name, "ns/b", %{v: 2}, cluster: cluster)
-      # Join default cluster — should not appear
-      :ok = Group.join(name, "ns/c", %{v: 3})
+      # Join in named cluster
+      :ok = Group.join(name, prefix <> "a", %{cluster: :named}, cluster: cluster)
+      # Join in default cluster (same prefix)
+      :ok = Group.join(name, prefix <> "b", %{cluster: :default})
 
-      members = Group.members(name, "ns/", cluster: cluster)
-      assert length(members) == 2
-      metas = Enum.map(members, &elem(&1, 1)) |> Enum.sort_by(& &1.v)
-      assert metas == [%{v: 1}, %{v: 2}]
+      named_members = Group.members(name, prefix, cluster: cluster)
+      assert length(named_members) == 1
+      assert [{_, %{cluster: :named}}] = named_members
+
+      default_members = Group.members(name, prefix)
+      assert length(default_members) == 1
+      assert [{_, %{cluster: :default}}] = default_members
     end
 
-    test "prefix query works with extract_meta option", %{name: name} do
-      :ok = Group.join(name, "em/a", %{secret: 1, public: :yes})
+    test "prefix finds keys across different shards", %{name: name} do
+      # Use enough keys that they're likely to hash to different shards (4 shards in test)
+      prefix = "shard_spread/#{System.unique_integer([:positive])}/"
 
-      members = Group.members(name, "em/", extract_meta: &Map.take(&1, [:public]))
-      assert [{_, %{public: :yes}}] = members
+      for i <- 1..20 do
+        :ok = Group.join(name, prefix <> "item_#{i}", %{i: i})
+      end
+
+      members = Group.members(name, prefix)
+      assert length(members) == 20
+
+      # Verify all items present
+      found_ids = Enum.map(members, fn {_pid, meta} -> meta.i end) |> Enum.sort()
+      assert found_ids == Enum.to_list(1..20)
+    end
+
+    test "register raises on key ending with /", %{name: name} do
+      assert_raise ArgumentError, ~r/must not end with/, fn ->
+        Group.register(name, "bad/key/", %{})
+      end
+    end
+
+    test "join raises on key ending with /", %{name: name} do
+      assert_raise ArgumentError, ~r/must not end with/, fn ->
+        Group.join(name, "bad/key/", %{})
+      end
+    end
+
+    test "unregister raises on key ending with /", %{name: name} do
+      assert_raise ArgumentError, ~r/must not end with/, fn ->
+        Group.unregister(name, "bad/key/")
+      end
+    end
+
+    test "leave raises on key ending with /", %{name: name} do
+      assert_raise ArgumentError, ~r/must not end with/, fn ->
+        Group.leave(name, "bad/key/")
+      end
     end
   end
 
@@ -395,6 +487,22 @@ defmodule GroupTest do
 
       # Should only receive one event (not duplicated)
       assert_receive {:group, [%Group.Event{type: :joined, pid: ^pid}], _}, 1000
+      refute_receive {:group, _, _}, 100
+    end
+
+    test "overlapping subscriptions still deliver one event", %{name: name} do
+      scope = "sprite_channels/#{System.unique_integer([:positive])}"
+      key = "#{scope}/state"
+
+      :ok = Group.monitor(name, :all)
+      :ok = Group.monitor(name, key)
+      :ok = Group.monitor(name, "sprite_channels/")
+      :ok = Group.monitor(name, "#{scope}/")
+
+      :ok = Group.join(name, key, %{v: 1})
+
+      assert_receive {:group, [%Group.Event{type: :joined, key: ^key} = event], _}, 1000
+      assert event.pid == self()
       refute_receive {:group, _, _}, 100
     end
 

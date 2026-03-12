@@ -14,7 +14,6 @@ defmodule GroupBench.Local do
 
     bench_lookup()
     bench_members()
-    bench_members_prefix()
     bench_register_shards()
     bench_register_unregister_cycle()
     bench_join_shards()
@@ -87,82 +86,6 @@ defmodule GroupBench.Local do
           end)
 
         report_latency("Group.members/3", samples)
-      end)
-    end
-  end
-
-  # ── 2b. members prefix throughput ────────────────────────────────────
-
-  defp bench_members_prefix do
-    header("2b. Members Prefix Throughput")
-
-    for {cluster_label, cluster_opt} <- clusters() do
-      subheader("cluster: #{cluster_label}")
-
-      with_group([name: @name, shards: @default_shards], fn ->
-        maybe_connect_cluster(cluster_opt)
-        opts = cluster_opts(cluster_opt)
-
-        # 50 rooms × 20 members = 1,000 memberships
-        # Keys: "room/{room_id}/user/{user_id}"
-        rooms = 50
-        members_per_room = 20
-        total = rooms * members_per_room
-        measure_count = 50_000
-
-        register_from_spawned_processes(total, fn i ->
-          room = rem(i - 1, rooms) + 1
-          user = div(i - 1, rooms) + 1
-          Group.join(@name, "room/#{room}/user/#{user}", %{room: room, user: user}, opts)
-        end)
-
-        # Also add some non-matching keys to verify selectivity
-        register_from_spawned_processes(200, fn i ->
-          Group.join(@name, "other/#{i}", %{}, opts)
-        end)
-
-        # -- exact match baseline --
-        warmup(1_000, fn -> Group.members(@name, "room/1/user/1", opts) end)
-
-        exact_samples =
-          collect_samples(measure_count, fn ->
-            r = :rand.uniform(rooms)
-            u = :rand.uniform(members_per_room)
-            Group.members(@name, "room/#{r}/user/#{u}", opts)
-          end)
-
-        report_latency("exact match (1 member)", exact_samples)
-
-        # -- prefix: single room (20 members) --
-        warmup(1_000, fn -> Group.members(@name, "room/1/", opts) end)
-
-        prefix_room_samples =
-          collect_samples(measure_count, fn ->
-            r = :rand.uniform(rooms)
-            Group.members(@name, "room/#{r}/", opts)
-          end)
-
-        report_latency("prefix \"room/{n}/\" (#{members_per_room} members)", prefix_room_samples)
-
-        # -- prefix: all rooms (1,000 members) --
-        warmup(100, fn -> Group.members(@name, "room/", opts) end)
-
-        prefix_all_samples =
-          collect_samples(10_000, fn ->
-            Group.members(@name, "room/", opts)
-          end)
-
-        report_latency("prefix \"room/\" (#{total} members)", prefix_all_samples)
-
-        # -- prefix: no matches --
-        warmup(1_000, fn -> Group.members(@name, "zzz/", opts) end)
-
-        prefix_empty_samples =
-          collect_samples(measure_count, fn ->
-            Group.members(@name, "zzz/", opts)
-          end)
-
-        report_latency("prefix \"zzz/\" (0 members)", prefix_empty_samples)
       end)
     end
   end

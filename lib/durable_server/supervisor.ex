@@ -786,7 +786,7 @@ defmodule DurableServer.Supervisor do
   defp deadline_after_optional_timeout(:infinity), do: nil
 
   defp deadline_after_optional_timeout(timeout_ms)
-       when is_integer(timeout_ms) and timeout_ms > 0 do
+       when is_integer(timeout_ms) and timeout_ms >= 0 do
     System.monotonic_time(:millisecond) + timeout_ms
   end
 

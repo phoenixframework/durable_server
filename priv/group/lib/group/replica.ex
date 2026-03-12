@@ -325,10 +325,11 @@ defmodule Group.Replica do
     subscriber containing all matching events from that handler turn.
 
   Events are built by `build_event/6`, accumulated in reverse via prepend, and
-  flushed by `notify_monitors/2` which reverses once, groups by cluster, matches
-  against subscriber patterns (`:all`, `{:prefix, _}`, `{:exact, _}`), and sends
-  one `{:group, events, %{name: name}}` per subscriber. Both functions are private
-  to this module.
+  flushed by `notify_monitors/2` which reverses once, resolves only the monitor
+  keys that can match each event (`:all`, `{:exact, key}`, and the key's
+  slash-terminated prefixes), caches those lookups per batch, and sends one
+  `{:group, events, %{name: name}}` per subscriber. Both functions are private to
+  this module.
 
   `resolve_conflict/5` returns `{state, event_or_nil}` so callers can accumulate
   the event. `merge_remote_cluster_data/5` threads `{state, events}` through its
@@ -1574,24 +1575,19 @@ defmodule Group.Replica do
   defp notify_monitors(_name, []), do: :ok
 
   defp notify_monitors(name, events) do
-    events = Enum.reverse(events)
-    events_by_cluster = Enum.group_by(events, & &1.cluster)
+    {subscriber_events, _cache_by_cluster} =
+      Enum.reduce(Enum.reverse(events), {%{}, %{}}, fn event, {acc, cache_by_cluster} ->
+        cluster_cache = Map.get(cache_by_cluster, event.cluster, %{})
 
-    subscriber_events =
-      Enum.reduce(events_by_cluster, %{}, fn {cluster, cluster_events}, acc ->
-        subs = get_subscribers_with_patterns(name, cluster)
+        {matching_pids, cluster_cache} =
+          matching_subscribers(name, event.cluster, event.key, cluster_cache)
 
-        Enum.reduce(cluster_events, acc, fn event, inner ->
-          matching_pids =
-            for {pattern, sub_pid} <- subs,
-                matches_pattern?(pattern, event.key),
-                uniq: true,
-                do: sub_pid
-
-          Enum.reduce(matching_pids, inner, fn sub_pid, acc ->
-            Map.update(acc, sub_pid, [event], &[event | &1])
+        acc =
+          Enum.reduce(matching_pids, acc, fn sub_pid, inner ->
+            Map.update(inner, sub_pid, [event], &[event | &1])
           end)
-        end)
+
+        {acc, Map.put(cache_by_cluster, event.cluster, cluster_cache)}
       end)
 
     for {sub_pid, sub_events} <- subscriber_events do
@@ -1601,22 +1597,54 @@ defmodule Group.Replica do
     :ok
   end
 
-  defp matches_pattern?(:all, _key), do: true
-  defp matches_pattern?({:exact, pattern}, key), do: pattern == key
-  defp matches_pattern?({:prefix, prefix}, key), do: String.starts_with?(key, prefix)
+  defp matching_subscribers(name, cluster, key, cache) do
+    {all_subscribers, cache} = get_cached_subscribers(name, cluster, :all, cache)
+    {exact_subscribers, cache} = get_cached_subscribers(name, cluster, {:exact, key}, cache)
 
-  defp get_subscribers_with_patterns(name, cluster) do
+    subscriber_set =
+      %{}
+      |> put_subscribers(all_subscribers)
+      |> put_subscribers(exact_subscribers)
+
+    {subscriber_set, cache} =
+      Enum.reduce(prefix_patterns_for_key(key), {subscriber_set, cache}, fn prefix,
+                                                                            {acc, inner_cache} ->
+        {prefix_subscribers, inner_cache} =
+          get_cached_subscribers(name, cluster, {:prefix, prefix}, inner_cache)
+
+        {put_subscribers(acc, prefix_subscribers), inner_cache}
+      end)
+
+    {Map.keys(subscriber_set), cache}
+  end
+
+  defp get_cached_subscribers(name, cluster, pattern, cache) do
+    case cache do
+      %{^pattern => subscribers} ->
+        {subscribers, cache}
+
+      %{} ->
+        subscribers = lookup_subscribers(name, cluster, pattern)
+        {subscribers, Map.put(cache, pattern, subscribers)}
+    end
+  end
+
+  defp lookup_subscribers(name, cluster, pattern) do
     Group.registry_name(name)
-    |> Registry.select([
-      {
-        {{:"$1", :"$2", :"$3"}, :"$4", :_},
-        [{:andalso, {:==, :"$1", name}, {:==, :"$2", cluster}}],
-        [{{:"$3", :"$4"}}]
-      }
-    ])
-    |> Enum.uniq()
+    |> Registry.lookup({name, cluster, pattern})
+    |> Enum.map(fn {pid, _value} -> pid end)
   rescue
     ArgumentError -> []
+  end
+
+  defp put_subscribers(acc, subscribers) do
+    Enum.reduce(subscribers, acc, fn subscriber, inner -> Map.put(inner, subscriber, true) end)
+  end
+
+  defp prefix_patterns_for_key(key) do
+    for {position, _length} <- :binary.matches(key, "/") do
+      binary_part(key, 0, position + 1)
+    end
   end
 
   # =====================================================================

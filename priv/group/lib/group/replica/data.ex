@@ -172,6 +172,16 @@ defmodule Group.Replica.Data do
     ])
   end
 
+  def registry_lookup_by_prefix(name, shard, cluster, prefix) do
+    table = reg_by_key_table(name, shard)
+    prefix_end = next_binary_prefix(prefix)
+
+    :ets.select(table, [
+      {{{cluster, :"$1"}, :"$2", :"$3", :_, :_},
+       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [{{:"$2", :"$3"}}]}
+    ])
+  end
+
   # =====================================================================
   # Process group operations
   # =====================================================================
@@ -214,23 +224,6 @@ defmodule Group.Replica.Data do
     :ets.select(table, match_spec)
   end
 
-  def pg_members_by_prefix(name, shard, cluster, prefix) do
-    table = pg_by_key_table(name, shard)
-    next = next_binary_prefix(prefix)
-
-    :ets.select(table, [
-      {{{cluster, :"$1", :"$2"}, :"$3", :_, :_},
-       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", next}}],
-       [{{:"$2", :"$3"}}]}
-    ])
-  end
-
-  defp next_binary_prefix(prefix) do
-    size = byte_size(prefix) - 1
-    <<head::binary-size(size), last_byte>> = prefix
-    <<head::binary, last_byte + 1>>
-  end
-
   def pg_members_with_node(name, shard, cluster, key) do
     table = pg_by_key_table(name, shard)
 
@@ -239,6 +232,16 @@ defmodule Group.Replica.Data do
     ]
 
     :ets.select(table, match_spec)
+  end
+
+  def pg_members_by_prefix(name, shard, cluster, prefix) do
+    table = pg_by_key_table(name, shard)
+    prefix_end = next_binary_prefix(prefix)
+
+    :ets.select(table, [
+      {{{cluster, :"$1", :"$2"}, :"$3", :_, :_},
+       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [{{:"$2", :"$3"}}]}
+    ])
   end
 
   def pg_members_local(name, shard, cluster, key) do
@@ -483,6 +486,16 @@ defmodule Group.Replica.Data do
 
     :ets.delete(reverse, dead_node)
     :ok
+  end
+
+  # =====================================================================
+  # Helpers
+  # =====================================================================
+
+  defp next_binary_prefix(prefix) do
+    size = byte_size(prefix) - 1
+    <<head::binary-size(size), last_byte>> = prefix
+    <<head::binary, last_byte + 1>>
   end
 
   # =====================================================================

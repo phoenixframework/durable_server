@@ -3077,6 +3077,106 @@ defmodule Group.DistributedTest do
     end
   end
 
+  describe "prefix members across nodes" do
+    test "prefix query excludes registrations from all nodes" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"prefix_dist_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      # Each node registers under a different "regional_index/<region>" key
+      TestCluster.spawn_register(node_a, name, "regional_index/iad", %{region: "iad"})
+      TestCluster.spawn_register(node_b, name, "regional_index/ord", %{region: "ord"})
+
+      # Wait for replication — exact lookups work on both nodes
+      for node <- [node_a, node_b], key <- ["regional_index/iad", "regional_index/ord"] do
+        TestCluster.assert_eventually(fn ->
+          TestCluster.rpc!(node, Group, :lookup, [name, key]) != nil
+        end)
+      end
+
+      # Prefix query from node_a should ignore registrations
+      members_a = TestCluster.rpc!(node_a, Group, :members, [name, "regional_index/"])
+      assert members_a == []
+
+      # Prefix query from node_b should also ignore registrations
+      members_b = TestCluster.rpc!(node_b, Group, :members, [name, "regional_index/"])
+      assert members_b == []
+    end
+
+    test "prefix query finds PG joins from all nodes" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"prefix_pg_dist_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      # Each node joins under a different "room/<id>" key
+      pid_a = TestCluster.spawn_join(node_a, name, "room/1", %{node: :a})
+      pid_b = TestCluster.spawn_join(node_b, name, "room/2", %{node: :b})
+
+      # Wait for replication
+      for node <- [node_a, node_b], key <- ["room/1", "room/2"] do
+        TestCluster.assert_eventually(fn ->
+          TestCluster.rpc!(node, Group, :members, [name, key]) != []
+        end)
+      end
+
+      # Prefix query from node_a should find both joins
+      members_a = TestCluster.rpc!(node_a, Group, :members, [name, "room/"])
+      assert length(members_a) == 2
+      pids = Enum.map(members_a, &elem(&1, 0)) |> Enum.sort()
+      assert Enum.sort([pid_a, pid_b]) == pids
+    end
+
+    test "prefix query finds only joins in mixed registration/join data" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"prefix_mixed_dist_#{System.unique_integer([:positive])}"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      # Node A registers, node B joins — different keys under same prefix
+      TestCluster.spawn_register(node_a, name, "svc/alpha", %{type: :reg})
+      TestCluster.spawn_join(node_b, name, "svc/beta", %{type: :pg})
+
+      # Wait for replication
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "svc/alpha"]) != nil
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :members, [name, "svc/beta"]) != []
+      end)
+
+      # Prefix query should find only the join
+      members = TestCluster.rpc!(node_a, Group, :members, [name, "svc/"])
+      assert [{_, %{type: :pg}}] = members
+    end
+  end
+
   # Helpers for event assertion tests
 
   defp flush_events do

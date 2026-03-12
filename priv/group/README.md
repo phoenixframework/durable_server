@@ -60,7 +60,14 @@ members = Group.members(:my_app, "chat/room/42")
 :ok = Group.leave(:my_app, "chat/room/42")
 ```
 
-`members/2` returns both registered processes and joined processes for a key.
+`members/2` returns joined processes for a key. Registered processes are not
+included — use `lookup/2` for those.
+Keys ending with `"/"` perform a prefix query across all shards:
+
+```elixir
+# All members in rooms under "chat/"
+Group.members(:my_app, "chat/")
+```
 
 ### Monitoring
 
