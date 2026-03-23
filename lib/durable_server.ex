@@ -1036,8 +1036,21 @@ defmodule DurableServer do
           "#{inspect(state.module)} (key=#{state.key}) failed to sync startup status :running: #{inspect(reason)}"
         )
 
-        send(state.init_reply_to, {state.init_from_ref, {:error, reason}})
-        {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, state}
+        case repair_failed_boot_storage(new_state) do
+          :ok ->
+            :ok
+
+          :noop ->
+            :ok
+
+          {:error, cleanup_reason} ->
+            Logger.warning(
+              "#{inspect(state.module)} (key=#{state.key}) failed to repair startup state after sync failure: #{inspect(cleanup_reason)}"
+            )
+        end
+
+        send(new_state.init_reply_to, {new_state.init_from_ref, {:error, reason}})
+        {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, new_state}
     end
   end
 
@@ -1046,7 +1059,8 @@ defmodule DurableServer do
   defp fetch_existing_state_raw(
          %StorageBackend{} = store,
          %{key: key, prefix: prefix},
-         init_state \\ nil
+         init_state,
+         opts
        ) do
     case init_state do
       {:restart, %{body: %StoredState{} = stored_state, etag: etag}} ->
@@ -1054,10 +1068,40 @@ defmodule DurableServer do
          attach_stored_state_context(%{stored_state | etag: etag}, %{key: key, prefix: prefix})}
 
       _ ->
-        case fetch_stored_state(store, %{key: key, prefix: prefix}) do
+        case fetch_stored_state(store, %{key: key, prefix: prefix}, opts) do
           {:ok, %StoredState{} = existing_raw_data} -> {:ok, existing_raw_data}
           {:error, _reason} -> :error
         end
+    end
+  end
+
+  defp load_fresh_init_state(module, init_state, object_store) do
+    with dumped_init_state <-
+           init_state
+           |> module.dump_state()
+           |> validate_dumped_state!(module),
+         {:ok, encoded_init_state} <-
+           StorageBackend.encode(object_store, dumped_init_state),
+         {:ok, client_init_state} <-
+           StorageBackend.decode(object_store, encoded_init_state) do
+      loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
+      {:ok, {loaded_user_state, _old_vsn = nil, _etag = nil, _meta = nil}}
+    end
+  end
+
+  defp reread_expired_state(%StorageBackend{} = store, %{key: _key, prefix: _prefix} = request) do
+    case fetch_stored_state(store, request, consistent: true) do
+      {:ok, %StoredState{meta: %Meta{} = meta} = stored_state} ->
+        case check_lock(meta) do
+          :expired -> {:ok, stored_state}
+          {:locked, lock_pid} -> {:error, {:already_started, lock_pid}}
+        end
+
+      {:error, :not_found} ->
+        :error
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1149,7 +1193,7 @@ defmodule DurableServer do
       }
     }
 
-    case StorageBackend.get_object(store, storage_key) do
+    case StorageBackend.get_object(store, storage_key, consistent: true) do
       # object already deleted, so we proceed as normal
       {:error, :not_found} ->
         :ok
@@ -1433,7 +1477,7 @@ defmodule DurableServer do
   end
 
   def get_server_metadata(%StorageBackend{} = store, %{key: key, prefix: prefix}) do
-    case fetch_stored_state(store, %{key: key, prefix: prefix}) do
+    case fetch_stored_state(store, %{key: key, prefix: prefix}, consistent: true) do
       {:ok, %{meta: %Meta{} = meta}} ->
         {:ok, meta}
 
@@ -1609,32 +1653,44 @@ defmodule DurableServer do
     with :ok <- CircuitBreaker.check_global_lock_circuit_breaker(circuit_breaker),
          :ok <- LifecycleManager.check_capacity(supervisor_name, module, capacity_opts) do
       load_result =
-        case fetch_existing_state_raw(object_store, %{key: key, prefix: prefix}, init_state) do
+        case fetch_existing_state_raw(
+               object_store,
+               %{key: key, prefix: prefix},
+               init_state,
+               consistent: false
+             ) do
           {:ok, %StoredState{} = existing} ->
-            %{meta: %Meta{} = meta, vsn: old_vsn, state: raw_existing_state, etag: etag} =
-              existing
+            %{meta: %Meta{} = meta} = existing
 
             case check_lock(meta) do
               {:locked, lock_pid} ->
                 {:error, {:already_started, lock_pid}}
 
               :expired ->
-                loaded_state = load_user_state(module, old_vsn, raw_existing_state)
-                {:ok, {loaded_state, old_vsn, etag, meta}}
+                case reread_expired_state(object_store, %{key: key, prefix: prefix}) do
+                  {:ok,
+                   %StoredState{
+                     meta: %Meta{} = current_meta,
+                     vsn: current_vsn,
+                     state: current_raw_state,
+                     etag: current_etag
+                   }} ->
+                    loaded_state = load_user_state(module, current_vsn, current_raw_state)
+                    {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
+
+                  {:error, {:already_started, lock_pid}} ->
+                    {:error, {:already_started, lock_pid}}
+
+                  :error ->
+                    load_fresh_init_state(module, init_state, object_store)
+
+                  {:error, reason} ->
+                    {:error, reason}
+                end
             end
 
           :error ->
-            with dumped_init_state <-
-                   init_state
-                   |> module.dump_state()
-                   |> validate_dumped_state!(module),
-                 {:ok, encoded_init_state} <-
-                   StorageBackend.encode(object_store, dumped_init_state),
-                 {:ok, client_init_state} <-
-                   StorageBackend.decode(object_store, encoded_init_state) do
-              loaded_user_state = load_user_state(module, _old_vsn = nil, client_init_state)
-              {:ok, {loaded_user_state, _old_vsn = nil, _etag = nil, _meta = nil}}
-            end
+            load_fresh_init_state(module, init_state, object_store)
         end
 
       case load_result do
@@ -2502,6 +2558,60 @@ defmodule DurableServer do
     end
   end
 
+  # If bootstrap fails after the initial lock claim, storage still contains the
+  # pre-init record we wrote during lock acquisition. Repair that record only if
+  # it is still owned by this exact boot attempt.
+  defp repair_failed_boot_storage(%DurableServer{} = state) do
+    repaired_state = %{
+      state
+      | status: :stopped_graceful,
+        last_heartbeat_at: System.system_time(:millisecond)
+    }
+
+    {%DurableServer{} = repaired_state, dumped_user_state} = dump_user_state(repaired_state)
+    repaired_meta = dump_meta(repaired_state)
+    key_ctx = %{key: state.key, prefix: state.prefix}
+
+    case StorageBackend.update_object(
+           state.object_store,
+           storage_key(state),
+           fn
+             %{body: %StoredState{meta: %Meta{} = meta} = stored_state} ->
+               if same_boot_owner?(state, meta) do
+                 updated_data =
+                   stored_state
+                   |> attach_stored_state_context(key_ctx)
+                   |> Map.put(:state, dumped_user_state)
+                   |> Map.put(:meta, repaired_meta)
+
+                 {:ok, updated_data}
+               else
+                 {:error, :ownership_mismatch}
+               end
+
+             %{body: other} ->
+               {:error, {:unexpected_value_type, other}}
+           end,
+           max_retries: 0
+         ) do
+      {:ok, _object} ->
+        :ok
+
+      {:error, :ownership_mismatch} ->
+        :noop
+
+      {:error, :not_found} ->
+        :noop
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp same_boot_owner?(%DurableServer{} = state, %Meta{} = meta) do
+    meta.pid == state.pid and meta.node_ref == state.node_ref and meta.node_str == state.node_str
+  end
+
   defp schedule_sync(%__MODULE__{} = state, sync_every_ms \\ nil) do
     if state.sync_timer_ref do
       Process.cancel_timer(state.sync_timer_ref)
@@ -2526,19 +2636,23 @@ defmodule DurableServer do
   @doc """
   Fetches the DurableServer's current state from storage.
   """
-  def fetch_stored_state(supervisor_name, %{key: key, prefix: prefix})
+  def fetch_stored_state(source, request, opts \\ [])
+
+  def fetch_stored_state(supervisor_name, %{key: key, prefix: prefix}, opts)
       when is_atom(supervisor_name) do
     %{storage_backend: storage_backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
-    fetch_stored_state(storage_backend, %{key: key, prefix: prefix})
+    fetch_stored_state(storage_backend, %{key: key, prefix: prefix}, opts)
   end
 
-  def fetch_stored_state(%ObjectStore{} = store, %{key: key, prefix: prefix}) do
+  def fetch_stored_state(%ObjectStore{} = store, %{key: key, prefix: prefix}, opts) do
     backend = StorageBackend.new(DurableServer.Backends.ObjectStore, store)
-    fetch_stored_state(backend, %{key: key, prefix: prefix})
+    fetch_stored_state(backend, %{key: key, prefix: prefix}, opts)
   end
 
-  def fetch_stored_state(%StorageBackend{} = store, %{key: key, prefix: prefix}) do
-    case StorageBackend.get_object(store, prefix <> key) do
+  def fetch_stored_state(%StorageBackend{} = store, %{key: key, prefix: prefix}, opts) do
+    opts = Keyword.validate!(opts, [:consistent])
+
+    case StorageBackend.get_object(store, prefix <> key, opts) do
       {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
         {:ok,
          attach_stored_state_context(%{stored_state | etag: etag}, %{key: key, prefix: prefix})}
@@ -2564,7 +2678,7 @@ defmodule DurableServer do
     try do
       %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
 
-      case StorageBackend.get_object(store, storage_key) do
+      case StorageBackend.get_object(store, storage_key, consistent: true) do
         {:ok, %{etag: etag}} -> {:ok, etag}
         {:error, _} = error -> error
       end
@@ -2682,7 +2796,11 @@ defmodule DurableServer do
        ) do
     report_lock_diagnostic(supervisor_name, :check_lock_storage_heartbeat_fetch)
 
-    case LifecycleManager.fetch_node_heartbeat_from_storage(supervisor_name, node_str) do
+    case LifecycleManager.fetch_node_heartbeat_from_storage(
+           supervisor_name,
+           node_str,
+           consistent: true
+         ) do
       {:healthy, %{node_ref: ^stored_node_ref}} ->
         report_lock_check_result(supervisor_name, {:locked, meta.pid})
         {:locked, meta.pid}
@@ -2768,10 +2886,15 @@ defmodule DurableServer do
     if retries > 50 do
       # we should have seen the registration come up by now, check object storage for current value
       # (possible netsplit) before falling back to :noproc
-      case fetch_existing_state_raw(state.object_store, %{
-             key: state.key,
-             prefix: state.prefix
-           }) do
+      case fetch_existing_state_raw(
+             state.object_store,
+             %{
+               key: state.key,
+               prefix: state.prefix
+             },
+             nil,
+             consistent: true
+           ) do
         {:ok, %StoredState{meta: %Meta{} = meta}} ->
           # increment global lock failure - we found a lock in storage but never saw it in syn
           # this indicates network partition/flapping
@@ -2896,7 +3019,7 @@ defmodule DurableServer do
     storage_key = storage_key(state)
     store = state.object_store
 
-    case StorageBackend.get_object(store, storage_key) do
+    case StorageBackend.get_object(store, storage_key, consistent: true) do
       {:ok, %{body: %StoredState{} = stored_state, etag: etag}} ->
         updated_data =
           stored_state

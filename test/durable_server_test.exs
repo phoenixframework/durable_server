@@ -3,6 +3,7 @@ defmodule DurableServerTest do
   import DurableServer.TestHelper
 
   alias DurableServer
+  alias DurableServer.LifecycleManager
   alias DurableServer.StoredState
   alias DurableServer.ObjectStore
   alias DurableServer.Backends.ObjectStore, as: ObjectStoreBackend
@@ -79,6 +80,21 @@ defmodule DurableServerTest do
     end
   end
 
+  defp backend_table(%StorageBackend{state: %{table: table}}), do: table
+
+  defp put_backend_override(table, key, consistent, response) do
+    :ets.insert(table, {{:override, key, consistent}, response})
+  end
+
+  defp recorded_get_opts(table, key) do
+    table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn
+      {{:get_call, _call_id}, %{key: ^key, opts: opts}} -> [opts]
+      _ -> []
+    end)
+  end
+
   # Test implementation modules
   defmodule RejectingStartupSyncBackend do
     @behaviour DurableServer.StorageBackend
@@ -137,6 +153,134 @@ defmodule DurableServerTest do
     @impl true
     def unsubscribe(%{delegate: delegate}, subscription_ref),
       do: StorageBackend.unsubscribe(delegate, subscription_ref)
+  end
+
+  defmodule ConsistencyProbeBackend do
+    @behaviour DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(raw_opts) do
+      opts =
+        case raw_opts do
+          %{} = map -> map
+          list when is_list(list) -> Map.new(list)
+        end
+
+      {:ok,
+       %{
+         state: %{
+           table: :ets.new(__MODULE__, [:set, :public]),
+           owner: Map.get(opts, :owner)
+         }
+       }}
+    end
+
+    @impl true
+    def ensure_ready(_state), do: :ok
+
+    @impl true
+    def get_object(%{table: table, owner: owner}, key, opts) do
+      record_get_call(table, key, opts, owner)
+      consistent = Keyword.get(opts, :consistent, :unset)
+
+      case :ets.lookup(table, {:override, key, consistent}) do
+        [{{:override, ^key, ^consistent}, response}] ->
+          response
+
+        [] ->
+          case :ets.lookup(table, {:data, key}) do
+            [{{:data, ^key}, %{body: body, etag: etag}}] -> {:ok, %{body: body, etag: etag}}
+            [] -> {:error, :not_found}
+          end
+      end
+    end
+
+    @impl true
+    def list_all_objects_stream(%{table: table}, prefix, _opts) do
+      table
+      |> :ets.tab2list()
+      |> Stream.filter(fn
+        {{:data, key}, _value} -> String.starts_with?(key, prefix)
+        _ -> false
+      end)
+      |> Stream.map(fn {{:data, key}, %{etag: etag}} -> %{key: key, etag: etag} end)
+    end
+
+    @impl true
+    def put_object(%{table: table}, key, data, opts) do
+      case Keyword.fetch(opts, :etag) do
+        {:ok, expected_etag} ->
+          case :ets.lookup(table, {:data, key}) do
+            [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+              store_value(table, key, data)
+
+            [{{:data, ^key}, _value}] ->
+              {:error, :conflict}
+
+            [] ->
+              {:error, :not_found}
+          end
+
+        :error ->
+          store_value(table, key, data)
+      end
+    end
+
+    @impl true
+    def delete_object(%{table: table}, key) do
+      case :ets.lookup(table, {:data, key}) do
+        [{{:data, ^key}, _value}] ->
+          :ets.delete(table, {:data, key})
+          :ok
+
+        [] ->
+          {:error, :not_found}
+      end
+    end
+
+    @impl true
+    def try_claim(%{table: table}, key, body) do
+      case :ets.lookup(table, {:data, key}) do
+        [] ->
+          {:ok, %{etag: etag}} = store_value(table, key, body)
+          {:ok, {:claimed, etag}}
+
+        [_existing] ->
+          {:error, :already_claimed}
+      end
+    end
+
+    @impl true
+    def update_object(%{table: table} = state, key, update_fn, _opts) do
+      with {:ok, %{body: body, etag: etag}} <- get_object(state, key, consistent: true),
+           {:ok, new_body} <- update_fn.(%{body: body, etag: etag}) do
+        put_object(%{table: table}, key, new_body, etag: etag)
+      end
+    end
+
+    @impl true
+    def encode(_state, data), do: {:ok, data}
+
+    @impl true
+    def decode(_state, data), do: {:ok, data}
+
+    defp store_value(table, key, data) do
+      etag =
+        System.unique_integer([:positive, :monotonic])
+        |> Integer.to_string()
+
+      :ets.insert(table, {{:data, key}, %{body: data, etag: etag}})
+      {:ok, %{body: data, etag: etag}}
+    end
+
+    defp record_get_call(table, key, opts, owner) do
+      call_id = System.unique_integer([:positive, :monotonic])
+      :ets.insert(table, {{:get_call, call_id}, %{key: key, opts: opts}})
+
+      if is_pid(owner) do
+        send(owner, {:consistency_probe_get, key, opts})
+      end
+    end
   end
 
   defmodule TestServer do
@@ -527,6 +671,29 @@ defmodule DurableServerTest do
 
       assert log =~ "failed to sync startup status :running"
       assert log =~ key
+    end
+
+    test "repairs claimed storage after startup sync failure" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {RejectingStartupSyncBackend, delegate_opts: test_object_store_opts()}
+        )
+
+      key = "startup-sync-repair-#{DurableServer.UUID.uuid4()}"
+
+      assert {:error, :startup_sync_rejected} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, %{key: key, custom_opts: %{permanent: true}}}
+               )
+
+      %{storage_backend: store} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      assert {:ok, %StoredState{} = stored_state} =
+               DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
+
+      assert stored_state.meta.status == :stopped_graceful
+      assert stored_state.meta.permanent == true
     end
 
     test "sets up node reference in persistent term", %{
@@ -2979,6 +3146,125 @@ defmodule DurableServerTest do
 
       # verify EXIT signal was :normal (which doesn't kill non-trapping processes)
       assert_receive {:EXIT, ^server_pid, :normal}, 100
+    end
+  end
+
+  describe "explicit consistency opts" do
+    test "fetch_stored_state forwards consistent opt to the backend" do
+      {:ok, backend} = StorageBackend.init_backend(ConsistencyProbeBackend, owner: self())
+      table = backend_table(backend)
+      prefix = "probe/"
+      key = "forwarded"
+      storage_key = prefix <> key
+
+      put_backend_override(
+        table,
+        storage_key,
+        false,
+        {:ok, %{body: %StoredState{vsn: 1, state: %{}, meta: %DurableServer.Meta{}}, etag: "v1"}}
+      )
+
+      assert {:ok, %StoredState{}} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix},
+                 consistent: false
+               )
+
+      assert Enum.any?(recorded_get_opts(table, storage_key), &(&1 == [consistent: false]))
+    end
+
+    test "fetch_node_heartbeat_from_storage forwards explicit consistency opts" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(backend)
+      node_str = to_string(node())
+      storage_key = "#{prefix}__nodes/#{node_str}"
+
+      assert {:healthy, %{}} =
+               LifecycleManager.fetch_node_heartbeat_from_storage(
+                 supervisor_name,
+                 node_str,
+                 consistent: false
+               )
+
+      assert {:healthy, %{}} =
+               LifecycleManager.fetch_node_heartbeat_from_storage(
+                 supervisor_name,
+                 node_str,
+                 consistent: true
+               )
+
+      get_opts = recorded_get_opts(table, storage_key)
+      assert [consistent: false] in get_opts
+      assert [consistent: true] in get_opts
+    end
+
+    test "startup rereads consistently before acting on an expired eventual read" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(backend)
+      key = "stale-expired-reread"
+      storage_key = prefix <> key
+      current_node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
+
+      stale_state = %StoredState{
+        vsn: 1,
+        state: %{"count" => 1},
+        meta: %DurableServer.Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          status: :stopped_graceful,
+          node_str: "stale@node",
+          node_ref: current_node_ref,
+          pid: self()
+        }
+      }
+
+      locked_state = %StoredState{
+        vsn: 2,
+        state: %{"count" => 2},
+        meta: %DurableServer.Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          status: :running,
+          node_str: to_string(node()),
+          node_ref: current_node_ref,
+          pid: self()
+        }
+      }
+
+      put_backend_override(
+        table,
+        storage_key,
+        false,
+        {:ok, %{body: stale_state, etag: "stale-etag"}}
+      )
+
+      put_backend_override(
+        table,
+        storage_key,
+        true,
+        {:ok, %{body: locked_state, etag: "fresh-etag"}}
+      )
+
+      assert {:error, {:already_started, pid}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, %{key: key}}
+               )
+
+      assert pid == self()
+
+      get_opts = recorded_get_opts(table, storage_key)
+      assert [consistent: false] in get_opts
+      assert [consistent: true] in get_opts
     end
   end
 end

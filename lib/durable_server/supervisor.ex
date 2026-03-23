@@ -394,7 +394,11 @@ defmodule DurableServer.Supervisor do
   def get_server_info(sup_name, key) when is_atom(sup_name) and is_binary(key) do
     %{storage_backend: storage_backend, prefix: prefix} = __get_config__(sup_name)
 
-    case DurableServer.fetch_stored_state(storage_backend, %{key: key, prefix: prefix}) do
+    case DurableServer.fetch_stored_state(
+           storage_backend,
+           %{key: key, prefix: prefix},
+           consistent: false
+         ) do
       {:ok, %DurableServer.StoredState{meta: meta, state: user_state, vsn: vsn}} ->
         # Check if server is currently running
         {pid, running} =
@@ -753,7 +757,7 @@ defmodule DurableServer.Supervisor do
     config = __get_config__(supervisor)
     storage_key = config.prefix <> key
 
-    case StorageBackend.get_object(config.storage_backend, storage_key) do
+    case StorageBackend.get_object(config.storage_backend, storage_key, consistent: true) do
       {:ok, %{body: body, etag: etag}} ->
         {:ok, {:restart, %{key: key, body: body, etag: etag}}}
 
@@ -1286,7 +1290,7 @@ defmodule DurableServer.Supervisor do
         config = __get_config__(supervisor)
         storage_key = config.prefix <> key
 
-        case StorageBackend.get_object(config.storage_backend, storage_key) do
+        case StorageBackend.get_object(config.storage_backend, storage_key, consistent: false) do
           {:ok, %{body: body}} ->
             meta = extract_meta_from_body(key, supervisor, body)
             meta && meta.sticky_placement
@@ -1625,7 +1629,11 @@ defmodule DurableServer.Supervisor do
         existing = Keyword.get(opts, :existing, false)
 
         {stored_object, sticky_placement} =
-          case StorageBackend.get_object(config.storage_backend, storage_key) do
+          case StorageBackend.get_object(
+                 config.storage_backend,
+                 storage_key,
+                 consistent: existing
+               ) do
             {:ok, %{body: body, etag: etag}} ->
               # Get augmented sticky placement (handles module config updates like :any)
               augmented_placement =
@@ -2460,13 +2468,14 @@ defmodule DurableServer.Supervisor do
     # Build storage backend from :backend or legacy :object_store options.
     {storage_backend, object_store} = build_storage_backend(opts, finch, task_sup)
     :ok = StorageBackend.ensure_ready(storage_backend)
-    backend_defaults = StorageBackend.defaults(storage_backend)
+
+    storage_backend_defaults = StorageBackend.defaults(storage_backend)
 
     discovery_interval_ms =
       extract_backend_tuned_interval!(
         opts,
         :discovery_interval_ms,
-        backend_defaults,
+        storage_backend_defaults,
         @default_discovery_interval_ms
       )
 
@@ -2474,17 +2483,17 @@ defmodule DurableServer.Supervisor do
       extract_backend_tuned_interval!(
         opts,
         :heartbeat_interval_ms,
-        backend_defaults,
+        storage_backend_defaults,
         @default_heartbeat_interval_ms
       )
 
     heartbeat_tracking_mode =
-      extract_heartbeat_tracking_mode_config(opts, backend_defaults)
+      extract_heartbeat_tracking_mode_config(opts, storage_backend_defaults)
 
     heartbeat_reconcile_interval_ms =
       extract_heartbeat_reconcile_interval_config(
         opts,
-        backend_defaults,
+        storage_backend_defaults,
         heartbeat_tracking_mode
       )
 
@@ -2644,6 +2653,16 @@ defmodule DurableServer.Supervisor do
     # Re-raise as the native erpc error so callers' catch patterns match.
     :error, {:exception, {:erpc, :noconnection}, _stacktrace} ->
       :erlang.error({:erpc, :noconnection})
+
+    # Remote placement readiness failures intentionally use throw({:error, :not_ready}).
+    # Across erpc this comes back as a remote nocatch wrapper, so restore the
+    # original throw locally for callers that already catch :throw.
+    kind, {:exception, {:nocatch, {:error, :not_ready}}, _stacktrace}
+    when kind in [:error, :exit] ->
+      throw({:error, :not_ready})
+
+    :exit, {:nocatch, {:error, :not_ready}} ->
+      throw({:error, :not_ready})
   end
 
   defp report_placement_diagnostic(supervisor_name, key) do

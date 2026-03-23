@@ -109,8 +109,9 @@ defmodule DurableServer.LifecycleTest do
     def list_all_objects_stream(_state, _prefix, _opts), do: []
 
     @impl true
-    def put_object(%{table: table, fail_count: fail_count}, _key, data, _opts) do
+    def put_object(%{table: table, fail_count: fail_count}, _key, data, opts) do
       attempt = :ets.update_counter(table, :attempts, {2, 1}, {:attempts, 0})
+      :ets.insert(table, {:last_put_opts, opts})
 
       if attempt <= fail_count do
         {:error, {:mirror_failed, :no_quorum}}
@@ -1601,6 +1602,8 @@ defmodule DurableServer.LifecycleTest do
 
       assert [{:attempts, attempts}] = :ets.lookup(table, :attempts)
       assert attempts >= 3
+      assert [{:last_put_opts, put_opts}] = :ets.lookup(table, :last_put_opts)
+      assert Keyword.get(put_opts, :max_retries) == 0
       assert [{:last_write, heartbeat_data}] = :ets.lookup(table, :last_write)
       assert is_map(heartbeat_data)
       assert Map.has_key?(heartbeat_data, "last_heartbeat_at")

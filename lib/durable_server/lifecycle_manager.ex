@@ -131,7 +131,6 @@ defmodule DurableServer.LifecycleManager do
             discovery_stopped: false,
             discovery_burst_remaining: 0
 
-  @max_heartbeat_retries 3
   # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold
   # Orphan threshold (20s) already includes grace period (2x heartbeat interval),
   # so we only need a small buffer for crash propagation time
@@ -898,7 +897,10 @@ defmodule DurableServer.LifecycleManager do
     if remaining_ms <= 0 do
       {:error, :heartbeat_deadline_exceeded}
     else
-      put_opts = [max_retries: @max_heartbeat_retries, timeout: remaining_ms]
+      # Give the backend one long write attempt using the remaining heartbeat budget.
+      # The outer LM retry loop handles fast-fail transient errors without compounding
+      # backend retries inside the same deadline window.
+      put_opts = [max_retries: 0, timeout: remaining_ms]
 
       case StorageBackend.put_object(state.object_store, key, heartbeat_data, put_opts) do
         {:ok, _} = ok ->
@@ -1015,7 +1017,7 @@ defmodule DurableServer.LifecycleManager do
       keys
       |> Task.async_stream(
         fn key ->
-          case StorageBackend.get_object(state.object_store, key) do
+          case StorageBackend.get_object(state.object_store, key, consistent: false) do
             {:ok, %{body: body}} ->
               case parse_heartbeat_data(body) do
                 {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
@@ -1272,8 +1274,10 @@ defmodule DurableServer.LifecycleManager do
   - `:not_found` if no heartbeat exists for this node
   - `{:error, reason}` on fetch failure
   """
-  def fetch_node_heartbeat_from_storage(supervisor_name, node_str)
+  def fetch_node_heartbeat_from_storage(supervisor_name, node_str, opts \\ [])
       when is_atom(supervisor_name) and is_binary(node_str) do
+    opts = Keyword.validate!(opts, [:consistent])
+
     %{
       prefix: prefix,
       heartbeat_interval_ms: heartbeat_interval_ms,
@@ -1282,7 +1286,7 @@ defmodule DurableServer.LifecycleManager do
 
     key = "#{prefix}__nodes/#{node_str}"
 
-    case StorageBackend.get_object(storage_backend, key) do
+    case StorageBackend.get_object(storage_backend, key, opts) do
       {:ok, %{body: body}} ->
         case parse_heartbeat_data(body) do
           {:ok,
@@ -1506,10 +1510,14 @@ defmodule DurableServer.LifecycleManager do
         nil
 
       nil ->
-        case DurableServer.fetch_stored_state(state.object_store, %{
-               key: key,
-               prefix: state.prefix
-             }) do
+        case DurableServer.fetch_stored_state(
+               state.object_store,
+               %{
+                 key: key,
+                 prefix: state.prefix
+               },
+               consistent: false
+             ) do
           {:ok, %StoredState{meta: %Meta{} = meta} = obj} ->
             cond do
               # never restart permanently crashed servers

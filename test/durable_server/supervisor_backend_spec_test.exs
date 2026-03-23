@@ -4,6 +4,10 @@ defmodule DurableServer.SupervisorBackendSpecTest do
   alias DurableServer.Backends.MirrorStore
   alias DurableServer.StorageBackend
 
+  def throw_not_ready do
+    throw({:error, :not_ready})
+  end
+
   defmodule InMemoryBackend do
     @behaviour StorageBackend
 
@@ -188,6 +192,18 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     )
 
     assert DurableServer.Supervisor.ready?(supervisor_name)
+  end
+
+  test "safe_erpc_call rethrows remote not_ready as a local throw" do
+    assert catch_throw(
+             DurableServer.Supervisor.safe_erpc_call(
+               Node.self(),
+               __MODULE__,
+               :throw_not_ready,
+               [],
+               1_000
+             )
+           ) == {:error, :not_ready}
   end
 
   defp unique_supervisor_name(label) do

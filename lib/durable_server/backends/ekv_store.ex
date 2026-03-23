@@ -16,7 +16,9 @@ defmodule DurableServer.Backends.EKVStore do
     :cas_retries,
     :backoff,
     :timeout,
-    :task_supervisor
+    :task_supervisor,
+    :ekv_mod,
+    :ekv_supervisor_mod
   ]
 
   @type state :: %{
@@ -25,7 +27,9 @@ defmodule DurableServer.Backends.EKVStore do
           required(:cas_retries) => non_neg_integer(),
           required(:backoff) => {non_neg_integer(), non_neg_integer()},
           required(:timeout) => pos_integer() | :infinity,
-          required(:task_supervisor) => atom()
+          required(:task_supervisor) => atom(),
+          required(:ekv_mod) => module(),
+          required(:ekv_supervisor_mod) => module()
         }
 
   def normalize_opts(opts) when is_list(opts) do
@@ -72,7 +76,9 @@ defmodule DurableServer.Backends.EKVStore do
       cas_retries: cas_retries,
       backoff: backoff,
       timeout: timeout,
-      task_supervisor: Keyword.get(opts, :task_supervisor, DurableServer.TaskSupervisor)
+      task_supervisor: Keyword.get(opts, :task_supervisor, DurableServer.TaskSupervisor),
+      ekv_mod: Keyword.get(opts, :ekv_mod, :"Elixir.EKV"),
+      ekv_supervisor_mod: Keyword.get(opts, :ekv_supervisor_mod, :"Elixir.EKV.Supervisor")
     }
   end
 
@@ -96,8 +102,8 @@ defmodule DurableServer.Backends.EKVStore do
   end
 
   @impl true
-  def ensure_ready(%{name: name} = _state) do
-    with {:ok, config} <- fetch_config(name),
+  def ensure_ready(%{} = state) do
+    with {:ok, config} <- fetch_config(state, state.name),
          :ok <- ensure_cas_config(config) do
       :ok
     end
@@ -113,7 +119,7 @@ defmodule DurableServer.Backends.EKVStore do
 
       {relay_pid, monitor_ref} =
         spawn_monitor(fn ->
-          subscription_relay(parent, subscriber, state.name, prefix)
+          subscription_relay(parent, subscriber, state, prefix)
         end)
 
       receive do
@@ -184,9 +190,17 @@ defmodule DurableServer.Backends.EKVStore do
 
     case ensure_ready(state) do
       :ok ->
-        state.name
-        |> ekv_keys(prefix)
-        |> Stream.map(fn {key, vsn} -> %{key: key, etag: encode_vsn(vsn)} end)
+        case ekv_keys(state, prefix) do
+          {:ok, keys} ->
+            Stream.map(keys, fn {key, vsn} -> %{key: key, etag: encode_vsn(vsn)} end)
+
+          {:error, reason} ->
+            case error_handler.(reason) do
+              :continue -> Stream.map([], & &1)
+              :halt -> Stream.map([], & &1)
+              _ -> Stream.map([], & &1)
+            end
+        end
 
       {:error, reason} ->
         case error_handler.(reason) do
@@ -230,7 +244,7 @@ defmodule DurableServer.Backends.EKVStore do
   @impl true
   def delete_object(%{} = state, key) when is_binary(key) do
     with_ekv(state, fn ->
-      do_delete(state, key, 0, state.cas_retries)
+      do_delete(state, key, 0, state.cas_retries, timeout_deadline(state.timeout))
     end)
   end
 
@@ -238,7 +252,7 @@ defmodule DurableServer.Backends.EKVStore do
   def try_claim(%{} = state, key, body) when is_binary(key) do
     with_ekv(state, fn ->
       with {:ok, encoded_body} <- encode_body(body) do
-        case ekv_put(state.name, key, encoded_body,
+        case ekv_put(state, key, encoded_body,
                if_vsn: nil,
                timeout: state.timeout,
                resolve_unconfirmed: true
@@ -331,49 +345,68 @@ defmodule DurableServer.Backends.EKVStore do
     end
   end
 
-  defp do_delete(state, key, attempt, max_retries) do
+  defp do_delete(state, key, attempt, max_retries, deadline_at) do
     case current_vsn(state, key) do
-      nil ->
+      {:ok, nil} ->
         {:error, :not_found}
 
-      vsn ->
-        case ekv_delete(state.name, key,
-               if_vsn: vsn,
-               timeout: state.timeout,
-               resolve_unconfirmed: true
-             ) do
-          {:ok, _new_vsn} ->
-            :ok
+      {:ok, vsn} ->
+        case remaining_timeout(deadline_at) do
+          timeout when is_integer(timeout) and timeout <= 0 ->
+            {:error, :timeout}
 
-          {:error, :conflict} when attempt < max_retries ->
-            Process.sleep(backoff_for_attempt(state.backoff, attempt))
-            do_delete(state, key, attempt + 1, max_retries)
+          timeout ->
+            case ekv_delete(state, key,
+                   if_vsn: vsn,
+                   timeout: timeout,
+                   resolve_unconfirmed: true
+                 ) do
+              {:ok, _new_vsn} ->
+                :ok
 
-          {:error, :conflict} ->
-            case current_vsn(state, key) do
-              nil -> {:error, :not_found}
-              _ -> {:error, :conflict}
+              {:error, :conflict} when attempt < max_retries ->
+                sleep_with_deadline(state.backoff, deadline_at, attempt)
+                do_delete(state, key, attempt + 1, max_retries, deadline_at)
+
+              {:error, :conflict} ->
+                case current_vsn(state, key) do
+                  {:ok, nil} -> {:error, :not_found}
+                  {:ok, _} -> {:error, :conflict}
+                  {:error, reason} -> {:error, reason}
+                end
+
+              {:error, reason} when attempt < max_retries ->
+                if retryable_error?(reason) do
+                  sleep_with_deadline(state.backoff, deadline_at, attempt)
+                  do_delete(state, key, attempt + 1, max_retries, deadline_at)
+                else
+                  {:error, reason}
+                end
+
+              {:error, reason} ->
+                {:error, reason}
             end
-
-          {:error, reason} when attempt < max_retries ->
-            if retryable_error?(reason) do
-              Process.sleep(backoff_for_attempt(state.backoff, attempt))
-              do_delete(state, key, attempt + 1, max_retries)
-            else
-              {:error, reason}
-            end
-
-          {:error, reason} ->
-            {:error, reason}
         end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   defp do_put_with_expected_vsn(state, key, encoded_data, data, expected_vsn, opts) do
     retries = Keyword.fetch!(opts, :retries)
-    timeout = Keyword.fetch!(opts, :timeout)
+    deadline_at = timeout_deadline(Keyword.fetch!(opts, :timeout))
 
-    do_put_with_expected_vsn(state, key, encoded_data, data, expected_vsn, retries, timeout, 0)
+    do_put_with_expected_vsn(
+      state,
+      key,
+      encoded_data,
+      data,
+      expected_vsn,
+      retries,
+      deadline_at,
+      0
+    )
   end
 
   defp do_put_with_expected_vsn(
@@ -383,7 +416,7 @@ defmodule DurableServer.Backends.EKVStore do
          _data,
          _expected_vsn,
          retries,
-         _timeout,
+         _deadline_at,
          attempt
        )
        when attempt > retries do
@@ -397,80 +430,92 @@ defmodule DurableServer.Backends.EKVStore do
          data,
          expected_vsn,
          retries,
-         timeout,
+         deadline_at,
          attempt
        ) do
-    case ekv_put(state.name, key, encoded_data,
-           if_vsn: expected_vsn,
-           timeout: timeout,
-           resolve_unconfirmed: true
-         ) do
-      {:ok, vsn} ->
-        {:ok, %{etag: encode_vsn(vsn), body: data}}
+    case remaining_timeout(deadline_at) do
+      timeout when is_integer(timeout) and timeout <= 0 ->
+        {:error, :timeout}
 
-      {:error, :conflict} ->
-        {:error, :conflict}
+      timeout ->
+        case ekv_put(state, key, encoded_data,
+               if_vsn: expected_vsn,
+               timeout: timeout,
+               resolve_unconfirmed: true
+             ) do
+          {:ok, vsn} ->
+            {:ok, %{etag: encode_vsn(vsn), body: data}}
 
-      {:error, reason} when attempt < retries ->
-        if retryable_error?(reason) do
-          Process.sleep(backoff_for_attempt(state.backoff, attempt))
+          {:error, :conflict} ->
+            {:error, :conflict}
 
-          do_put_with_expected_vsn(
-            state,
-            key,
-            encoded_data,
-            data,
-            expected_vsn,
-            retries,
-            timeout,
-            attempt + 1
-          )
-        else
-          {:error, reason}
+          {:error, reason} when attempt < retries ->
+            if retryable_error?(reason) do
+              sleep_with_deadline(state.backoff, deadline_at, attempt)
+
+              do_put_with_expected_vsn(
+                state,
+                key,
+                encoded_data,
+                data,
+                expected_vsn,
+                retries,
+                deadline_at,
+                attempt + 1
+              )
+            else
+              {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
   defp do_put_latest(state, key, encoded_data, data, opts) do
     retries = Keyword.fetch!(opts, :retries)
-    timeout = Keyword.fetch!(opts, :timeout)
-    do_put_latest(state, key, encoded_data, data, retries, timeout, 0)
+    deadline_at = timeout_deadline(Keyword.fetch!(opts, :timeout))
+    do_put_latest(state, key, encoded_data, data, retries, deadline_at, 0)
   end
 
-  defp do_put_latest(_state, _key, _encoded_data, _data, retries, _timeout, attempt)
+  defp do_put_latest(_state, _key, _encoded_data, _data, retries, _deadline_at, attempt)
        when attempt > retries do
     {:error, :conflict}
   end
 
-  defp do_put_latest(state, key, encoded_data, data, retries, timeout, attempt) do
-    case ekv_update(state.name, key, {__MODULE__, :put_latest_update, [encoded_data]},
-           timeout: timeout,
-           retries: 0,
-           resolve_unconfirmed: true
-         ) do
-      {:ok, _new_value, vsn} ->
-        {:ok, %{etag: encode_vsn(vsn), body: data}}
+  defp do_put_latest(state, key, encoded_data, data, retries, deadline_at, attempt) do
+    case remaining_timeout(deadline_at) do
+      timeout when is_integer(timeout) and timeout <= 0 ->
+        {:error, :timeout}
 
-      {:error, :conflict} when attempt < retries ->
-        Process.sleep(backoff_for_attempt(state.backoff, attempt))
-        do_put_latest(state, key, encoded_data, data, retries, timeout, attempt + 1)
+      timeout ->
+        case ekv_update(state, key, {__MODULE__, :put_latest_update, [encoded_data]},
+               timeout: timeout,
+               retries: 0,
+               resolve_unconfirmed: true
+             ) do
+          {:ok, _new_value, vsn} ->
+            {:ok, %{etag: encode_vsn(vsn), body: data}}
 
-      {:error, :conflict} ->
-        {:error, :conflict}
+          {:error, :conflict} when attempt < retries ->
+            sleep_with_deadline(state.backoff, deadline_at, attempt)
+            do_put_latest(state, key, encoded_data, data, retries, deadline_at, attempt + 1)
 
-      {:error, reason} when attempt < retries ->
-        if retryable_error?(reason) do
-          Process.sleep(backoff_for_attempt(state.backoff, attempt))
-          do_put_latest(state, key, encoded_data, data, retries, timeout, attempt + 1)
-        else
-          {:error, reason}
+          {:error, :conflict} ->
+            {:error, :conflict}
+
+          {:error, reason} when attempt < retries ->
+            if retryable_error?(reason) do
+              sleep_with_deadline(state.backoff, deadline_at, attempt)
+              do_put_latest(state, key, encoded_data, data, retries, deadline_at, attempt + 1)
+            else
+              {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
@@ -478,9 +523,10 @@ defmodule DurableServer.Backends.EKVStore do
   def put_latest_update(_current_value, encoded_data), do: encoded_data
 
   defp current_vsn(state, key) do
-    case ekv_lookup(state.name, key) do
-      nil -> nil
-      {_value, vsn} -> vsn
+    case ekv_lookup(state, key) do
+      {:ok, nil} -> {:ok, nil}
+      {:ok, {_value, vsn}} -> {:ok, vsn}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -488,23 +534,55 @@ defmodule DurableServer.Backends.EKVStore do
     consistent = Keyword.get(opts, :consistent, false)
 
     if consistent do
-      try do
-        _ = ekv_get(state.name, key, consistent: true, timeout: state.timeout)
-      rescue
-        error in RuntimeError ->
-          return_error({:consistent_read_failed, error.message})
+      case consistent_read_barrier(state, key) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          return_error({:consistent_read_failed, reason})
       end
     end
 
-    case ekv_lookup(state.name, key) do
-      nil -> {:ok, {nil, nil}}
-      {value, vsn} -> {:ok, {value, vsn}}
+    case ekv_lookup(state, key) do
+      {:ok, nil} -> {:ok, {nil, nil}}
+      {:ok, {value, vsn}} -> {:ok, {value, vsn}}
+      {:error, reason} -> {:error, reason}
     end
   catch
     {:return_error, reason} -> {:error, reason}
   end
 
   defp return_error(reason), do: throw({:return_error, reason})
+
+  defp consistent_read_barrier(state, key) do
+    do_consistent_read_barrier(state, key, state.cas_retries, timeout_deadline(state.timeout), 0)
+  end
+
+  defp do_consistent_read_barrier(_state, _key, retries, _deadline_at, attempt)
+       when attempt > retries do
+    {:error, :timeout}
+  end
+
+  defp do_consistent_read_barrier(state, key, retries, deadline_at, attempt) do
+    case remaining_timeout(deadline_at) do
+      timeout when is_integer(timeout) and timeout <= 0 ->
+        {:error, :timeout}
+
+      timeout ->
+        case ekv_get(state, key, consistent: true, timeout: timeout) do
+          {:ok, _value} ->
+            :ok
+
+          {:error, reason} ->
+            if attempt < retries and retryable_error?(reason) do
+              sleep_with_deadline(state.backoff, deadline_at, attempt)
+              do_consistent_read_barrier(state, key, retries, deadline_at, attempt + 1)
+            else
+              {:error, reason}
+            end
+        end
+    end
+  end
 
   defp normalize_put_opts!(opts) do
     Keyword.validate!(opts, [
@@ -531,7 +609,7 @@ defmodule DurableServer.Backends.EKVStore do
   defp decode_vsn(etag) when is_binary(etag) do
     with {:ok, bin} <- Base.url_decode64(etag, padding: false),
          {ts, origin} <- :erlang.binary_to_term(bin),
-         true <- is_integer(ts) and is_atom(origin) do
+         true <- is_integer(ts) do
       {:ok, {ts, origin}}
     else
       _ -> :error
@@ -542,6 +620,7 @@ defmodule DurableServer.Backends.EKVStore do
 
   defp retryable_error?(reason) do
     reason in [
+      :timeout,
       :no_quorum,
       :quorum_timeout,
       :unavailable,
@@ -557,9 +636,9 @@ defmodule DurableServer.Backends.EKVStore do
     end
   end
 
-  defp fetch_config(name) do
+  defp fetch_config(state, name) when is_atom(name) do
     try do
-      {:ok, ekv_get_config(name)}
+      {:ok, ekv_get_config(state, name)}
     rescue
       _ -> {:error, {:ekv_not_started, name}}
     catch
@@ -583,31 +662,55 @@ defmodule DurableServer.Backends.EKVStore do
     :rand.uniform(max_ms - min_ms + 1) + min_ms - 1
   end
 
-  defp subscription_relay(parent, subscriber, name, prefix) do
+  defp sleep_with_deadline(backoff, deadline_at, attempt) do
+    sleep_ms =
+      case remaining_timeout(deadline_at) do
+        :infinity -> backoff_for_attempt(backoff, attempt)
+        remaining_ms -> min(backoff_for_attempt(backoff, attempt), remaining_ms)
+      end
+
+    if sleep_ms > 0 do
+      Process.sleep(sleep_ms)
+    end
+  end
+
+  defp timeout_deadline(:infinity), do: :infinity
+
+  defp timeout_deadline(timeout) when is_integer(timeout) and timeout > 0 do
+    System.monotonic_time(:millisecond) + timeout
+  end
+
+  defp remaining_timeout(:infinity), do: :infinity
+
+  defp remaining_timeout(deadline_at) when is_integer(deadline_at) do
+    max(deadline_at - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp subscription_relay(parent, subscriber, state, prefix) do
     monitor_ref = Process.monitor(subscriber)
 
-    case ekv_subscribe(name, prefix) do
-      :ok ->
+    case ekv_subscribe(state, prefix) do
+      {:ok, :ok} ->
         send(parent, {:durable_server_storage_subscribed, self(), :ok})
-        subscription_relay_loop(subscriber, name, prefix, monitor_ref)
+        subscription_relay_loop(subscriber, state, prefix, monitor_ref)
 
       {:error, reason} ->
         send(parent, {:durable_server_storage_subscribed, self(), {:error, reason}})
     end
   end
 
-  defp subscription_relay_loop(subscriber, name, prefix, monitor_ref) do
+  defp subscription_relay_loop(subscriber, state, prefix, monitor_ref) do
     receive do
       {:durable_server_storage_unsubscribe, from} ->
-        _ = ekv_unsubscribe(name, prefix)
+        _ = ekv_unsubscribe(state, prefix)
         send(from, {:durable_server_storage_unsubscribed, self()})
         :ok
 
       {:DOWN, ^monitor_ref, :process, ^subscriber, _reason} ->
-        _ = ekv_unsubscribe(name, prefix)
+        _ = ekv_unsubscribe(state, prefix)
         :ok
 
-      {:ekv, events, %{name: ^name}} when is_list(events) ->
+      {:ekv, events, %{name: name}} when is_list(events) and name == state.name ->
         normalized_events =
           events
           |> Enum.flat_map(&normalize_ekv_event/1)
@@ -616,10 +719,10 @@ defmodule DurableServer.Backends.EKVStore do
           send(subscriber, {:durable_server_storage_events, normalized_events})
         end
 
-        subscription_relay_loop(subscriber, name, prefix, monitor_ref)
+        subscription_relay_loop(subscriber, state, prefix, monitor_ref)
 
       _other ->
-        subscription_relay_loop(subscriber, name, prefix, monitor_ref)
+        subscription_relay_loop(subscriber, state, prefix, monitor_ref)
     end
   end
 
@@ -655,16 +758,71 @@ defmodule DurableServer.Backends.EKVStore do
     end
   end
 
-  defp ekv_mod, do: :"Elixir.EKV"
-  defp ekv_supervisor_mod, do: :"Elixir.EKV.Supervisor"
+  defp ekv_get_config(%{ekv_supervisor_mod: mod}, name), do: apply(mod, :get_config, [name])
 
-  defp ekv_get_config(name), do: apply(ekv_supervisor_mod(), :get_config, [name])
-  defp ekv_keys(name, prefix), do: apply(ekv_mod(), :keys, [name, prefix])
-  defp ekv_lookup(name, key), do: apply(ekv_mod(), :lookup, [name, key])
-  defp ekv_put(name, key, value, opts), do: apply(ekv_mod(), :put, [name, key, value, opts])
-  defp ekv_update(name, key, fun, opts), do: apply(ekv_mod(), :update, [name, key, fun, opts])
-  defp ekv_get(name, key, opts), do: apply(ekv_mod(), :get, [name, key, opts])
-  defp ekv_delete(name, key, opts), do: apply(ekv_mod(), :delete, [name, key, opts])
-  defp ekv_subscribe(name, prefix), do: apply(ekv_mod(), :subscribe, [name, prefix])
-  defp ekv_unsubscribe(name, prefix), do: apply(ekv_mod(), :unsubscribe, [name, prefix])
+  defp ekv_keys(%{ekv_mod: mod, name: name}, prefix),
+    do: ekv_raw_call(fn -> apply(mod, :keys, [name, prefix]) end)
+
+  defp ekv_lookup(%{ekv_mod: mod, name: name}, key),
+    do: ekv_raw_call(fn -> apply(mod, :lookup, [name, key]) end)
+
+  defp ekv_put(%{ekv_mod: mod, name: name}, key, value, opts),
+    do: ekv_result_call(fn -> apply(mod, :put, [name, key, value, opts]) end)
+
+  defp ekv_update(%{ekv_mod: mod, name: name}, key, fun, opts),
+    do: ekv_result_call(fn -> apply(mod, :update, [name, key, fun, opts]) end)
+
+  defp ekv_get(%{ekv_mod: mod, name: name}, key, opts),
+    do: ekv_result_call(fn -> apply(mod, :get, [name, key, opts]) end)
+
+  defp ekv_delete(%{ekv_mod: mod, name: name}, key, opts),
+    do: ekv_result_call(fn -> apply(mod, :delete, [name, key, opts]) end)
+
+  defp ekv_subscribe(%{ekv_mod: mod, name: name}, prefix),
+    do: ekv_raw_call(fn -> apply(mod, :subscribe, [name, prefix]) end)
+
+  defp ekv_unsubscribe(%{ekv_mod: mod, name: name}, prefix),
+    do: ekv_raw_call(fn -> apply(mod, :unsubscribe, [name, prefix]) end)
+
+  defp ekv_raw_call(fun) when is_function(fun, 0) do
+    {:ok, fun.()}
+  rescue
+    error ->
+      {:error, normalize_runtime_error(error)}
+  catch
+    :exit, reason ->
+      {:error, normalize_exit_reason(reason)}
+  end
+
+  defp ekv_result_call(fun) when is_function(fun, 0) do
+    case ekv_raw_call(fun) do
+      {:ok, {:ok, _} = ok} -> ok
+      {:ok, {:ok, _, _} = ok} -> ok
+      {:ok, {:error, _} = error} -> error
+      {:ok, other} -> {:ok, other}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp normalize_runtime_error(%RuntimeError{message: "EKV: consistent read failed: " <> reason}) do
+    normalize_consistent_read_reason(String.trim(reason))
+  end
+
+  defp normalize_runtime_error(%RuntimeError{message: message}), do: {:ekv_runtime_error, message}
+  defp normalize_runtime_error(error), do: {:ekv_runtime_error, Exception.message(error)}
+
+  defp normalize_consistent_read_reason(":timeout"), do: :timeout
+  defp normalize_consistent_read_reason(":no_quorum"), do: :no_quorum
+  defp normalize_consistent_read_reason(":quorum_timeout"), do: :quorum_timeout
+  defp normalize_consistent_read_reason(":unavailable"), do: :unavailable
+  defp normalize_consistent_read_reason(":cluster_overflow"), do: :cluster_overflow
+  defp normalize_consistent_read_reason(":cluster_not_ready"), do: :cluster_not_ready
+  defp normalize_consistent_read_reason(other), do: {:consistent_read_failed, other}
+
+  defp normalize_exit_reason(:timeout), do: :timeout
+  defp normalize_exit_reason({:timeout, _}), do: :timeout
+  defp normalize_exit_reason({:shutdown, reason}), do: normalize_exit_reason(reason)
+  defp normalize_exit_reason({:noproc, _}), do: :unavailable
+  defp normalize_exit_reason({:nodedown, _}), do: :unavailable
+  defp normalize_exit_reason(reason), do: {:ekv_exit, reason}
 end
