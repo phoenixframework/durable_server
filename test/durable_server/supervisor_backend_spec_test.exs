@@ -208,6 +208,10 @@ defmodule DurableServer.SupervisorBackendSpecTest do
          initial_discovery_delay_ms: {10, 20},
          discovery_shuffle_batch_size: 123,
          parallel_restart_batch_size: 7,
+         restart_claim_preferred_fanout: 3,
+         restart_claim_expanded_fanout: 5,
+         restart_claim_gate_expand_after_ms: 5_000,
+         restart_claim_gate_disable_after_ms: 45_000,
          graceful_shutdown_timeout_ms: 500
        ]}
     )
@@ -215,18 +219,30 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     %{
       initial_discovery_delay_ms: initial_discovery_delay_ms,
       discovery_shuffle_batch_size: discovery_shuffle_batch_size,
-      parallel_restart_batch_size: parallel_restart_batch_size
+      parallel_restart_batch_size: parallel_restart_batch_size,
+      restart_claim_preferred_fanout: restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: restart_claim_gate_disable_after_ms
     } = DurableServer.Supervisor.__get_config__(supervisor_name)
 
     assert initial_discovery_delay_ms == {10, 20}
     assert discovery_shuffle_batch_size == 123
     assert parallel_restart_batch_size == 7
+    assert restart_claim_preferred_fanout == 3
+    assert restart_claim_expanded_fanout == 5
+    assert restart_claim_gate_expand_after_ms == 5_000
+    assert restart_claim_gate_disable_after_ms == 45_000
 
     state = :sys.get_state(LifecycleManager.name(supervisor_name))
 
     assert state.initial_discovery_delay_ms == {10, 20}
     assert state.discovery_shuffle_batch_size == 123
     assert state.parallel_restart_batch_size == 7
+    assert state.restart_claim_preferred_fanout == 3
+    assert state.restart_claim_expanded_fanout == 5
+    assert state.restart_claim_gate_expand_after_ms == 5_000
+    assert state.restart_claim_gate_disable_after_ms == 45_000
   end
 
   test "invalid discovery tuning options raise" do
@@ -268,6 +284,48 @@ defmodule DurableServer.SupervisorBackendSpecTest do
          ]}
       )
     end
+
+    assert_raise RuntimeError, ~r/restart_claim_preferred_fanout/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("invalid_restart_preferred"),
+           prefix: unique_prefix("invalid_restart_preferred"),
+           backend: {InMemoryBackend, name: :invalid_restart_preferred},
+           restart_claim_preferred_fanout: 0
+         ]}
+      )
+    end
+
+    assert_raise RuntimeError,
+                 ~r/restart_claim_expanded_fanout must be >= restart_claim_preferred_fanout/,
+                 fn ->
+                   start_supervised!(
+                     {DurableServer.Supervisor,
+                      [
+                        name: unique_supervisor_name("invalid_restart_expanded"),
+                        prefix: unique_prefix("invalid_restart_expanded"),
+                        backend: {InMemoryBackend, name: :invalid_restart_expanded},
+                        restart_claim_preferred_fanout: 3,
+                        restart_claim_expanded_fanout: 2
+                      ]}
+                   )
+                 end
+
+    assert_raise RuntimeError,
+                 ~r/restart_claim_gate_disable_after_ms must be >= restart_claim_gate_expand_after_ms/,
+                 fn ->
+                   start_supervised!(
+                     {DurableServer.Supervisor,
+                      [
+                        name: unique_supervisor_name("invalid_restart_disable"),
+                        prefix: unique_prefix("invalid_restart_disable"),
+                        backend: {InMemoryBackend, name: :invalid_restart_disable},
+                        restart_claim_gate_expand_after_ms: 5_000,
+                        restart_claim_gate_disable_after_ms: 4_999
+                      ]}
+                   )
+                 end
   end
 
   test "safe_erpc_call rethrows remote not_ready as a local throw" do

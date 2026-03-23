@@ -132,13 +132,21 @@ defmodule DurableServer.LifecycleManager do
             discovery_stopped: false,
             discovery_burst_remaining: 0,
             discovery_shuffle_batch_size: nil,
-            parallel_restart_batch_size: nil
+            parallel_restart_batch_size: nil,
+            restart_claim_preferred_fanout: nil,
+            restart_claim_expanded_fanout: nil,
+            restart_claim_gate_expand_after_ms: nil,
+            restart_claim_gate_disable_after_ms: nil
 
   # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold
   # Orphan threshold (20s) already includes grace period (2x heartbeat interval),
   # so we only need a small buffer for crash propagation time
   @heartbeat_deadline_buffer_ms :timer.seconds(2)
   @restart_claim_ttl_ms :timer.seconds(30)
+  @restart_claim_preferred_fanout 2
+  @restart_claim_expanded_fanout 4
+  @restart_claim_gate_expand_after_ms :timer.seconds(30)
+  @restart_claim_gate_disable_after_ms :timer.minutes(2)
   @default_initial_discovery_delay_ms {1_000, 6_000}
   # batch size for accumulating keys before shuffling - provides randomization for load distribution
   # during cold deploys while maintaining bounded memory usage
@@ -195,6 +203,16 @@ defmodule DurableServer.LifecycleManager do
     end
   rescue
     ArgumentError -> %{}
+  end
+
+  @doc false
+  def __preferred_restart_claimer__(supervisor_name, %Meta{} = meta, opts \\ [])
+      when is_atom(supervisor_name) and is_list(opts) do
+    local_node = Keyword.get(opts, :local_node, Node.self())
+    now = Keyword.get(opts, :now, System.system_time(:millisecond))
+    gate_config = Keyword.get(opts, :gate_config, restart_claim_gate_config(supervisor_name))
+
+    preferred_restart_claimer?(supervisor_name, meta, gate_config, local_node, now)
   end
 
   @doc false
@@ -261,6 +279,10 @@ defmodule DurableServer.LifecycleManager do
         initial_discovery_delay_ms: @default_initial_discovery_delay_ms,
         discovery_shuffle_batch_size: @default_discovery_shuffle_batch_size,
         parallel_restart_batch_size: @default_parallel_restart_batch_size,
+        restart_claim_preferred_fanout: @restart_claim_preferred_fanout,
+        restart_claim_expanded_fanout: @restart_claim_expanded_fanout,
+        restart_claim_gate_expand_after_ms: @restart_claim_gate_expand_after_ms,
+        restart_claim_gate_disable_after_ms: @restart_claim_gate_disable_after_ms,
         heartbeat_interval_ms: 10_000,
         heartbeat_tracking_mode: :poll,
         heartbeat_reconcile_interval_ms: 10_000,
@@ -269,6 +291,10 @@ defmodule DurableServer.LifecycleManager do
       |> Map.put_new(:initial_discovery_delay_ms, @default_initial_discovery_delay_ms)
       |> Map.put_new(:discovery_shuffle_batch_size, @default_discovery_shuffle_batch_size)
       |> Map.put_new(:parallel_restart_batch_size, @default_parallel_restart_batch_size)
+      |> Map.put_new(:restart_claim_preferred_fanout, @restart_claim_preferred_fanout)
+      |> Map.put_new(:restart_claim_expanded_fanout, @restart_claim_expanded_fanout)
+      |> Map.put_new(:restart_claim_gate_expand_after_ms, @restart_claim_gate_expand_after_ms)
+      |> Map.put_new(:restart_claim_gate_disable_after_ms, @restart_claim_gate_disable_after_ms)
       |> Map.put_new(:heartbeat_tracking_mode, :poll)
       |> Map.put_new(:heartbeat_reconcile_interval_ms, 10_000)
 
@@ -328,7 +354,11 @@ defmodule DurableServer.LifecycleManager do
       discovery_skip_table: skip_tab,
       discovery_burst_remaining: Map.get(config, :discovery_burst_count, 0),
       discovery_shuffle_batch_size: config.discovery_shuffle_batch_size,
-      parallel_restart_batch_size: config.parallel_restart_batch_size
+      parallel_restart_batch_size: config.parallel_restart_batch_size,
+      restart_claim_preferred_fanout: config.restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: config.restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: config.restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: config.restart_claim_gate_disable_after_ms
     }
 
     # schedule periodic resource checks if limits configured
@@ -1385,6 +1415,54 @@ defmodule DurableServer.LifecycleManager do
         raise ArgumentError,
               "parallel_restart_batch_size must be a positive integer, got: #{inspect(other)}"
     end
+
+    case Map.fetch!(config, :restart_claim_preferred_fanout) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_preferred_fanout must be a positive integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :restart_claim_expanded_fanout) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_expanded_fanout must be a positive integer, got: #{inspect(other)}"
+    end
+
+    if Map.fetch!(config, :restart_claim_expanded_fanout) <
+         Map.fetch!(config, :restart_claim_preferred_fanout) do
+      raise ArgumentError,
+            "restart_claim_expanded_fanout must be >= restart_claim_preferred_fanout"
+    end
+
+    case Map.fetch!(config, :restart_claim_gate_expand_after_ms) do
+      value when is_integer(value) and value >= 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_gate_expand_after_ms must be a non-negative integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :restart_claim_gate_disable_after_ms) do
+      value when is_integer(value) and value >= 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_claim_gate_disable_after_ms must be a non-negative integer, got: #{inspect(other)}"
+    end
+
+    if Map.fetch!(config, :restart_claim_gate_disable_after_ms) <
+         Map.fetch!(config, :restart_claim_gate_expand_after_ms) do
+      raise ArgumentError,
+            "restart_claim_gate_disable_after_ms must be >= restart_claim_gate_expand_after_ms"
+    end
   end
 
   defp initial_discovery_delay_ms(timeout) when is_integer(timeout) and timeout >= 0, do: timeout
@@ -1395,8 +1473,256 @@ defmodule DurableServer.LifecycleManager do
     min_timeout + :rand.uniform(max_timeout - min_timeout + 1) - 1
   end
 
+  defp preferred_restart_claimer?(
+         supervisor_name,
+         %Meta{} = meta,
+         gate_config,
+         local_node \\ Node.self(),
+         now \\ System.system_time(:millisecond)
+       ) do
+    case restart_claim_contention_fanout(meta, gate_config, now) do
+      {:preferred, fanout} ->
+        report_diagnostic(supervisor_name, :restart_gate_fanout_preferred)
+        decide_restart_gate(supervisor_name, meta, gate_config, local_node, now, fanout)
+
+      {:expanded, fanout} ->
+        report_diagnostic(supervisor_name, :restart_gate_fanout_expanded)
+        decide_restart_gate(supervisor_name, meta, gate_config, local_node, now, fanout)
+
+      :all ->
+        report_diagnostic(supervisor_name, :restart_gate_fanout_all)
+        true
+    end
+  end
+
+  defp decide_restart_gate(supervisor_name, %Meta{} = meta, gate_config, local_node, now, fanout)
+       when is_integer(fanout) and fanout > 0 do
+    case eligible_restart_claim_nodes(supervisor_name, meta, gate_config, now) do
+      nodes when is_list(nodes) ->
+        cond do
+          length(nodes) < 2 ->
+            report_diagnostic(supervisor_name, :restart_gate_bypass_small_candidate_set)
+            true
+
+          not Enum.member?(nodes, local_node) ->
+            # The local restartability checks already said "yes". If this best-effort
+            # candidate set disagrees due to stale heartbeat/capacity state, do not
+            # suppress the local claimer and risk stranding the key.
+            report_diagnostic(supervisor_name, :restart_gate_bypass_local_missing)
+            true
+
+          true ->
+            allowed? =
+              nodes
+              |> preferred_restart_claim_nodes(meta.key, fanout)
+              |> Enum.member?(local_node)
+
+            if not allowed? do
+              report_diagnostic(supervisor_name, :restart_gate_deferred)
+            end
+
+            allowed?
+        end
+    end
+  end
+
+  defp restart_claim_contention_fanout(%Meta{} = meta, gate_config, now) when is_integer(now) do
+    age_ms =
+      case meta.last_heartbeat_at do
+        ts when is_integer(ts) -> max(now - ts, 0)
+        _ -> gate_config.restart_claim_gate_disable_after_ms + 1
+      end
+
+    cond do
+      age_ms < gate_config.restart_claim_gate_expand_after_ms ->
+        {:preferred, gate_config.restart_claim_preferred_fanout}
+
+      age_ms < gate_config.restart_claim_gate_disable_after_ms ->
+        {:expanded, gate_config.restart_claim_expanded_fanout}
+
+      true ->
+        :all
+    end
+  end
+
+  defp eligible_restart_claim_nodes(supervisor_name, %Meta{} = meta, _gate_config, now)
+       when is_atom(supervisor_name) and is_integer(now) do
+    heartbeat_table = heartbeat_table_name(supervisor_name)
+
+    case :ets.whereis(heartbeat_table) do
+      :undefined ->
+        []
+
+      _ ->
+        sticky_placement =
+          DurableServer.Supervisor.__augment_sticky_placement__(
+            supervisor_name,
+            meta.module,
+            meta.sticky_placement
+          )
+
+        delays = get_sticky_placement_delays(supervisor_name, meta.module)
+
+        node_health = lookup_node_health(meta)
+
+        node_unhealthy_or_full =
+          node_health in [:stale, :unknown] or
+            (match?({:healthy, _}, node_health) and
+               not can_node_accept_module?(node_health, meta.module))
+
+        needs_restart =
+          Meta.crashed?(meta) or
+            (Meta.running?(meta) and meta.permanent) or
+            (Meta.stopped_graceful?(meta) and meta.permanent)
+
+        merge_heartbeat_sources(supervisor_name, heartbeat_table, now)
+        |> Enum.flat_map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars,
+                             heartbeat_meta} ->
+          try do
+            node = String.to_existing_atom(node_str)
+
+            if now - timestamp <= @node_health_staleness_threshold_ms do
+              candidate_health =
+                {:healthy,
+                 %{
+                   node_ref: node_ref,
+                   capacity: capacity,
+                   resources: resources,
+                   env_vars: env_vars,
+                   heartbeat_meta: heartbeat_meta
+                 }}
+
+              matching_level = restart_claim_matching_level(sticky_placement, env_vars)
+
+              if restart_claim_node_eligible?(
+                   meta,
+                   sticky_placement,
+                   delays,
+                   needs_restart,
+                   node_unhealthy_or_full,
+                   matching_level,
+                   candidate_health
+                 ) do
+                [node]
+              else
+                []
+              end
+            else
+              []
+            end
+          rescue
+            ArgumentError ->
+              []
+          end
+        end)
+        |> Enum.uniq()
+    end
+  end
+
+  defp restart_claim_node_eligible?(
+         %Meta{} = meta,
+         sticky_placement,
+         delays,
+         needs_restart,
+         node_unhealthy_or_full,
+         matching_level,
+         candidate_health
+       ) do
+    cond do
+      needs_restart ->
+        matching_level != nil and
+          can_claim_at_level?(meta, matching_level, delays) and
+          can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level)
+
+      Meta.restart_attempt_expired?(meta) ->
+        can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level) and
+          (sticky_placement in [nil, []] or matching_level != nil)
+
+      node_unhealthy_or_full ->
+        matching_level != nil and
+          can_claim_at_level?(meta, matching_level, delays) and
+          can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level)
+
+      true ->
+        false
+    end
+  end
+
+  defp restart_claim_matching_level(nil, _env_vars), do: 0
+  defp restart_claim_matching_level([], _env_vars), do: 0
+
+  defp restart_claim_matching_level(sticky_placement, env_vars) when is_list(sticky_placement) do
+    Enum.find_index(sticky_placement, fn preference ->
+      case preference do
+        %{env_var: :any, value: :any} ->
+          true
+
+        %{env_var: env_var, value: expected_value} ->
+          Map.get(env_vars, env_var) == expected_value
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  defp preferred_restart_claim_nodes(nodes, key, fanout)
+       when is_list(nodes) and is_binary(key) and is_integer(fanout) and fanout > 0 do
+    count = min(fanout, length(nodes))
+
+    nodes
+    |> Enum.sort_by(&restart_claim_hash_score(key, &1), :desc)
+    |> Enum.take(count)
+  end
+
+  defp restart_claim_hash_score(key, node) do
+    node_str = to_string(node)
+    {:erlang.phash2({key, node_str}, 1_000_000_000), node_str}
+  end
+
+  defp restart_claim_gate_config(%LifecycleManager{} = state) do
+    %{
+      restart_claim_preferred_fanout: state.restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: state.restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: state.restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: state.restart_claim_gate_disable_after_ms
+    }
+  end
+
+  defp restart_claim_gate_config(supervisor_name) when is_atom(supervisor_name) do
+    case DurableServer.Supervisor.__get_config__(supervisor_name) do
+      %{
+        restart_claim_preferred_fanout: preferred_fanout,
+        restart_claim_expanded_fanout: expanded_fanout,
+        restart_claim_gate_expand_after_ms: expand_after_ms,
+        restart_claim_gate_disable_after_ms: disable_after_ms
+      } ->
+        %{
+          restart_claim_preferred_fanout: preferred_fanout,
+          restart_claim_expanded_fanout: expanded_fanout,
+          restart_claim_gate_expand_after_ms: expand_after_ms,
+          restart_claim_gate_disable_after_ms: disable_after_ms
+        }
+
+      _ ->
+        default_restart_claim_gate_config()
+    end
+  rescue
+    RuntimeError -> default_restart_claim_gate_config()
+  end
+
+  defp default_restart_claim_gate_config do
+    %{
+      restart_claim_preferred_fanout: @restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: @restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: @restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: @restart_claim_gate_disable_after_ms
+    }
+  end
+
   defp discover_and_restart_servers(%LifecycleManager{} = state) do
     diagnostics_before = discovery_diag_snapshot(state)
+    restart_gate_config = restart_claim_gate_config(state)
     skip_count = :ets.info(state.discovery_skip_table, :size)
 
     if skip_count > 0 do
@@ -1451,7 +1777,15 @@ defmodule DurableServer.LifecycleManager do
       fn {key, etag} ->
         case get_restartable_object(state, key) do
           %{} = obj ->
-            attempt_restart(state, obj)
+            if preferred_restart_claimer?(
+                 state.supervisor_name,
+                 obj.meta,
+                 restart_gate_config
+               ) do
+              attempt_restart(state, obj)
+            else
+              :noop
+            end
 
           :skip ->
             # permanently non-restartable — cache without meta
@@ -1532,10 +1866,19 @@ defmodule DurableServer.LifecycleManager do
     placement_erpc_attempts = Map.get(delta, :remote_placement_erpc_attempt, 0)
     placement_erpc_errors = Map.get(delta, :remote_placement_erpc_error, 0)
     race_lookup_erpc_errors = Map.get(delta, :race_lookup_erpc_error, 0)
+    restart_gate_preferred = Map.get(delta, :restart_gate_fanout_preferred, 0)
+    restart_gate_expanded = Map.get(delta, :restart_gate_fanout_expanded, 0)
+    restart_gate_all = Map.get(delta, :restart_gate_fanout_all, 0)
+    restart_gate_deferred = Map.get(delta, :restart_gate_deferred, 0)
+    restart_gate_bypass_small = Map.get(delta, :restart_gate_bypass_small_candidate_set, 0)
+    restart_gate_bypass_missing = Map.get(delta, :restart_gate_bypass_local_missing, 0)
 
     if group_nil > 0 or group_mismatch > 0 or sync_stop_errors > 0 or rpc_timeouts > 0 or
          rpc_noconnection > 0 or rpc_notsup > 0 or placement_erpc_attempts > 0 or
-         placement_erpc_errors > 0 or race_lookup_erpc_errors > 0 do
+         placement_erpc_errors > 0 or race_lookup_erpc_errors > 0 or
+         restart_gate_preferred > 0 or restart_gate_expanded > 0 or restart_gate_all > 0 or
+         restart_gate_deferred > 0 or restart_gate_bypass_small > 0 or
+         restart_gate_bypass_missing > 0 do
       log(state, :info, fn ->
         "Discovery diagnostics delta: group_nil=#{group_nil} " <>
           "group_mismatch=#{group_mismatch} slow_path=#{slow_path} " <>
@@ -1543,7 +1886,13 @@ defmodule DurableServer.LifecycleManager do
           "rpc_noconnection=#{rpc_noconnection} rpc_notsup=#{rpc_notsup} " <>
           "placement_erpc_attempts=#{placement_erpc_attempts} " <>
           "placement_erpc_errors=#{placement_erpc_errors} " <>
-          "race_lookup_erpc_errors=#{race_lookup_erpc_errors}"
+          "race_lookup_erpc_errors=#{race_lookup_erpc_errors} " <>
+          "restart_gate_preferred=#{restart_gate_preferred} " <>
+          "restart_gate_expanded=#{restart_gate_expanded} " <>
+          "restart_gate_all=#{restart_gate_all} " <>
+          "restart_gate_deferred=#{restart_gate_deferred} " <>
+          "restart_gate_bypass_small=#{restart_gate_bypass_small} " <>
+          "restart_gate_bypass_missing=#{restart_gate_bypass_missing}"
       end)
     end
   end

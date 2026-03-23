@@ -1056,6 +1056,29 @@ defmodule DurableServer.LifecycleTest do
     end
   end
 
+  defp setup_restart_gate_tables(supervisor_name) do
+    config_table = :"durable_supervisor_#{supervisor_name}"
+    heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
+
+    ^config_table =
+      :ets.new(config_table, [:named_table, :set, :protected, read_concurrency: true])
+
+    ^heartbeat_table =
+      :ets.new(heartbeat_table, [:named_table, :set, :public, read_concurrency: true])
+
+    :ets.insert(config_table, {:sticky_placement_config, %{per_module: %{}, default: nil}})
+
+    on_exit(fn ->
+      if :ets.whereis(heartbeat_table) != :undefined do
+        :ets.delete(heartbeat_table)
+      end
+
+      if :ets.whereis(config_table) != :undefined do
+        :ets.delete(config_table)
+      end
+    end)
+  end
+
   describe "lifecycle manager edge cases" do
     test "handles object store failures during discovery gracefully", %{
       supervisor_name: supervisor_name,
@@ -1076,6 +1099,115 @@ defmodule DurableServer.LifecycleTest do
 
       assert_process_alive(pid)
       GenServer.stop(pid)
+    end
+
+    test "restart claimer gate limits fresh contention and widens over time" do
+      supervisor_name = :"restart_gate_#{DurableServer.UUID.uuid4()}"
+      setup_restart_gate_tables(supervisor_name)
+
+      now = System.system_time(:millisecond)
+
+      nodes = [
+        :"gate-a@test",
+        :"gate-b@test",
+        :"gate-c@test",
+        :"gate-d@test",
+        :"gate-e@test"
+      ]
+
+      heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
+
+      Enum.with_index(nodes, 1)
+      |> Enum.each(fn {node, idx} ->
+        :ets.insert(
+          heartbeat_table,
+          {to_string(node), idx, now, nil, nil, %{}, %{}}
+        )
+      end)
+
+      base_meta = %Meta{
+        key: "driver/test",
+        module: TestServer,
+        permanent: true,
+        status: :running,
+        supervisor: supervisor_name,
+        node_str: "owner@test",
+        node_ref: 1,
+        sticky_placement: nil
+      }
+
+      fresh_meta = %{base_meta | last_heartbeat_at: now}
+      warm_meta = %{base_meta | last_heartbeat_at: now - :timer.seconds(45)}
+      old_meta = %{base_meta | last_heartbeat_at: now - :timer.minutes(3)}
+
+      fresh_decisions =
+        Enum.map(nodes, fn node ->
+          LifecycleManager.__preferred_restart_claimer__(
+            supervisor_name,
+            fresh_meta,
+            local_node: node,
+            now: now
+          )
+        end)
+
+      warm_decisions =
+        Enum.map(nodes, fn node ->
+          LifecycleManager.__preferred_restart_claimer__(
+            supervisor_name,
+            warm_meta,
+            local_node: node,
+            now: now
+          )
+        end)
+
+      old_decisions =
+        Enum.map(nodes, fn node ->
+          LifecycleManager.__preferred_restart_claimer__(
+            supervisor_name,
+            old_meta,
+            local_node: node,
+            now: now
+          )
+        end)
+
+      assert Enum.count(fresh_decisions, & &1) == 2
+      assert Enum.count(warm_decisions, & &1) == 4
+      assert Enum.all?(old_decisions)
+    end
+
+    test "restart claimer gate does not strand keys when local node is absent from candidate view" do
+      supervisor_name = :"restart_gate_absent_#{DurableServer.UUID.uuid4()}"
+      setup_restart_gate_tables(supervisor_name)
+
+      now = System.system_time(:millisecond)
+      heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
+
+      Enum.with_index([:"gate-a@test", :"gate-b@test", :"gate-c@test"], 1)
+      |> Enum.each(fn {node, idx} ->
+        :ets.insert(
+          heartbeat_table,
+          {to_string(node), idx, now, nil, nil, %{}, %{}}
+        )
+      end)
+
+      meta = %Meta{
+        key: "driver/test",
+        module: TestServer,
+        permanent: true,
+        status: :running,
+        supervisor: supervisor_name,
+        node_str: "owner@test",
+        node_ref: 1,
+        sticky_placement: nil,
+        last_heartbeat_at: now
+      }
+
+      assert LifecycleManager.__preferred_restart_claimer__(
+               supervisor_name,
+               meta,
+               local_node: :missing@test,
+               now: now
+             )
     end
 
     test "handles invalid metadata gracefully during restart detection", %{

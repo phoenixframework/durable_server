@@ -75,6 +75,14 @@ defmodule DurableServer.Supervisor do
     shuffling restart order (default: 20_000)
   - `:parallel_restart_batch_size` - Number of restart attempts to run concurrently per
     node during a discovery sweep (default: 50)
+  - `:restart_claim_preferred_fanout` - Number of eligible nodes allowed to contend for
+    a freshly restartable key before widening (default: 2)
+  - `:restart_claim_expanded_fanout` - Number of eligible nodes allowed to contend after
+    the first restart-gate age threshold (default: 4)
+  - `:restart_claim_gate_expand_after_ms` - Age after which restart contention widens
+    from preferred to expanded fanout (default: 30_000)
+  - `:restart_claim_gate_disable_after_ms` - Age after which the restart contention gate
+    is disabled and all eligible nodes may contend (default: 120_000)
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
     Defaults from backend capabilities.
@@ -207,6 +215,10 @@ defmodule DurableServer.Supervisor do
   @default_initial_discovery_delay_ms {1_000, 6_000}
   @default_discovery_shuffle_batch_size 20_000
   @default_parallel_restart_batch_size 50
+  @default_restart_claim_preferred_fanout 2
+  @default_restart_claim_expanded_fanout 4
+  @default_restart_claim_gate_expand_after_ms :timer.seconds(30)
+  @default_restart_claim_gate_disable_after_ms :timer.minutes(2)
   @default_heartbeat_interval_ms 10_000
   @default_heartbeat_tracking_mode :poll
   @default_heartbeat_reconcile_interval_ms 10_000
@@ -584,6 +596,10 @@ defmodule DurableServer.Supervisor do
     `{min_ms, max_ms}` jitter tuple (default: `{1_000, 6_000}`)
   - `:discovery_shuffle_batch_size` - Discovery shuffle batch size (default: 20_000)
   - `:parallel_restart_batch_size` - Concurrent restart attempts per node (default: 50)
+  - `:restart_claim_preferred_fanout` - Initial restart claim contention fanout (default: 2)
+  - `:restart_claim_expanded_fanout` - Expanded restart claim contention fanout (default: 4)
+  - `:restart_claim_gate_expand_after_ms` - Age before widening claim fanout (default: 30_000)
+  - `:restart_claim_gate_disable_after_ms` - Age before disabling the claim gate (default: 120_000)
   - `:heartbeat_interval_ms` - Node heartbeat interval (default: 10_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
@@ -2449,6 +2465,10 @@ defmodule DurableServer.Supervisor do
         :discovery_burst_count,
         :discovery_shuffle_batch_size,
         :parallel_restart_batch_size,
+        :restart_claim_preferred_fanout,
+        :restart_claim_expanded_fanout,
+        :restart_claim_gate_expand_after_ms,
+        :restart_claim_gate_disable_after_ms,
         :heartbeat_interval_ms,
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
@@ -2512,6 +2532,44 @@ defmodule DurableServer.Supervisor do
         :parallel_restart_batch_size,
         @default_parallel_restart_batch_size
       )
+
+    restart_claim_preferred_fanout =
+      extract_positive_integer!(
+        opts,
+        :restart_claim_preferred_fanout,
+        @default_restart_claim_preferred_fanout
+      )
+
+    restart_claim_expanded_fanout =
+      extract_positive_integer!(
+        opts,
+        :restart_claim_expanded_fanout,
+        @default_restart_claim_expanded_fanout
+      )
+
+    restart_claim_gate_expand_after_ms =
+      extract_non_negative_integer!(
+        opts,
+        :restart_claim_gate_expand_after_ms,
+        @default_restart_claim_gate_expand_after_ms
+      )
+
+    restart_claim_gate_disable_after_ms =
+      extract_non_negative_integer!(
+        opts,
+        :restart_claim_gate_disable_after_ms,
+        @default_restart_claim_gate_disable_after_ms
+      )
+
+    if restart_claim_expanded_fanout < restart_claim_preferred_fanout do
+      raise ArgumentError,
+            "restart_claim_expanded_fanout must be >= restart_claim_preferred_fanout"
+    end
+
+    if restart_claim_gate_disable_after_ms < restart_claim_gate_expand_after_ms do
+      raise ArgumentError,
+            "restart_claim_gate_disable_after_ms must be >= restart_claim_gate_expand_after_ms"
+    end
 
     heartbeat_interval_ms =
       extract_backend_tuned_interval!(
@@ -2609,6 +2667,10 @@ defmodule DurableServer.Supervisor do
       discovery_burst_count: Keyword.get(opts, :discovery_burst_count, 3),
       discovery_shuffle_batch_size: discovery_shuffle_batch_size,
       parallel_restart_batch_size: parallel_restart_batch_size,
+      restart_claim_preferred_fanout: restart_claim_preferred_fanout,
+      restart_claim_expanded_fanout: restart_claim_expanded_fanout,
+      restart_claim_gate_expand_after_ms: restart_claim_gate_expand_after_ms,
+      restart_claim_gate_disable_after_ms: restart_claim_gate_disable_after_ms,
       heartbeat_interval_ms: heartbeat_interval_ms,
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
@@ -3132,6 +3194,16 @@ defmodule DurableServer.Supervisor do
 
       other ->
         raise ArgumentError, "#{key} must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp extract_non_negative_integer!(opts, key, default) when is_list(opts) and is_atom(key) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value >= 0 ->
+        value
+
+      other ->
+        raise ArgumentError, "#{key} must be a non-negative integer, got: #{inspect(other)}"
     end
   end
 
