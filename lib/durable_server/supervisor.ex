@@ -66,8 +66,15 @@ defmodule DurableServer.Supervisor do
   - `:prefix` - Required. Object storage prefix for scoping (should end with "/")
   - `:max_children` - Maximum concurrent DurableServer processes (default: :infinity)
   - `:discovery_interval_ms` - How often to scan for orphaned servers (default: 60_000)
+  - `:initial_discovery_delay_ms` - Initial delay before the first discovery sweep.
+    Accepts either a fixed integer delay or a `{min_ms, max_ms}` jitter tuple
+    (default: `{1_000, 6_000}`)
   - `:discovery_burst_count` - Number of initial discovery sweeps to run back-to-back
     without waiting for the discovery interval (default: 3)
+  - `:discovery_shuffle_batch_size` - Number of candidate keys to accumulate before
+    shuffling restart order (default: 20_000)
+  - `:parallel_restart_batch_size` - Number of restart attempts to run concurrently per
+    node during a discovery sweep (default: 50)
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
     Defaults from backend capabilities.
@@ -197,6 +204,9 @@ defmodule DurableServer.Supervisor do
   @default_placement_timeout :timer.seconds(15)
   @default_start_child_timeout 5_000
   @default_discovery_interval_ms 60_000
+  @default_initial_discovery_delay_ms {1_000, 6_000}
+  @default_discovery_shuffle_batch_size 20_000
+  @default_parallel_restart_batch_size 50
   @default_heartbeat_interval_ms 10_000
   @default_heartbeat_tracking_mode :poll
   @default_heartbeat_reconcile_interval_ms 10_000
@@ -570,6 +580,10 @@ defmodule DurableServer.Supervisor do
   - `:prefix` - Required. Object storage prefix (should end with "/")
   - `:max_children` - Maximum concurrent children (default: :infinity)
   - `:discovery_interval_ms` - Lifecycle discovery interval (default: 60_000)
+  - `:initial_discovery_delay_ms` - Initial discovery delay as a fixed integer or
+    `{min_ms, max_ms}` jitter tuple (default: `{1_000, 6_000}`)
+  - `:discovery_shuffle_batch_size` - Discovery shuffle batch size (default: 20_000)
+  - `:parallel_restart_batch_size` - Concurrent restart attempts per node (default: 50)
   - `:heartbeat_interval_ms` - Node heartbeat interval (default: 10_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
@@ -2431,7 +2445,10 @@ defmodule DurableServer.Supervisor do
         :max_memory,
         :max_disk,
         :discovery_interval_ms,
+        :initial_discovery_delay_ms,
         :discovery_burst_count,
+        :discovery_shuffle_batch_size,
+        :parallel_restart_batch_size,
         :heartbeat_interval_ms,
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
@@ -2477,6 +2494,23 @@ defmodule DurableServer.Supervisor do
         :discovery_interval_ms,
         storage_backend_defaults,
         @default_discovery_interval_ms
+      )
+
+    initial_discovery_delay_ms =
+      extract_initial_discovery_delay_config(opts, @default_initial_discovery_delay_ms)
+
+    discovery_shuffle_batch_size =
+      extract_positive_integer!(
+        opts,
+        :discovery_shuffle_batch_size,
+        @default_discovery_shuffle_batch_size
+      )
+
+    parallel_restart_batch_size =
+      extract_positive_integer!(
+        opts,
+        :parallel_restart_batch_size,
+        @default_parallel_restart_batch_size
       )
 
     heartbeat_interval_ms =
@@ -2571,7 +2605,10 @@ defmodule DurableServer.Supervisor do
       storage_backend: storage_backend,
       object_store: object_store,
       discovery_interval_ms: discovery_interval_ms,
+      initial_discovery_delay_ms: initial_discovery_delay_ms,
       discovery_burst_count: Keyword.get(opts, :discovery_burst_count, 3),
+      discovery_shuffle_batch_size: discovery_shuffle_batch_size,
+      parallel_restart_batch_size: parallel_restart_batch_size,
       heartbeat_interval_ms: heartbeat_interval_ms,
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
@@ -3069,6 +3106,32 @@ defmodule DurableServer.Supervisor do
       {:ok, other} ->
         raise ArgumentError,
               "max_singleflight_waiters_per_key_module must be a positive integer when provided, got: #{inspect(other)}"
+    end
+  end
+
+  defp extract_initial_discovery_delay_config(opts, default) when is_list(opts) do
+    case Keyword.get(opts, :initial_discovery_delay_ms, default) do
+      timeout when is_integer(timeout) and timeout >= 0 ->
+        timeout
+
+      {min_timeout, max_timeout}
+      when is_integer(min_timeout) and min_timeout >= 0 and is_integer(max_timeout) and
+             max_timeout >= min_timeout ->
+        {min_timeout, max_timeout}
+
+      other ->
+        raise ArgumentError,
+              "initial_discovery_delay_ms must be a non-negative integer or {min_ms, max_ms} tuple, got: #{inspect(other)}"
+    end
+  end
+
+  defp extract_positive_integer!(opts, key, default) when is_list(opts) and is_atom(key) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      other ->
+        raise ArgumentError, "#{key} must be a positive integer, got: #{inspect(other)}"
     end
   end
 

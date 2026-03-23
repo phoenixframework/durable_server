@@ -286,6 +286,43 @@ defmodule GroupTest do
     end
   end
 
+  describe "count APIs" do
+    test "registry_count returns this node's replicated registry view", %{supervisor_name: sup} do
+      key1 = "registry/#{DurableServer.UUID.uuid4()}"
+      key2 = "registry/#{DurableServer.UUID.uuid4()}"
+
+      assert Group.registry_count(sup) == 0
+      assert Group.local_registry_count(sup) == 0
+
+      {:ok, {_pid1, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key1}})
+      {:ok, {_pid2, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key2}})
+
+      assert Group.registry_count(sup) == 2
+      assert Group.local_registry_count(sup) == 2
+    end
+
+    test "member_count counts exact keys and prefixes from the replicated PG view", %{
+      supervisor_name: sup
+    } do
+      room1 = "rooms/#{DurableServer.UUID.uuid4()}"
+      room2 = "rooms/#{DurableServer.UUID.uuid4()}"
+      other = "other/#{DurableServer.UUID.uuid4()}"
+
+      assert Group.member_count(sup, room1) == 0
+      assert Group.member_count(sup, "rooms/") == 0
+      assert Group.local_member_count(sup, room1) == 0
+
+      :ok = Group.join(sup, room1, %{role: :listener})
+      :ok = Group.join(sup, room2, %{role: :listener})
+      :ok = Group.join(sup, other, %{role: :listener})
+
+      assert Group.member_count(sup, room1) == 1
+      assert Group.local_member_count(sup, room1) == 1
+      assert Group.member_count(sup, "rooms/") == 2
+      assert Group.member_count(sup, "other/") == 1
+    end
+  end
+
   describe "integration" do
     test "full lifecycle: subscribe, start server, join, stop, leave", %{supervisor_name: sup} do
       key = "integration/test/#{DurableServer.UUID.uuid4()}"

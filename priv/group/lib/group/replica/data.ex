@@ -89,8 +89,9 @@ defmodule Group.Replica.Data do
   - `local_data_by_cluster/3`: Full table scan filtering by `node() == local_node`,
     grouped by cluster. Only runs during discovery/sync protocol.
 
-  - `local_registry_count`, `local_pg_count`: Uses `ets.select_count` with a guard.
-    Full scan but returns only the count without materializing results.
+  - `registry_count`, `pg_count`, `pg_count_by_prefix`, `local_registry_count`,
+    `local_pg_count`: Uses `ets.select_count`. Full scan but returns only the
+    count without materializing results.
 
   - `entries_by_pid/3`: Range scan on the by_pid ordered_set tables. O(entries for that pid).
 
@@ -414,6 +415,48 @@ defmodule Group.Replica.Data do
   # =====================================================================
   # Counting
   # =====================================================================
+
+  def registry_count(name, num_shards, cluster) do
+    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
+      table = reg_by_key_table(name, shard)
+
+      count =
+        :ets.select_count(table, [
+          {{{cluster, :_}, :_, :_, :_, :_}, [], [true]}
+        ])
+
+      acc + count
+    end)
+  end
+
+  def pg_count(name, num_shards, cluster, key) do
+    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
+      table = pg_by_key_table(name, shard)
+
+      count =
+        :ets.select_count(table, [
+          {{{cluster, key, :_}, :_, :_, :_}, [], [true]}
+        ])
+
+      acc + count
+    end)
+  end
+
+  def pg_count_by_prefix(name, num_shards, cluster, prefix) do
+    prefix_end = next_binary_prefix(prefix)
+
+    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
+      table = pg_by_key_table(name, shard)
+
+      count =
+        :ets.select_count(table, [
+          {{{cluster, :"$1", :_}, :_, :_, :_},
+           [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [true]}
+        ])
+
+      acc + count
+    end)
+  end
 
   def local_registry_count(name, num_shards, cluster) do
     local_node = node()

@@ -409,9 +409,10 @@ defmodule DurableServer.LifecycleTest do
       supervisor_name: supervisor_name,
       prefix: prefix,
       config: config,
-      circuit_breaker: _circuit_breaker
+      circuit_breaker: circuit_breaker
     } do
       key = "detect-crashed-test-#{DurableServer.UUID.uuid4()}"
+      breaker_table = circuit_breaker.table_name
 
       # Create server and stop it
       pid = start_test_server(supervisor_name, key)
@@ -453,6 +454,12 @@ defmodule DurableServer.LifecycleTest do
       send(manager_pid, :discover_and_restart)
       wait_for_discovery_completion(manager_pid, 5000)
 
+      assert {restarted_pid, _meta} =
+               DurableServer.Supervisor.lookup(supervisor_name, key)
+
+      assert restarted_pid != pid
+      assert_process_alive(restarted_pid)
+
       # Check if restart attempt was made
       {:ok, final_data} =
         DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
@@ -469,8 +476,8 @@ defmodule DurableServer.LifecycleTest do
       assert Map.get(final_data.meta, :restart_attempt_time) == nil
       assert Map.get(final_data.meta, :restart_attempt_ttl) == nil
 
-      # This confirms the LifecycleManager detected the orphan, attempted restart,
-      # failed due to module interface mismatch, and cleaned up properly
+      assert :ets.lookup(breaker_table, TestServer) == []
+
       GenServer.stop(manager_pid)
     end
 

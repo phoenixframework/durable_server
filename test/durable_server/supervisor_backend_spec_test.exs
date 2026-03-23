@@ -1,6 +1,7 @@
 defmodule DurableServer.SupervisorBackendSpecTest do
   use ExUnit.Case, async: false
 
+  alias DurableServer.LifecycleManager
   alias DurableServer.Backends.MirrorStore
   alias DurableServer.StorageBackend
 
@@ -192,6 +193,81 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     )
 
     assert DurableServer.Supervisor.ready?(supervisor_name)
+  end
+
+  test "discovery tuning options are propagated to lifecycle manager state" do
+    supervisor_name = unique_supervisor_name("discovery_tuning")
+    prefix = unique_prefix("discovery_tuning")
+
+    start_supervised!(
+      {DurableServer.Supervisor,
+       [
+         name: supervisor_name,
+         prefix: prefix,
+         backend: {InMemoryBackend, name: :discovery_tuning},
+         initial_discovery_delay_ms: {10, 20},
+         discovery_shuffle_batch_size: 123,
+         parallel_restart_batch_size: 7,
+         graceful_shutdown_timeout_ms: 500
+       ]}
+    )
+
+    %{
+      initial_discovery_delay_ms: initial_discovery_delay_ms,
+      discovery_shuffle_batch_size: discovery_shuffle_batch_size,
+      parallel_restart_batch_size: parallel_restart_batch_size
+    } = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+    assert initial_discovery_delay_ms == {10, 20}
+    assert discovery_shuffle_batch_size == 123
+    assert parallel_restart_batch_size == 7
+
+    state = :sys.get_state(LifecycleManager.name(supervisor_name))
+
+    assert state.initial_discovery_delay_ms == {10, 20}
+    assert state.discovery_shuffle_batch_size == 123
+    assert state.parallel_restart_batch_size == 7
+  end
+
+  test "invalid discovery tuning options raise" do
+    supervisor_name = unique_supervisor_name("invalid_discovery_tuning")
+    prefix = unique_prefix("invalid_discovery_tuning")
+
+    assert_raise RuntimeError, ~r/initial_discovery_delay_ms/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: supervisor_name,
+           prefix: prefix,
+           backend: {InMemoryBackend, name: :invalid_discovery_tuning},
+           initial_discovery_delay_ms: {20, 10}
+         ]}
+      )
+    end
+
+    assert_raise RuntimeError, ~r/discovery_shuffle_batch_size/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("invalid_shuffle"),
+           prefix: unique_prefix("invalid_shuffle"),
+           backend: {InMemoryBackend, name: :invalid_shuffle},
+           discovery_shuffle_batch_size: 0
+         ]}
+      )
+    end
+
+    assert_raise RuntimeError, ~r/parallel_restart_batch_size/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("invalid_parallel"),
+           prefix: unique_prefix("invalid_parallel"),
+           backend: {InMemoryBackend, name: :invalid_parallel},
+           parallel_restart_batch_size: 0
+         ]}
+      )
+    end
   end
 
   test "safe_erpc_call rethrows remote not_ready as a local throw" do

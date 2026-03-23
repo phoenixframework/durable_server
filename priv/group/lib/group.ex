@@ -639,6 +639,35 @@ defmodule Group do
   end
 
   @doc """
+  Count processes registered in this node's local replicated ETS view.
+
+  This returns the caller node's current view of the cluster registry.
+  It is eventually consistent across nodes and may differ briefly during
+  propagation, partitions, or healing.
+
+  ## Parameters
+
+  - `name` - The Group name
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Count in a named cluster instead of the default cluster
+
+  ## Returns
+
+  - Integer count
+  """
+  def registry_count(name, opts \\ [])
+
+  def registry_count(name, opts)
+      when is_atom(name) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    num_shards = get_config(name).num_shards
+    Data.registry_count(name, num_shards, cluster)
+  end
+
+  @doc """
   Count processes registered in the local node's registry.
 
   This counts only processes registered via `register/5` on the local node.
@@ -663,6 +692,44 @@ defmodule Group do
     cluster = Keyword.get(opts, :cluster)
     num_shards = get_config(name).num_shards
     Data.local_registry_count(name, num_shards, cluster)
+  end
+
+  @doc """
+  Count group members in this node's local replicated ETS view.
+
+  This returns the caller node's current view of process group membership.
+  It is eventually consistent across nodes and may differ briefly during
+  propagation, partitions, or healing.
+
+  Supports prefix matching: if `group` ends with `"/"`, counts all
+  members whose group key starts with that prefix.
+
+  ## Parameters
+
+  - `name` - The Group name
+  - `group` - The group to count (string). Append `"/"` for prefix matching.
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Count in a named cluster instead of the default cluster
+
+  ## Returns
+
+  - Integer count
+  """
+  def member_count(name, group, opts \\ [])
+
+  def member_count(name, group, opts)
+      when is_atom(name) and is_binary(group) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    num_shards = get_config(name).num_shards
+
+    if String.ends_with?(group, "/") do
+      Data.pg_count_by_prefix(name, num_shards, cluster, group)
+    else
+      Data.pg_count(name, num_shards, cluster, group)
+    end
   end
 
   @doc """

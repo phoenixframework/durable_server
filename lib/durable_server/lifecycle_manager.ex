@@ -116,6 +116,7 @@ defmodule DurableServer.LifecycleManager do
             current_heartbeat_task: nil,
             heartbeat_table: nil,
             discovery_interval_ms: nil,
+            initial_discovery_delay_ms: nil,
             heartbeat_interval_ms: nil,
             heartbeat_tracking_mode: :poll,
             heartbeat_reconcile_interval_ms: nil,
@@ -129,18 +130,21 @@ defmodule DurableServer.LifecycleManager do
             discovery_diag_table: nil,
             discovery_skip_table: nil,
             discovery_stopped: false,
-            discovery_burst_remaining: 0
+            discovery_burst_remaining: 0,
+            discovery_shuffle_batch_size: nil,
+            parallel_restart_batch_size: nil
 
   # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold
   # Orphan threshold (20s) already includes grace period (2x heartbeat interval),
   # so we only need a small buffer for crash propagation time
   @heartbeat_deadline_buffer_ms :timer.seconds(2)
   @restart_claim_ttl_ms :timer.seconds(30)
+  @default_initial_discovery_delay_ms {1_000, 6_000}
   # batch size for accumulating keys before shuffling - provides randomization for load distribution
   # during cold deploys while maintaining bounded memory usage
-  @shuffle_batch_size 20_000
+  @default_discovery_shuffle_batch_size 20_000
   # parallel processing batch size - how many restart attempts to run concurrently
-  @parallel_restart_batch_size 50
+  @default_parallel_restart_batch_size 50
   # Threshold for considering a node's heartbeat stale (used in heartbeat validation/deadline)
   @heartbeat_staleness_threshold_ms :timer.seconds(20)
   # Threshold for considering a node unhealthy when finding eligible placement nodes
@@ -254,13 +258,21 @@ defmodule DurableServer.LifecycleManager do
       opts
       |> Keyword.get(:config, %{
         discovery_interval_ms: 60_000,
+        initial_discovery_delay_ms: @default_initial_discovery_delay_ms,
+        discovery_shuffle_batch_size: @default_discovery_shuffle_batch_size,
+        parallel_restart_batch_size: @default_parallel_restart_batch_size,
         heartbeat_interval_ms: 10_000,
         heartbeat_tracking_mode: :poll,
         heartbeat_reconcile_interval_ms: 10_000,
         prefix: "test/"
       })
+      |> Map.put_new(:initial_discovery_delay_ms, @default_initial_discovery_delay_ms)
+      |> Map.put_new(:discovery_shuffle_batch_size, @default_discovery_shuffle_batch_size)
+      |> Map.put_new(:parallel_restart_batch_size, @default_parallel_restart_batch_size)
       |> Map.put_new(:heartbeat_tracking_mode, :poll)
       |> Map.put_new(:heartbeat_reconcile_interval_ms, 10_000)
+
+    validate_discovery_config!(config)
 
     # Validate heartbeat timing config
     # Nodes are considered stale at 2x heartbeat_interval. If heartbeat_interval is too long,
@@ -306,6 +318,7 @@ defmodule DurableServer.LifecycleManager do
       current_heartbeat_task: nil,
       heartbeat_table: hearbeat_tab,
       discovery_interval_ms: config.discovery_interval_ms,
+      initial_discovery_delay_ms: config.initial_discovery_delay_ms,
       heartbeat_interval_ms: config.heartbeat_interval_ms,
       heartbeat_tracking_mode: config.heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: config.heartbeat_reconcile_interval_ms,
@@ -313,7 +326,9 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_meta: heartbeat_meta,
       discovery_diag_table: diagnostics_tab,
       discovery_skip_table: skip_tab,
-      discovery_burst_remaining: Map.get(config, :discovery_burst_count, 0)
+      discovery_burst_remaining: Map.get(config, :discovery_burst_count, 0),
+      discovery_shuffle_batch_size: config.discovery_shuffle_batch_size,
+      parallel_restart_batch_size: config.parallel_restart_batch_size
     }
 
     # schedule periodic resource checks if limits configured
@@ -326,8 +341,8 @@ defmodule DurableServer.LifecycleManager do
         state
       end
 
-    # start with a random delay to spread out discovery across nodes
-    discovery_delay = :rand.uniform(5_000) + 1_000
+    # start with a configured delay/jitter window to spread out discovery across nodes
+    discovery_delay = initial_discovery_delay_ms(config.initial_discovery_delay_ms)
     Process.send_after(self(), :discover_and_restart, discovery_delay)
 
     Process.send_after(self(), :heartbeat, config.heartbeat_interval_ms)
@@ -1338,6 +1353,48 @@ defmodule DurableServer.LifecycleManager do
     {state.discovery_interval_ms, state}
   end
 
+  defp validate_discovery_config!(config) when is_map(config) do
+    case Map.fetch!(config, :initial_discovery_delay_ms) do
+      timeout when is_integer(timeout) and timeout >= 0 ->
+        :ok
+
+      {min_timeout, max_timeout}
+      when is_integer(min_timeout) and min_timeout >= 0 and is_integer(max_timeout) and
+             max_timeout >= min_timeout ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "initial_discovery_delay_ms must be a non-negative integer or {min_ms, max_ms} tuple, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :discovery_shuffle_batch_size) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "discovery_shuffle_batch_size must be a positive integer, got: #{inspect(other)}"
+    end
+
+    case Map.fetch!(config, :parallel_restart_batch_size) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "parallel_restart_batch_size must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp initial_discovery_delay_ms(timeout) when is_integer(timeout) and timeout >= 0, do: timeout
+
+  defp initial_discovery_delay_ms({min_timeout, max_timeout})
+       when is_integer(min_timeout) and min_timeout >= 0 and is_integer(max_timeout) and
+              max_timeout >= min_timeout do
+    min_timeout + :rand.uniform(max_timeout - min_timeout + 1) - 1
+  end
+
   defp discover_and_restart_servers(%LifecycleManager{} = state) do
     diagnostics_before = discovery_diag_snapshot(state)
     skip_count = :ets.info(state.discovery_skip_table, :size)
@@ -1377,7 +1434,7 @@ defmodule DurableServer.LifecycleManager do
     # accumulate large batches of keys, then shuffle for randomized restart order
     # this prevents all servers from being restarted in storage enumeration order
     # which would cause the first node up during a cold deploy to claim everything
-    |> Stream.chunk_every(@shuffle_batch_size)
+    |> Stream.chunk_every(state.discovery_shuffle_batch_size)
     |> Stream.flat_map(fn items ->
       shuffled = Enum.shuffle(items)
 
@@ -1387,70 +1444,59 @@ defmodule DurableServer.LifecycleManager do
 
       shuffled
     end)
-    # process in smaller parallel batches for restart attempts
-    |> Stream.chunk_every(@parallel_restart_batch_size)
-    |> Enum.each(fn
-      [_ | _] = batch ->
-        log(state, :debug, fn ->
-          "Processing parallel batch of #{length(batch)} servers for potential restart"
+    # keep restart concurrency bounded, but do not wait for an entire fixed-size
+    # batch to drain before launching more work. This avoids one slow key holding
+    # up the next N restart attempts.
+    |> Task.async_stream(
+      fn {key, etag} ->
+        case get_restartable_object(state, key) do
+          %{} = obj ->
+            attempt_restart(state, obj)
+
+          :skip ->
+            # permanently non-restartable — cache without meta
+            now = System.monotonic_time(:millisecond)
+            :ets.insert(state.discovery_skip_table, {key, etag, :skip, now})
+            :noop
+
+          {:skip, %Meta{} = meta} ->
+            # temporarily non-restartable (circuit breaker, time-gated placement,
+            # health check) — cache trimmed meta for re-evaluation next round
+            now = System.monotonic_time(:millisecond)
+            trimmed = trim_meta_for_cache(meta)
+            :ets.insert(state.discovery_skip_table, {key, etag, trimmed, now})
+            :noop
+
+          nil ->
+            # fetch error — don't cache
+            :noop
+        end
+      end,
+      timeout: 120_000,
+      on_timeout: :kill_task,
+      ordered: false,
+      max_concurrency: state.parallel_restart_batch_size
+    )
+    |> Enum.reduce(%{timeouts: 0, exits: 0}, fn
+      {:ok, _result}, acc ->
+        acc
+
+      {:exit, :timeout}, acc ->
+        %{acc | timeouts: acc.timeouts + 1}
+
+      {:exit, reason}, acc ->
+        log(state, :warning, fn ->
+          "Discovery task exited for item: #{inspect(reason)}"
         end)
 
-        # process each item in parallel and block until the batch completes
-        batch
-        |> Task.async_stream(
-          fn {key, etag} ->
-            case get_restartable_object(state, key) do
-              %{} = obj ->
-                attempt_restart(state, obj)
-
-              :skip ->
-                # permanently non-restartable — cache without meta
-                now = System.monotonic_time(:millisecond)
-                :ets.insert(state.discovery_skip_table, {key, etag, :skip, now})
-                :noop
-
-              {:skip, %Meta{} = meta} ->
-                # temporarily non-restartable (circuit breaker, time-gated placement,
-                # health check) — cache trimmed meta for re-evaluation next round
-                now = System.monotonic_time(:millisecond)
-                trimmed = trim_meta_for_cache(meta)
-                :ets.insert(state.discovery_skip_table, {key, etag, trimmed, now})
-                :noop
-
-              nil ->
-                # fetch error — don't cache
-                :noop
-            end
-          end,
-          timeout: 120_000,
-          on_timeout: :kill_task,
-          ordered: false,
-          max_concurrency: @parallel_restart_batch_size
-        )
-        |> Enum.reduce(%{timeouts: 0, exits: 0}, fn
-          {:ok, _result}, acc ->
-            acc
-
-          {:exit, :timeout}, acc ->
-            %{acc | timeouts: acc.timeouts + 1}
-
-          {:exit, reason}, acc ->
-            log(state, :warning, fn ->
-              "Discovery task exited for batch item: #{inspect(reason)}"
-            end)
-
-            %{acc | exits: acc.exits + 1}
+        %{acc | exits: acc.exits + 1}
+    end)
+    |> then(fn %{timeouts: timeouts, exits: exits} ->
+      if timeouts > 0 or exits > 0 do
+        log(state, :warning, fn ->
+          "Discovery stream had #{timeouts} timeout(s) and #{exits} exit(s) (max_concurrency=#{state.parallel_restart_batch_size}, timeout_ms=120000)"
         end)
-        |> then(fn %{timeouts: timeouts, exits: exits} ->
-          if timeouts > 0 or exits > 0 do
-            log(state, :warning, fn ->
-              "Discovery batch had #{timeouts} timeout(s) and #{exits} exit(s) (batch_size=#{length(batch)}, timeout_ms=120000)"
-            end)
-          end
-        end)
-
-      [] ->
-        nil
+      end
     end)
 
     log_discovery_diagnostics_delta(state, diagnostics_before)
@@ -1805,9 +1851,6 @@ defmodule DurableServer.LifecycleManager do
               "Successfully restarted DurableServer #{meta.key} on #{Node.self()}"
             end)
 
-            # inc circuit breaker on successful restart (it's still a restart event)
-            CircuitBreaker.increment_module_circuit_breaker(state.circuit_breaker, module)
-
           {:error, reason} ->
             log_level =
               case reason do
@@ -1819,7 +1862,9 @@ defmodule DurableServer.LifecycleManager do
               "Failed to restart DurableServer #{meta.key}: #{inspect(reason)}"
             end)
 
-            CircuitBreaker.increment_module_circuit_breaker(state.circuit_breaker, module)
+            if counts_towards_module_restart_circuit_breaker?(reason) do
+              CircuitBreaker.increment_module_circuit_breaker(state.circuit_breaker, module)
+            end
 
             DurableServer.clear_restart_attempt(state.object_store, %{
               key: stored_state.key,
@@ -1845,6 +1890,12 @@ defmodule DurableServer.LifecycleManager do
         :ok
     end
   end
+
+  defp counts_towards_module_restart_circuit_breaker?({:already_started, _}), do: false
+  defp counts_towards_module_restart_circuit_breaker?({:capacity_limit, _}), do: false
+  defp counts_towards_module_restart_circuit_breaker?(:not_ready), do: false
+  defp counts_towards_module_restart_circuit_breaker?(:timeout), do: false
+  defp counts_towards_module_restart_circuit_breaker?(_reason), do: true
 
   defp check_server_health(%LifecycleManager{} = state, %Meta{} = meta) do
     %{supervisor_name: supervisor_name} = state
