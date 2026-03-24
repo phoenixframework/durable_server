@@ -3,6 +3,7 @@ defmodule DurableServerTest do
   import DurableServer.TestHelper
 
   alias DurableServer
+  alias DurableServer.CircuitBreaker
   alias DurableServer.LifecycleManager
   alias DurableServer.StoredState
   alias DurableServer.ObjectStore
@@ -309,6 +310,10 @@ defmodule DurableServerTest do
     end
 
     def init(init_state) do
+      if sleep_ms = init_state[:init_sleep_ms] do
+        Process.sleep(sleep_ms)
+      end
+
       custom_opts = Enum.into(init_state[:custom_opts] || %{}, [])
 
       # Extract meta if provided and add to options
@@ -3265,6 +3270,206 @@ defmodule DurableServerTest do
       get_opts = recorded_get_opts(table, storage_key)
       assert [consistent: false] in get_opts
       assert [consistent: true] in get_opts
+    end
+  end
+
+  describe "global lock circuit breaker" do
+    test "restart boots bypass an open global lock circuit breaker" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          global_lock_failure_count: 1,
+          global_lock_failure_window_ms: 60_000,
+          global_lock_failure_cooldown_ms: 60_000
+        )
+
+      key = "restart-breaker-bypass-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, %{key: key}}
+        )
+
+      ref = Process.monitor(pid)
+      assert :ok = GenServer.call(pid, :stop_normal)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+      %{storage_backend: backend, circuit_breaker: circuit_breaker} =
+        DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      {:ok, %{etag: etag} = body} =
+        DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix})
+
+      CircuitBreaker.increment_global_lock_failures(circuit_breaker)
+
+      assert {:circuit_open, _cooldown_ms} =
+               CircuitBreaker.check_global_lock_circuit_breaker(circuit_breaker)
+
+      assert {:error, {:circuit_open, :network_partition}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, %{key: "fresh-#{DurableServer.UUID.uuid4()}"}}
+               )
+
+      assert {:ok, {restart_pid, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {TestServer, {:restart, %{key: key, body: body, etag: etag}}},
+                 local_only: true,
+                 timeout: 10_000
+               )
+
+      assert Process.alive?(restart_pid)
+    end
+
+    test "normal races still increment the breaker but restart races do not" do
+      slow_init_ms = 6_500
+
+      {normal_supervisor, _normal_supervisor_pid, _prefix} =
+        start_test_supervisor(
+          global_lock_failure_count: 1,
+          global_lock_failure_window_ms: 60_000,
+          global_lock_failure_cooldown_ms: 60_000
+        )
+
+      normal_breaker = DurableServer.Supervisor.__get_config__(normal_supervisor).circuit_breaker
+      normal_key = "normal-race-#{DurableServer.UUID.uuid4()}"
+
+      normal_results =
+        [
+          Task.async(fn ->
+            DurableServer.Supervisor.start_child(
+              normal_supervisor,
+              {TestServer, %{key: normal_key, init_sleep_ms: slow_init_ms}},
+              timeout: 15_000
+            )
+          end),
+          Task.async(fn ->
+            DurableServer.Supervisor.start_child(
+              normal_supervisor,
+              {TestServer, %{key: normal_key, init_sleep_ms: slow_init_ms}},
+              timeout: 15_000
+            )
+          end)
+        ]
+        |> Enum.map(&Task.await(&1, 20_000))
+
+      assert Enum.count(normal_results, &match?({:ok, {_pid, _meta}}, &1)) == 1
+      assert Enum.count(normal_results, &match?({:error, {:already_started, _pid}}, &1)) == 1
+
+      assert {:circuit_open, _cooldown_ms} =
+               CircuitBreaker.check_global_lock_circuit_breaker(normal_breaker)
+
+      {restart_supervisor, _restart_supervisor_pid, restart_prefix} =
+        start_test_supervisor(
+          global_lock_failure_count: 1,
+          global_lock_failure_window_ms: 60_000,
+          global_lock_failure_cooldown_ms: 60_000
+        )
+
+      restart_key = "restart-race-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {seed_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          restart_supervisor,
+          {TestServer, %{key: restart_key, init_sleep_ms: slow_init_ms}},
+          timeout: 15_000
+        )
+
+      seed_ref = Process.monitor(seed_pid)
+      assert :ok = GenServer.call(seed_pid, :stop_normal)
+      assert_receive {:DOWN, ^seed_ref, :process, ^seed_pid, :normal}
+
+      %{storage_backend: restart_backend, circuit_breaker: restart_breaker} =
+        DurableServer.Supervisor.__get_config__(restart_supervisor)
+
+      {:ok, %{etag: restart_etag} = restart_body} =
+        DurableServer.fetch_stored_state(
+          restart_backend,
+          %{key: restart_key, prefix: restart_prefix}
+        )
+
+      restart_results =
+        [
+          Task.async(fn ->
+            DurableServer.Supervisor.start_child(
+              restart_supervisor,
+              {TestServer,
+               {:restart, %{key: restart_key, body: restart_body, etag: restart_etag}}},
+              local_only: true,
+              timeout: 15_000
+            )
+          end),
+          Task.async(fn ->
+            DurableServer.Supervisor.start_child(
+              restart_supervisor,
+              {TestServer,
+               {:restart, %{key: restart_key, body: restart_body, etag: restart_etag}}},
+              local_only: true,
+              timeout: 15_000
+            )
+          end)
+        ]
+        |> Enum.map(&Task.await(&1, 20_000))
+
+      assert Enum.count(restart_results, &match?({:ok, {_pid, _meta}}, &1)) == 1
+      assert Enum.count(restart_results, &match?({:error, {:already_started, _pid}}, &1)) == 1
+      assert :ok = CircuitBreaker.check_global_lock_circuit_breaker(restart_breaker)
+
+      assert {:ok, {_pid, _meta}} =
+               DurableServer.Supervisor.start_child(
+                 restart_supervisor,
+                 {TestServer, %{key: "fresh-after-restart-race-#{DurableServer.UUID.uuid4()}"}}
+               )
+    end
+
+    test "normal start waits for an active restart claim instead of racing it" do
+      {supervisor_name, _supervisor_pid, prefix} = start_test_supervisor()
+      key = "restart-lease-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {seed_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, %{key: key}},
+          timeout: 15_000
+        )
+
+      seed_ref = Process.monitor(seed_pid)
+      assert :ok = GenServer.call(seed_pid, :stop_normal)
+      assert_receive {:DOWN, ^seed_ref, :process, ^seed_pid, :normal}
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      {:ok, %StoredState{} = stored_state} =
+        DurableServer.fetch_stored_state(
+          backend,
+          %{key: key, prefix: prefix}
+        )
+
+      assert {:ok, %{body: claimed_body, etag: claimed_etag}} =
+               DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
+
+      restart_task =
+        Task.async(fn ->
+          Process.sleep(250)
+
+          DurableServer.Supervisor.start_child(
+            supervisor_name,
+            {TestServer, {:restart, %{key: key, body: claimed_body, etag: claimed_etag}}},
+            local_only: true,
+            timeout: 15_000
+          )
+        end)
+
+      direct_result =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {TestServer, %{key: key}},
+          timeout: 15_000
+        )
+
+      assert {:ok, {restart_pid, _restart_meta}} = Task.await(restart_task, 20_000)
+      assert {:error, {:already_started, {^restart_pid, _direct_meta}}} = direct_result
     end
   end
 end

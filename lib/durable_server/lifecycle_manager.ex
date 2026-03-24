@@ -129,20 +129,24 @@ defmodule DurableServer.LifecycleManager do
             last_heartbeat_timing: nil,
             discovery_diag_table: nil,
             discovery_skip_table: nil,
+            restart_gate_table: nil,
             discovery_stopped: false,
             discovery_burst_remaining: 0,
             discovery_shuffle_batch_size: nil,
             parallel_restart_batch_size: nil,
+            restart_start_timeout_ms: nil,
             restart_claim_preferred_fanout: nil,
             restart_claim_expanded_fanout: nil,
             restart_claim_gate_expand_after_ms: nil,
             restart_claim_gate_disable_after_ms: nil
 
-  # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold
-  # Orphan threshold (20s) already includes grace period (2x heartbeat interval),
+  # Buffer for heartbeat deadline - time for crash/cleanup before orphan threshold.
+  # Orphan threshold is configurable and already includes grace period,
   # so we only need a small buffer for crash propagation time
   @heartbeat_deadline_buffer_ms :timer.seconds(2)
-  @restart_claim_ttl_ms :timer.seconds(30)
+  @default_restart_start_timeout_ms :timer.seconds(30)
+  @restart_claim_ttl_min_ms :timer.seconds(30)
+  @restart_claim_ttl_buffer_ms :timer.seconds(10)
   @restart_claim_preferred_fanout 2
   @restart_claim_expanded_fanout 4
   @restart_claim_gate_expand_after_ms :timer.seconds(30)
@@ -153,8 +157,8 @@ defmodule DurableServer.LifecycleManager do
   @default_discovery_shuffle_batch_size 20_000
   # parallel processing batch size - how many restart attempts to run concurrently
   @default_parallel_restart_batch_size 50
-  # Threshold for considering a node's heartbeat stale (used in heartbeat validation/deadline)
-  @heartbeat_staleness_threshold_ms :timer.seconds(20)
+  # Default threshold for considering a node's heartbeat stale
+  @default_heartbeat_staleness_threshold_ms :timer.seconds(30)
   # Threshold for considering a node unhealthy when finding eligible placement nodes
   @node_health_staleness_threshold_ms :timer.seconds(50)
   @resource_check_interval_ms :timer.seconds(60)
@@ -211,8 +215,37 @@ defmodule DurableServer.LifecycleManager do
     local_node = Keyword.get(opts, :local_node, Node.self())
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
     gate_config = Keyword.get(opts, :gate_config, restart_claim_gate_config(supervisor_name))
+    gate_first_seen_at = Keyword.get(opts, :gate_first_seen_at, now)
 
-    preferred_restart_claimer?(supervisor_name, meta, gate_config, local_node, now)
+    preferred_restart_claimer?(
+      supervisor_name,
+      meta,
+      gate_config,
+      local_node,
+      now,
+      gate_first_seen_at
+    )
+  end
+
+  @doc false
+  def __restart_claim_ttl_ms__(restart_start_timeout_ms)
+      when is_integer(restart_start_timeout_ms) and restart_start_timeout_ms > 0 do
+    restart_claim_ttl_ms(restart_start_timeout_ms)
+  end
+
+  @doc false
+  def __clear_restart_attempt_after_failure__(reason) do
+    clear_restart_attempt_after_failure?(reason)
+  end
+
+  @doc false
+  def __restart_claim_diag_key__(result) do
+    restart_claim_diag_key(result)
+  end
+
+  @doc false
+  def __restart_start_diag_key__(result) do
+    restart_start_diag_key(result)
   end
 
   @doc false
@@ -279,11 +312,13 @@ defmodule DurableServer.LifecycleManager do
         initial_discovery_delay_ms: @default_initial_discovery_delay_ms,
         discovery_shuffle_batch_size: @default_discovery_shuffle_batch_size,
         parallel_restart_batch_size: @default_parallel_restart_batch_size,
+        restart_start_timeout_ms: @default_restart_start_timeout_ms,
         restart_claim_preferred_fanout: @restart_claim_preferred_fanout,
         restart_claim_expanded_fanout: @restart_claim_expanded_fanout,
         restart_claim_gate_expand_after_ms: @restart_claim_gate_expand_after_ms,
         restart_claim_gate_disable_after_ms: @restart_claim_gate_disable_after_ms,
         heartbeat_interval_ms: 10_000,
+        heartbeat_staleness_threshold_ms: @default_heartbeat_staleness_threshold_ms,
         heartbeat_tracking_mode: :poll,
         heartbeat_reconcile_interval_ms: 10_000,
         prefix: "test/"
@@ -291,36 +326,32 @@ defmodule DurableServer.LifecycleManager do
       |> Map.put_new(:initial_discovery_delay_ms, @default_initial_discovery_delay_ms)
       |> Map.put_new(:discovery_shuffle_batch_size, @default_discovery_shuffle_batch_size)
       |> Map.put_new(:parallel_restart_batch_size, @default_parallel_restart_batch_size)
+      |> Map.put_new(:restart_start_timeout_ms, @default_restart_start_timeout_ms)
       |> Map.put_new(:restart_claim_preferred_fanout, @restart_claim_preferred_fanout)
       |> Map.put_new(:restart_claim_expanded_fanout, @restart_claim_expanded_fanout)
       |> Map.put_new(:restart_claim_gate_expand_after_ms, @restart_claim_gate_expand_after_ms)
       |> Map.put_new(:restart_claim_gate_disable_after_ms, @restart_claim_gate_disable_after_ms)
+      |> Map.put_new(:heartbeat_staleness_threshold_ms, @default_heartbeat_staleness_threshold_ms)
       |> Map.put_new(:heartbeat_tracking_mode, :poll)
       |> Map.put_new(:heartbeat_reconcile_interval_ms, 10_000)
 
     validate_discovery_config!(config)
-
-    # Validate heartbeat timing config
-    # Nodes are considered stale at 2x heartbeat_interval. If heartbeat_interval is too long,
-    # nodes would be considered stale before they even miss a heartbeat.
-    max_heartbeat_interval = div(@heartbeat_staleness_threshold_ms, 2)
-
-    if config.heartbeat_interval_ms > max_heartbeat_interval do
-      raise ArgumentError, """
-      Invalid heartbeat_interval_ms configuration: #{config.heartbeat_interval_ms}ms
-
-      heartbeat_interval_ms must be <= #{max_heartbeat_interval}ms (half of heartbeat_staleness_threshold: #{@heartbeat_staleness_threshold_ms}ms).
-
-      With the current value, nodes would be considered stale before they even
-      have a chance to send their next heartbeat, causing unnecessary failovers.
-      """
-    end
 
     hearbeat_tab = heartbeat_table_name(supervisor_name)
     :ets.new(hearbeat_tab, [:set, :public, :named_table, read_concurrency: true])
 
     skip_tab = :"durable_server_discovery_skip_#{supervisor_name}"
     :ets.new(skip_tab, [:set, :public, :named_table])
+
+    restart_gate_tab = restart_gate_table_name(supervisor_name)
+
+    :ets.new(restart_gate_tab, [
+      :set,
+      :public,
+      :named_table,
+      read_concurrency: true,
+      write_concurrency: true
+    ])
 
     diagnostics_tab = discovery_diagnostics_table_name(supervisor_name)
 
@@ -352,9 +383,11 @@ defmodule DurableServer.LifecycleManager do
       heartbeat_meta: heartbeat_meta,
       discovery_diag_table: diagnostics_tab,
       discovery_skip_table: skip_tab,
+      restart_gate_table: restart_gate_tab,
       discovery_burst_remaining: Map.get(config, :discovery_burst_count, 0),
       discovery_shuffle_batch_size: config.discovery_shuffle_batch_size,
       parallel_restart_batch_size: config.parallel_restart_batch_size,
+      restart_start_timeout_ms: config.restart_start_timeout_ms,
       restart_claim_preferred_fanout: config.restart_claim_preferred_fanout,
       restart_claim_expanded_fanout: config.restart_claim_expanded_fanout,
       restart_claim_gate_expand_after_ms: config.restart_claim_gate_expand_after_ms,
@@ -403,7 +436,7 @@ defmodule DurableServer.LifecycleManager do
   @impl true
   def handle_info(:heartbeat, %LifecycleManager{} = state) do
     now = System.system_time(:millisecond)
-    deadline_ms = heartbeat_hard_deadline_ms()
+    deadline_ms = heartbeat_hard_deadline_ms(state)
     deadline_at = state.last_successful_heartbeat_at + deadline_ms
 
     # Check if we've already exceeded the deadline
@@ -434,7 +467,7 @@ defmodule DurableServer.LifecycleManager do
   end
 
   def handle_info(:heartbeat_deadline_exceeded, %LifecycleManager{} = state) do
-    deadline_ms = heartbeat_hard_deadline_ms()
+    deadline_ms = heartbeat_hard_deadline_ms(state)
     elapsed_since_last = System.system_time(:millisecond) - state.last_successful_heartbeat_at
 
     # Check if heartbeat success message arrived (race window)
@@ -504,6 +537,17 @@ defmodule DurableServer.LifecycleManager do
     if expired > 0 do
       log(state, :debug, fn ->
         "Swept #{expired} expired entries from discovery skip set"
+      end)
+    end
+
+    gate_expired =
+      :ets.select_delete(state.restart_gate_table, [
+        {{:_, :_, :"$1"}, [{:<, :"$1", expire_before}], [true]}
+      ])
+
+    if gate_expired > 0 do
+      log(state, :debug, fn ->
+        "Swept #{gate_expired} expired entries from restart gate state"
       end)
     end
 
@@ -624,6 +668,7 @@ defmodule DurableServer.LifecycleManager do
     # discovery task crashed or failed, still schedule next run but log the error
     log(state, :error, fn -> "discovery task failed: #{inspect(reason)}" end)
     :ets.delete_all_objects(state.discovery_skip_table)
+    :ets.delete_all_objects(state.restart_gate_table)
     state = %{state | current_discovery_task: nil}
     {delay, state} = next_discovery_delay(state)
     Process.send_after(self(), :discover_and_restart, delay)
@@ -694,7 +739,8 @@ defmodule DurableServer.LifecycleManager do
       last_heartbeat_timing: state.last_heartbeat_timing,
       last_successful_heartbeat_at: state.last_successful_heartbeat_at,
       heartbeat_interval_ms: state.heartbeat_interval_ms,
-      deadline_ms: heartbeat_hard_deadline_ms(),
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms(state),
+      deadline_ms: heartbeat_hard_deadline_ms(state),
       resources: resources,
       capacity: capacity,
       heartbeat_meta: heartbeat_meta
@@ -867,8 +913,8 @@ defmodule DurableServer.LifecycleManager do
 
   # Calculate the hard deadline for heartbeat operations.
   # We must complete heartbeat before other nodes consider us stale (orphan claimable).
-  defp heartbeat_hard_deadline_ms do
-    @heartbeat_staleness_threshold_ms - @heartbeat_deadline_buffer_ms
+  defp heartbeat_hard_deadline_ms(%LifecycleManager{} = state) do
+    heartbeat_staleness_threshold_ms(state) - @heartbeat_deadline_buffer_ms
   end
 
   # this gets run async inside a task
@@ -912,7 +958,7 @@ defmodule DurableServer.LifecycleManager do
     key = "#{state.prefix}__nodes/#{node_str}"
     entry = {node_str, node_ref, current_time, capacity, resources, env_vars, heartbeat_meta}
 
-    deadline_at = heartbeat_deadline_at(state.last_successful_heartbeat_at)
+    deadline_at = heartbeat_deadline_at(state, state.last_successful_heartbeat_at)
 
     case put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at) do
       {:ok, _} ->
@@ -967,12 +1013,12 @@ defmodule DurableServer.LifecycleManager do
     end
   end
 
-  defp heartbeat_deadline_at(nil),
-    do: System.system_time(:millisecond) + heartbeat_hard_deadline_ms()
+  defp heartbeat_deadline_at(%LifecycleManager{} = state, nil),
+    do: System.system_time(:millisecond) + heartbeat_hard_deadline_ms(state)
 
-  defp heartbeat_deadline_at(last_successful_heartbeat_at)
+  defp heartbeat_deadline_at(%LifecycleManager{} = state, last_successful_heartbeat_at)
        when is_integer(last_successful_heartbeat_at) do
-    last_successful_heartbeat_at + heartbeat_hard_deadline_ms()
+    last_successful_heartbeat_at + heartbeat_hard_deadline_ms(state)
   end
 
   defp heartbeat_write_retryable?({:mirror_failed, reason}),
@@ -1048,43 +1094,21 @@ defmodule DurableServer.LifecycleManager do
     dead_node_threshold_ms = state.config.dead_node_threshold_ms
     current_time = System.system_time(:millisecond)
 
-    # Collect keys first, then fetch in parallel
-    keys =
+    entries =
       StorageBackend.list_all_objects_stream(state.object_store, "#{state.prefix}__nodes/",
+        include_objects: true,
         error_handler: fn reason ->
           log(state, :warning, fn -> "List stream error: #{inspect(reason)}" end)
           :continue
         end
       )
-      |> Enum.map(& &1.key)
+      |> Enum.to_list()
 
     results =
-      keys
+      entries
       |> Task.async_stream(
-        fn key ->
-          case StorageBackend.get_object(state.object_store, key, consistent: false) do
-            {:ok, %{body: body}} ->
-              case parse_heartbeat_data(body) do
-                {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
-                  if current_time - timestamp > dead_node_threshold_ms do
-                    {:dead, key, node, node_ref, timestamp}
-                  else
-                    {:alive, node, node_ref, timestamp, capacity, resources, env_vars,
-                     heartbeat_meta}
-                  end
-
-                {:error, :invalid_format} ->
-                  {:fetch_error, key, :invalid_format}
-              end
-
-            {:error, :not_found} ->
-              # list/get race: key was removed after we listed it.
-              # This is expected during concurrent cleanup and should not fail heartbeat refresh.
-              {:missing, key}
-
-            {:error, reason} ->
-              {:fetch_error, key, reason}
-          end
+        fn entry ->
+          process_heartbeat_list_entry(entry, state, current_time, dead_node_threshold_ms)
         end,
         max_concurrency: 20,
         timeout: :timer.seconds(10),
@@ -1172,12 +1196,62 @@ defmodule DurableServer.LifecycleManager do
     {:ok, length(live_heartbeats), cleaned_count, error_count}
   end
 
+  defp process_heartbeat_list_entry(
+         %{key: key, body: body},
+         _state,
+         current_time,
+         dead_node_threshold_ms
+       )
+       when is_binary(key) and is_integer(current_time) and is_integer(dead_node_threshold_ms) do
+    case parse_heartbeat_data(body) do
+      {:ok, {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}} ->
+        if current_time - timestamp > dead_node_threshold_ms do
+          {:dead, key, node, node_ref, timestamp}
+        else
+          {:alive, node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
+        end
+
+      {:error, :invalid_format} ->
+        {:fetch_error, key, :invalid_format}
+    end
+  end
+
+  defp process_heartbeat_list_entry(
+         %{key: key},
+         %LifecycleManager{} = state,
+         current_time,
+         dead_node_threshold_ms
+       )
+       when is_binary(key) and is_integer(current_time) and is_integer(dead_node_threshold_ms) do
+    case StorageBackend.get_object(state.object_store, key, consistent: false) do
+      {:ok, %{body: body}} ->
+        process_heartbeat_list_entry(
+          %{key: key, body: body},
+          state,
+          current_time,
+          dead_node_threshold_ms
+        )
+
+      {:error, :not_found} ->
+        # list/get race: key was removed after we listed it.
+        # This is expected during concurrent cleanup and should not fail heartbeat refresh.
+        {:missing, key}
+
+      {:error, reason} ->
+        {:fetch_error, key, reason}
+    end
+  end
+
   defp heartbeat_table_name(supervisor_name) when is_atom(supervisor_name) do
     :"durable_server_heartbeats_#{supervisor_name}"
   end
 
   defp discovery_diagnostics_table_name(supervisor_name) when is_atom(supervisor_name) do
     :"durable_server_discovery_diag_#{supervisor_name}"
+  end
+
+  defp restart_gate_table_name(supervisor_name) when is_atom(supervisor_name) do
+    :"durable_server_restart_gate_#{supervisor_name}"
   end
 
   # Join the Group heartbeat PG key with our heartbeat metadata so other nodes
@@ -1273,14 +1347,16 @@ defmodule DurableServer.LifecycleManager do
     # but hasn't fully initialized its supervisor/ETS tables yet
     table_name = heartbeat_table_name(supervisor_name)
 
-    %{heartbeat_interval_ms: heartbeat_interval_ms} =
+    %{
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms
+    } =
       DurableServer.Supervisor.__get_config__(supervisor_name)
 
     case :ets.lookup(table_name, node_str) do
       [{^node_str, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}] ->
         current_time = System.system_time(:millisecond)
 
-        if current_time - timestamp > heartbeat_interval_ms * 2 do
+        if current_time - timestamp > heartbeat_staleness_threshold_ms do
           :stale
         else
           {:healthy,
@@ -1325,7 +1401,7 @@ defmodule DurableServer.LifecycleManager do
 
     %{
       prefix: prefix,
-      heartbeat_interval_ms: heartbeat_interval_ms,
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
       storage_backend: storage_backend
     } = DurableServer.Supervisor.__get_config__(supervisor_name)
 
@@ -1338,7 +1414,7 @@ defmodule DurableServer.LifecycleManager do
            {_node_str, node_ref, timestamp, _capacity, _resources, _env_vars, _heartbeat_meta}} ->
             current_time = System.system_time(:millisecond)
 
-            if current_time - timestamp > heartbeat_interval_ms * 2 do
+            if current_time - timestamp > heartbeat_staleness_threshold_ms do
               :stale
             else
               # Cache the fetched heartbeat so subsequent lookups are fast
@@ -1416,6 +1492,15 @@ defmodule DurableServer.LifecycleManager do
               "parallel_restart_batch_size must be a positive integer, got: #{inspect(other)}"
     end
 
+    case Map.fetch!(config, :restart_start_timeout_ms) do
+      value when is_integer(value) and value > 0 ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "restart_start_timeout_ms must be a positive integer, got: #{inspect(other)}"
+    end
+
     case Map.fetch!(config, :restart_claim_preferred_fanout) do
       value when is_integer(value) and value > 0 ->
         :ok
@@ -1463,6 +1548,36 @@ defmodule DurableServer.LifecycleManager do
       raise ArgumentError,
             "restart_claim_gate_disable_after_ms must be >= restart_claim_gate_expand_after_ms"
     end
+
+    case Map.fetch!(config, :heartbeat_staleness_threshold_ms) do
+      value when is_integer(value) and value > @heartbeat_deadline_buffer_ms ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "heartbeat_staleness_threshold_ms must be an integer greater than #{@heartbeat_deadline_buffer_ms}, got: #{inspect(other)}"
+    end
+
+    max_heartbeat_interval = div(Map.fetch!(config, :heartbeat_staleness_threshold_ms), 2)
+
+    case Map.fetch!(config, :heartbeat_interval_ms) do
+      value when is_integer(value) and value > 0 and value <= max_heartbeat_interval ->
+        :ok
+
+      value when is_integer(value) and value > 0 ->
+        raise ArgumentError, """
+        Invalid heartbeat_interval_ms configuration: #{value}ms
+
+        heartbeat_interval_ms must be <= #{max_heartbeat_interval}ms (half of heartbeat_staleness_threshold_ms: #{Map.fetch!(config, :heartbeat_staleness_threshold_ms)}ms).
+
+        With the current value, nodes would be considered stale before they even
+        have a chance to send their next heartbeat, causing unnecessary failovers.
+        """
+
+      other ->
+        raise ArgumentError,
+              "heartbeat_interval_ms must be a positive integer, got: #{inspect(other)}"
+    end
   end
 
   defp initial_discovery_delay_ms(timeout) when is_integer(timeout) and timeout >= 0, do: timeout
@@ -1473,14 +1588,25 @@ defmodule DurableServer.LifecycleManager do
     min_timeout + :rand.uniform(max_timeout - min_timeout + 1) - 1
   end
 
+  defp heartbeat_staleness_threshold_ms(%LifecycleManager{} = state) do
+    Map.fetch!(state.config, :heartbeat_staleness_threshold_ms)
+  end
+
   defp preferred_restart_claimer?(
          supervisor_name,
          %Meta{} = meta,
          gate_config,
-         local_node \\ Node.self(),
-         now \\ System.system_time(:millisecond)
+         local_node,
+         now,
+         gate_first_seen_at
        ) do
-    case restart_claim_contention_fanout(meta, gate_config, now) do
+    gate_first_seen_at =
+      case gate_first_seen_at do
+        value when is_integer(value) -> value
+        _ -> now
+      end
+
+    case restart_claim_contention_fanout(gate_config, now, gate_first_seen_at) do
       {:preferred, fanout} ->
         report_diagnostic(supervisor_name, :restart_gate_fanout_preferred)
         decide_restart_gate(supervisor_name, meta, gate_config, local_node, now, fanout)
@@ -1526,12 +1652,9 @@ defmodule DurableServer.LifecycleManager do
     end
   end
 
-  defp restart_claim_contention_fanout(%Meta{} = meta, gate_config, now) when is_integer(now) do
-    age_ms =
-      case meta.last_heartbeat_at do
-        ts when is_integer(ts) -> max(now - ts, 0)
-        _ -> gate_config.restart_claim_gate_disable_after_ms + 1
-      end
+  defp restart_claim_contention_fanout(gate_config, now, gate_first_seen_at)
+       when is_integer(now) and is_integer(gate_first_seen_at) do
+    age_ms = max(now - gate_first_seen_at, 0)
 
     cond do
       age_ms < gate_config.restart_claim_gate_expand_after_ms ->
@@ -1734,27 +1857,36 @@ defmodule DurableServer.LifecycleManager do
     # list all keys with this supervisor's prefix, but exclude __nodes/ heartbeat objects
     StorageBackend.list_all_objects_stream(state.object_store, state.prefix,
       consistent: false,
+      include_objects: true,
       error_handler: fn reason ->
         log(state, :error, fn -> "Failed to list objects: #{inspect(reason)}" end)
         :continue
       end
     )
     |> Stream.reject(&String.starts_with?(&1.key, "#{state.prefix}__nodes/"))
-    |> Stream.flat_map(fn %{key: storage_key, etag: etag} ->
+    |> Stream.flat_map(fn %{key: storage_key, etag: etag} = entry ->
       key = String.trim_leading(storage_key, state.prefix)
+
+      candidate =
+        case Map.fetch(entry, :body) do
+          {:ok, body} -> %{key: key, etag: etag, body: body}
+          :error -> %{key: key, etag: etag}
+        end
 
       cond do
         # already running — skip
         match?({_, _}, DurableServer.Supervisor.lookup(state.supervisor_name, key)) ->
+          clear_restart_gate_state(state, key)
           []
 
         # in skip set with matching etag — skip permanently non-restartable,
         # re-evaluate temporarily non-restartable (time gates, circuit breaker)
         discovery_skip?(state, key, etag) ->
+          clear_restart_gate_state(state, key)
           []
 
         true ->
-          [{key, etag}]
+          [candidate]
       end
     end)
     # accumulate large batches of keys, then shuffle for randomized restart order
@@ -1774,13 +1906,19 @@ defmodule DurableServer.LifecycleManager do
     # batch to drain before launching more work. This avoids one slow key holding
     # up the next N restart attempts.
     |> Task.async_stream(
-      fn {key, etag} ->
-        case get_restartable_object(state, key) do
+      fn %{key: key, etag: etag} = entry ->
+        case get_restartable_object(state, entry) do
           %{} = obj ->
+            now = System.system_time(:millisecond)
+            gate_first_seen_at = touch_restart_gate_state(state, key, now)
+
             if preferred_restart_claimer?(
                  state.supervisor_name,
                  obj.meta,
-                 restart_gate_config
+                 restart_gate_config,
+                 Node.self(),
+                 now,
+                 gate_first_seen_at
                ) do
               attempt_restart(state, obj)
             else
@@ -1791,6 +1929,7 @@ defmodule DurableServer.LifecycleManager do
             # permanently non-restartable — cache without meta
             now = System.monotonic_time(:millisecond)
             :ets.insert(state.discovery_skip_table, {key, etag, :skip, now})
+            clear_restart_gate_state(state, key)
             :noop
 
           {:skip, %Meta{} = meta} ->
@@ -1799,6 +1938,7 @@ defmodule DurableServer.LifecycleManager do
             now = System.monotonic_time(:millisecond)
             trimmed = trim_meta_for_cache(meta)
             :ets.insert(state.discovery_skip_table, {key, etag, trimmed, now})
+            clear_restart_gate_state(state, key)
             :noop
 
           nil ->
@@ -1872,13 +2012,25 @@ defmodule DurableServer.LifecycleManager do
     restart_gate_deferred = Map.get(delta, :restart_gate_deferred, 0)
     restart_gate_bypass_small = Map.get(delta, :restart_gate_bypass_small_candidate_set, 0)
     restart_gate_bypass_missing = Map.get(delta, :restart_gate_bypass_local_missing, 0)
+    restart_claim_ok = Map.get(delta, :restart_claim_ok, 0)
+    restart_claim_already_claimed = Map.get(delta, :restart_claim_already_claimed, 0)
+    restart_claim_not_eligible = Map.get(delta, :restart_claim_not_eligible, 0)
+    restart_claim_error = Map.get(delta, :restart_claim_error, 0)
+    restart_start_ok = Map.get(delta, :restart_start_ok, 0)
+    restart_start_already_started = Map.get(delta, :restart_start_already_started, 0)
+    restart_start_timeout = Map.get(delta, :restart_start_timeout, 0)
+    restart_start_error = Map.get(delta, :restart_start_error, 0)
 
     if group_nil > 0 or group_mismatch > 0 or sync_stop_errors > 0 or rpc_timeouts > 0 or
          rpc_noconnection > 0 or rpc_notsup > 0 or placement_erpc_attempts > 0 or
          placement_erpc_errors > 0 or race_lookup_erpc_errors > 0 or
          restart_gate_preferred > 0 or restart_gate_expanded > 0 or restart_gate_all > 0 or
          restart_gate_deferred > 0 or restart_gate_bypass_small > 0 or
-         restart_gate_bypass_missing > 0 do
+         restart_gate_bypass_missing > 0 or restart_claim_ok > 0 or
+         restart_claim_already_claimed > 0 or restart_claim_not_eligible > 0 or
+         restart_claim_error > 0 or restart_start_ok > 0 or
+         restart_start_already_started > 0 or restart_start_timeout > 0 or
+         restart_start_error > 0 do
       log(state, :info, fn ->
         "Discovery diagnostics delta: group_nil=#{group_nil} " <>
           "group_mismatch=#{group_mismatch} slow_path=#{slow_path} " <>
@@ -1892,12 +2044,20 @@ defmodule DurableServer.LifecycleManager do
           "restart_gate_all=#{restart_gate_all} " <>
           "restart_gate_deferred=#{restart_gate_deferred} " <>
           "restart_gate_bypass_small=#{restart_gate_bypass_small} " <>
-          "restart_gate_bypass_missing=#{restart_gate_bypass_missing}"
+          "restart_gate_bypass_missing=#{restart_gate_bypass_missing} " <>
+          "restart_claim_ok=#{restart_claim_ok} " <>
+          "restart_claim_already_claimed=#{restart_claim_already_claimed} " <>
+          "restart_claim_not_eligible=#{restart_claim_not_eligible} " <>
+          "restart_claim_error=#{restart_claim_error} " <>
+          "restart_start_ok=#{restart_start_ok} " <>
+          "restart_start_already_started=#{restart_start_already_started} " <>
+          "restart_start_timeout=#{restart_start_timeout} " <>
+          "restart_start_error=#{restart_start_error}"
       end)
     end
   end
 
-  defp get_restartable_object(%LifecycleManager{} = state, key) do
+  defp get_restartable_object(%LifecycleManager{} = state, %{key: key, etag: etag} = entry) do
     # first check if server is eligible for restart based on metadata
     # first see if server exists in registry, and skip it if so
     case DurableServer.Supervisor.lookup(state.supervisor_name, key) do
@@ -1905,14 +2065,7 @@ defmodule DurableServer.LifecycleManager do
         nil
 
       nil ->
-        case DurableServer.fetch_stored_state(
-               state.object_store,
-               %{
-                 key: key,
-                 prefix: state.prefix
-               },
-               consistent: false
-             ) do
+        case fetch_restartable_stored_state(state, key, etag, entry) do
           {:ok, %StoredState{meta: %Meta{} = meta} = obj} ->
             cond do
               # never restart permanently crashed servers
@@ -1975,6 +2128,71 @@ defmodule DurableServer.LifecycleManager do
             nil
         end
     end
+  end
+
+  defp fetch_restartable_stored_state(
+         %LifecycleManager{} = state,
+         key,
+         etag,
+         %{body: %StoredState{} = stored_state}
+       )
+       when is_binary(key) and is_binary(etag) do
+    {:ok, attach_listed_stored_state_context(stored_state, key, state.prefix, etag)}
+  end
+
+  defp fetch_restartable_stored_state(
+         %LifecycleManager{} = state,
+         key,
+         _etag,
+         %{body: nil}
+       )
+       when is_binary(key) do
+    DurableServer.fetch_stored_state(
+      state.object_store,
+      %{
+        key: key,
+        prefix: state.prefix
+      },
+      consistent: false
+    )
+  end
+
+  defp fetch_restartable_stored_state(
+         %LifecycleManager{} = _state,
+         key,
+         _etag,
+         %{body: other}
+       )
+       when is_binary(key) do
+    {:error, {:unexpected_value_type, other}}
+  end
+
+  defp fetch_restartable_stored_state(%LifecycleManager{} = state, key, _etag, _entry)
+       when is_binary(key) do
+    DurableServer.fetch_stored_state(
+      state.object_store,
+      %{
+        key: key,
+        prefix: state.prefix
+      },
+      consistent: false
+    )
+  end
+
+  defp attach_listed_stored_state_context(
+         %StoredState{meta: %Meta{} = meta} = stored_state,
+         key,
+         prefix,
+         etag
+       )
+       when is_binary(key) and is_binary(prefix) and is_binary(etag) do
+    %StoredState{
+      stored_state
+      | key: key,
+        prefix: prefix,
+        etag: etag,
+        meta: %{meta | key: key, prefix: prefix}
+    }
   end
 
   defp appears_restartable?(%LifecycleManager{} = state, %Meta{} = meta) do
@@ -2174,7 +2392,8 @@ defmodule DurableServer.LifecycleManager do
       DurableServer.Supervisor.start_child(
         state.supervisor_name,
         {module, init_arg},
-        max_placement_retries: 0
+        max_placement_retries: 0,
+        timeout: state.restart_start_timeout_ms
       )
     else
       {:error, {:undef, module}}
@@ -2185,17 +2404,29 @@ defmodule DurableServer.LifecycleManager do
          %LifecycleManager{} = state,
          %StoredState{meta: %Meta{} = meta} = stored_state
        ) do
-    case DurableServer.claim_restart_attempt(state.object_store, stored_state,
-           ttl: @restart_claim_ttl_ms
-         ) do
+    claim_result =
+      DurableServer.claim_restart_attempt(state.object_store, stored_state,
+        ttl: restart_claim_ttl_ms(state)
+      )
+
+    report_diagnostic(state.supervisor_name, restart_claim_diag_key(claim_result))
+
+    case claim_result do
       {:ok, %{body: body, etag: etag}} ->
         module = meta.module
 
-        case try_restart_child(
-               state,
-               {module, {:restart, %{key: meta.key, body: body, etag: etag}}}
-             ) do
+        start_result =
+          try_restart_child(
+            state,
+            {module, {:restart, %{key: meta.key, body: body, etag: etag}}}
+          )
+
+        report_diagnostic(state.supervisor_name, restart_start_diag_key(start_result))
+
+        case start_result do
           {:ok, {_pid, _meta}} ->
+            clear_restart_gate_state(state, meta.key)
+
             log(state, :info, fn ->
               "Successfully restarted DurableServer #{meta.key} on #{Node.self()}"
             end)
@@ -2211,16 +2442,15 @@ defmodule DurableServer.LifecycleManager do
               "Failed to restart DurableServer #{meta.key}: #{inspect(reason)}"
             end)
 
+            if match?({:already_started, _}, reason) do
+              clear_restart_gate_state(state, meta.key)
+            end
+
             if counts_towards_module_restart_circuit_breaker?(reason) do
               CircuitBreaker.increment_module_circuit_breaker(state.circuit_breaker, module)
             end
 
-            DurableServer.clear_restart_attempt(state.object_store, %{
-              key: stored_state.key,
-              prefix: stored_state.prefix,
-              body: body,
-              etag: etag
-            })
+            maybe_clear_restart_attempt_after_failure(state, stored_state, body, etag, reason)
         end
 
       {:error, :already_claimed} ->
@@ -2240,11 +2470,77 @@ defmodule DurableServer.LifecycleManager do
     end
   end
 
+  defp restart_claim_diag_key({:ok, _}), do: :restart_claim_ok
+  defp restart_claim_diag_key({:error, :already_claimed}), do: :restart_claim_already_claimed
+  defp restart_claim_diag_key({:error, :not_eligible}), do: :restart_claim_not_eligible
+  defp restart_claim_diag_key({:error, _reason}), do: :restart_claim_error
+
+  defp restart_start_diag_key({:ok, _}), do: :restart_start_ok
+  defp restart_start_diag_key({:error, {:already_started, _}}), do: :restart_start_already_started
+  defp restart_start_diag_key({:error, :timeout}), do: :restart_start_timeout
+  defp restart_start_diag_key({:error, _reason}), do: :restart_start_error
+
   defp counts_towards_module_restart_circuit_breaker?({:already_started, _}), do: false
   defp counts_towards_module_restart_circuit_breaker?({:capacity_limit, _}), do: false
   defp counts_towards_module_restart_circuit_breaker?(:not_ready), do: false
   defp counts_towards_module_restart_circuit_breaker?(:timeout), do: false
   defp counts_towards_module_restart_circuit_breaker?(_reason), do: true
+
+  defp maybe_clear_restart_attempt_after_failure(
+         %LifecycleManager{} = state,
+         %StoredState{} = stored_state,
+         body,
+         etag,
+         reason
+       ) do
+    if clear_restart_attempt_after_failure?(reason) do
+      DurableServer.clear_restart_attempt(state.object_store, %{
+        key: stored_state.key,
+        prefix: stored_state.prefix,
+        body: body,
+        etag: etag
+      })
+    else
+      :ok
+    end
+  end
+
+  defp clear_restart_attempt_after_failure?(:timeout), do: false
+  defp clear_restart_attempt_after_failure?({:already_started, _}), do: false
+  defp clear_restart_attempt_after_failure?(_reason), do: true
+
+  defp restart_claim_ttl_ms(%LifecycleManager{} = state) do
+    restart_claim_ttl_ms(state.restart_start_timeout_ms)
+  end
+
+  defp restart_claim_ttl_ms(restart_start_timeout_ms)
+       when is_integer(restart_start_timeout_ms) and restart_start_timeout_ms > 0 do
+    max(@restart_claim_ttl_min_ms, restart_start_timeout_ms + @restart_claim_ttl_buffer_ms)
+  end
+
+  defp touch_restart_gate_state(%LifecycleManager{} = state, key, now)
+       when is_binary(key) and is_integer(now) do
+    case :ets.lookup(state.restart_gate_table, key) do
+      [{^key, first_seen_at, _last_seen_at}] ->
+        :ets.insert(state.restart_gate_table, {key, first_seen_at, now})
+        first_seen_at
+
+      [] ->
+        true = :ets.insert_new(state.restart_gate_table, {key, now, now})
+        now
+    end
+  rescue
+    ArgumentError ->
+      now
+  end
+
+  defp clear_restart_gate_state(%LifecycleManager{} = state, key) when is_binary(key) do
+    :ets.delete(state.restart_gate_table, key)
+    :ok
+  rescue
+    ArgumentError ->
+      :ok
+  end
 
   defp check_server_health(%LifecycleManager{} = state, %Meta{} = meta) do
     %{supervisor_name: supervisor_name} = state
@@ -2285,10 +2581,6 @@ defmodule DurableServer.LifecycleManager do
     node_health = lookup_node_health(meta)
 
     cond do
-      # check if the node appears down based on heartbeat cache
-      node_health in [:stale, :unknown] ->
-        :orphaned
-
       # node is healthy but can't accept this module (at capacity)
       match?({:healthy, _}, node_health) and
           not can_node_accept_module?(node_health, meta.module) ->

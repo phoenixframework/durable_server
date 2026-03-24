@@ -208,6 +208,8 @@ defmodule DurableServer.SupervisorBackendSpecTest do
          initial_discovery_delay_ms: {10, 20},
          discovery_shuffle_batch_size: 123,
          parallel_restart_batch_size: 7,
+         restart_start_timeout_ms: 12_000,
+         heartbeat_staleness_threshold_ms: 30_000,
          restart_claim_preferred_fanout: 3,
          restart_claim_expanded_fanout: 5,
          restart_claim_gate_expand_after_ms: 5_000,
@@ -220,6 +222,8 @@ defmodule DurableServer.SupervisorBackendSpecTest do
       initial_discovery_delay_ms: initial_discovery_delay_ms,
       discovery_shuffle_batch_size: discovery_shuffle_batch_size,
       parallel_restart_batch_size: parallel_restart_batch_size,
+      restart_start_timeout_ms: restart_start_timeout_ms,
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
       restart_claim_preferred_fanout: restart_claim_preferred_fanout,
       restart_claim_expanded_fanout: restart_claim_expanded_fanout,
       restart_claim_gate_expand_after_ms: restart_claim_gate_expand_after_ms,
@@ -229,6 +233,8 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert initial_discovery_delay_ms == {10, 20}
     assert discovery_shuffle_batch_size == 123
     assert parallel_restart_batch_size == 7
+    assert restart_start_timeout_ms == 12_000
+    assert heartbeat_staleness_threshold_ms == 30_000
     assert restart_claim_preferred_fanout == 3
     assert restart_claim_expanded_fanout == 5
     assert restart_claim_gate_expand_after_ms == 5_000
@@ -239,6 +245,8 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert state.initial_discovery_delay_ms == {10, 20}
     assert state.discovery_shuffle_batch_size == 123
     assert state.parallel_restart_batch_size == 7
+    assert state.restart_start_timeout_ms == 12_000
+    assert state.config.heartbeat_staleness_threshold_ms == 30_000
     assert state.restart_claim_preferred_fanout == 3
     assert state.restart_claim_expanded_fanout == 5
     assert state.restart_claim_gate_expand_after_ms == 5_000
@@ -281,6 +289,43 @@ defmodule DurableServer.SupervisorBackendSpecTest do
            prefix: unique_prefix("invalid_parallel"),
            backend: {InMemoryBackend, name: :invalid_parallel},
            parallel_restart_batch_size: 0
+         ]}
+      )
+    end
+
+    assert_raise RuntimeError, ~r/restart_start_timeout_ms/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("invalid_restart_timeout"),
+           prefix: unique_prefix("invalid_restart_timeout"),
+           backend: {InMemoryBackend, name: :invalid_restart_timeout},
+           restart_start_timeout_ms: 0
+         ]}
+      )
+    end
+
+    assert_raise RuntimeError, ~r/heartbeat_staleness_threshold_ms/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("invalid_heartbeat_staleness"),
+           prefix: unique_prefix("invalid_heartbeat_staleness"),
+           backend: {InMemoryBackend, name: :invalid_heartbeat_staleness},
+           heartbeat_staleness_threshold_ms: 2_000
+         ]}
+      )
+    end
+
+    assert_raise RuntimeError, ~r/heartbeat_interval_ms/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("invalid_heartbeat_interval"),
+           prefix: unique_prefix("invalid_heartbeat_interval"),
+           backend: {InMemoryBackend, name: :invalid_heartbeat_interval},
+           heartbeat_interval_ms: 10_000,
+           heartbeat_staleness_threshold_ms: 15_000
          ]}
       )
     end

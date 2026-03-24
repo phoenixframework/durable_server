@@ -769,6 +769,7 @@ defmodule DurableServer do
             prefix: nil,
             etag: nil,
             pid: nil,
+            restart_boot: false,
             bootstrapped: false,
             init_from_ref: nil,
             init_from_pid: nil,
@@ -971,6 +972,7 @@ defmodule DurableServer do
       circuit_breaker: circuit_breaker,
       node_str: to_string(Node.self()),
       pid: self(),
+      restart_boot: match?({:restart, _}, init_state),
       node_ref: DurableServer.Supervisor.node_ref(supervisor_name),
       init_from_ref: from_ref,
       init_from_pid: from_pid,
@@ -1117,6 +1119,7 @@ defmodule DurableServer do
          supervisor_name: supervisor_name,
          circuit_breake: circuit_breaker,
          init_from: init_from,
+         restart_boot: restart_boot,
          sticky_placement_history_limit: history_limit
        }) do
     {init_from_ref, init_from_pid, init_reply_to} = normalize_init_from(init_from)
@@ -1136,6 +1139,7 @@ defmodule DurableServer do
       key: key,
       # original unprefixed key passed by user, used for group registry
       prefix: prefix,
+      restart_boot: restart_boot,
       vsn: config.vsn,
       etag: etag,
       old_vsn: old_vsn,
@@ -1638,6 +1642,7 @@ defmodule DurableServer do
            key: key,
            prefix: prefix,
            circuit_breaker: circuit_breaker,
+           restart_boot: restart_boot,
            init_from_ref: from_ref,
            init_from_pid: from_pid,
            init_reply_to: reply_to,
@@ -1650,8 +1655,10 @@ defmodule DurableServer do
            capacity_opts: capacity_opts
          }
        ) do
-    with :ok <- CircuitBreaker.check_global_lock_circuit_breaker(circuit_breaker),
+    with :ok <- maybe_check_global_lock_circuit_breaker(circuit_breaker, restart_boot),
          :ok <- LifecycleManager.check_capacity(supervisor_name, module, capacity_opts) do
+      current_node_str = to_string(Node.self())
+
       load_result =
         case fetch_existing_state_raw(
                object_store,
@@ -1662,30 +1669,36 @@ defmodule DurableServer do
           {:ok, %StoredState{} = existing} ->
             %{meta: %Meta{} = meta} = existing
 
-            case check_lock(meta) do
-              {:locked, lock_pid} ->
-                {:error, {:already_started, lock_pid}}
+            case active_restart_claim(meta, restart_boot, current_node_str) do
+              {:claimed, claimant_node} ->
+                {:error, {:restart_claimed, claimant_node}}
 
-              :expired ->
-                case reread_expired_state(object_store, %{key: key, prefix: prefix}) do
-                  {:ok,
-                   %StoredState{
-                     meta: %Meta{} = current_meta,
-                     vsn: current_vsn,
-                     state: current_raw_state,
-                     etag: current_etag
-                   }} ->
-                    loaded_state = load_user_state(module, current_vsn, current_raw_state)
-                    {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
-
-                  {:error, {:already_started, lock_pid}} ->
+              :ok ->
+                case check_lock(meta) do
+                  {:locked, lock_pid} ->
                     {:error, {:already_started, lock_pid}}
 
-                  :error ->
-                    load_fresh_init_state(module, init_state, object_store)
+                  :expired ->
+                    case reread_expired_state(object_store, %{key: key, prefix: prefix}) do
+                      {:ok,
+                       %StoredState{
+                         meta: %Meta{} = current_meta,
+                         vsn: current_vsn,
+                         state: current_raw_state,
+                         etag: current_etag
+                       }} ->
+                        loaded_state = load_user_state(module, current_vsn, current_raw_state)
+                        {:ok, {loaded_state, current_vsn, current_etag, current_meta}}
 
-                  {:error, reason} ->
-                    {:error, reason}
+                      {:error, {:already_started, lock_pid}} ->
+                        {:error, {:already_started, lock_pid}}
+
+                      :error ->
+                        load_fresh_init_state(module, init_state, object_store)
+
+                      {:error, reason} ->
+                        {:error, reason}
+                    end
                 end
             end
 
@@ -1695,7 +1708,6 @@ defmodule DurableServer do
 
       case load_result do
         {:ok, {loaded_init_state, old_vsn, etag, meta}} ->
-          current_node_str = to_string(Node.self())
           current_node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
 
           same_caller? =
@@ -1724,6 +1736,7 @@ defmodule DurableServer do
                    supervisor_name: supervisor_name,
                    circuit_breake: circuit_breaker,
                    init_from: init_from,
+                   restart_boot: restart_boot,
                    sticky_placement_history_limit: sticky_placement_history_limit
                  }) do
               {:ok, %DurableServer{} = locked_state} ->
@@ -2776,10 +2789,11 @@ defmodule DurableServer do
         report_lock_check_result(sup_name, {:locked, meta.pid})
         {:locked, meta.pid}
 
-      # node heartbeat is stale
+      # A stale local cache view is not strong enough evidence to steal a lock.
+      # Confirm against storage heartbeat before expiring the lock.
       :stale ->
-        report_lock_check_result(sup_name, :expired)
-        :expired
+        report_lock_diagnostic(sup_name, :check_lock_heartbeat_stale)
+        check_lock_via_storage_heartbeat(meta)
 
       # no heartbeat data in local cache - fetch directly from storage as fallback
       # this prevents incorrectly treating a node as expired just because we haven't
@@ -2898,7 +2912,7 @@ defmodule DurableServer do
         {:ok, %StoredState{meta: %Meta{} = meta}} ->
           # increment global lock failure - we found a lock in storage but never saw it in syn
           # this indicates network partition/flapping
-          CircuitBreaker.increment_global_lock_failures(state.circuit_breaker)
+          maybe_increment_global_lock_failures(state)
           {:error, {:already_started, meta.pid}}
 
         :error ->
@@ -3096,6 +3110,35 @@ defmodule DurableServer do
       {:error, _} ->
         {:error, :not_found}
     end
+  end
+
+  defp maybe_check_global_lock_circuit_breaker(_circuit_breaker, true), do: :ok
+
+  defp maybe_check_global_lock_circuit_breaker(circuit_breaker, false) do
+    CircuitBreaker.check_global_lock_circuit_breaker(circuit_breaker)
+  end
+
+  defp active_restart_claim(%Meta{} = meta, true, current_node_str)
+       when is_binary(current_node_str) do
+    if Meta.currently_restarting?(meta) && meta.restart_attempt_node != current_node_str do
+      {:claimed, meta.restart_attempt_node}
+    else
+      :ok
+    end
+  end
+
+  defp active_restart_claim(%Meta{} = meta, false, _current_node_str) do
+    if Meta.currently_restarting?(meta) do
+      {:claimed, meta.restart_attempt_node}
+    else
+      :ok
+    end
+  end
+
+  defp maybe_increment_global_lock_failures(%DurableServer{restart_boot: true}), do: :ok
+
+  defp maybe_increment_global_lock_failures(%DurableServer{} = state) do
+    CircuitBreaker.increment_global_lock_failures(state.circuit_breaker)
   end
 
   # we want to IMMEDIATELY exit, but use `{:shutdown, term}` to prevent our `DynamicSupervisor`

@@ -75,6 +75,8 @@ defmodule DurableServer.Supervisor do
     shuffling restart order (default: 20_000)
   - `:parallel_restart_batch_size` - Number of restart attempts to run concurrently per
     node during a discovery sweep (default: 50)
+  - `:restart_start_timeout_ms` - Maximum time to wait for a claimed LM restart to
+    finish bootstrapping before treating the outcome as unknown (default: 30_000)
   - `:restart_claim_preferred_fanout` - Number of eligible nodes allowed to contend for
     a freshly restartable key before widening (default: 2)
   - `:restart_claim_expanded_fanout` - Number of eligible nodes allowed to contend after
@@ -84,6 +86,8 @@ defmodule DurableServer.Supervisor do
   - `:restart_claim_gate_disable_after_ms` - Age after which the restart contention gate
     is disabled and all eligible nodes may contend (default: 120_000)
   - `:heartbeat_interval_ms` - How often to write node heartbeats (default: 10_000)
+  - `:heartbeat_staleness_threshold_ms` - How long a node heartbeat may go without success
+    before the node is considered stale/orphan-claimable (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`.
     Defaults from backend capabilities.
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval used
@@ -100,6 +104,12 @@ defmodule DurableServer.Supervisor do
     (default: 300_000 = 5 minutes)
   - `:module_circuit_breaker_cooldown_ms` - Cooldown period when module circuit breaker opens
     (default: 600_000 = 10 minutes)
+  - `:global_lock_failure_count` - Supervisor-wide lock race threshold before the
+    global lock circuit breaker opens (default: 100)
+  - `:global_lock_failure_window_ms` - Time window for the global lock circuit breaker
+    threshold (default: 30_000 = 30 seconds)
+  - `:global_lock_failure_cooldown_ms` - Cooldown period when the global lock circuit
+    breaker opens (default: 60_000 = 1 minute)
   - `:backend` - Optional storage backend spec:
     `{BackendModule, opts}` or a pre-initialized `%DurableServer.StorageBackend{}`
   - `:object_store` - Legacy object storage config (used when `:backend` is not set)
@@ -215,6 +225,8 @@ defmodule DurableServer.Supervisor do
   @default_initial_discovery_delay_ms {1_000, 6_000}
   @default_discovery_shuffle_batch_size 20_000
   @default_parallel_restart_batch_size 50
+  @default_restart_start_timeout_ms 30_000
+  @default_heartbeat_staleness_threshold_ms 30_000
   @default_restart_claim_preferred_fanout 2
   @default_restart_claim_expanded_fanout 4
   @default_restart_claim_gate_expand_after_ms :timer.seconds(30)
@@ -596,11 +608,14 @@ defmodule DurableServer.Supervisor do
     `{min_ms, max_ms}` jitter tuple (default: `{1_000, 6_000}`)
   - `:discovery_shuffle_batch_size` - Discovery shuffle batch size (default: 20_000)
   - `:parallel_restart_batch_size` - Concurrent restart attempts per node (default: 50)
+  - `:restart_start_timeout_ms` - Timeout for LM-owned claimed restarts (default: 30_000)
   - `:restart_claim_preferred_fanout` - Initial restart claim contention fanout (default: 2)
   - `:restart_claim_expanded_fanout` - Expanded restart claim contention fanout (default: 4)
   - `:restart_claim_gate_expand_after_ms` - Age before widening claim fanout (default: 30_000)
   - `:restart_claim_gate_disable_after_ms` - Age before disabling the claim gate (default: 120_000)
   - `:heartbeat_interval_ms` - Node heartbeat interval (default: 10_000)
+  - `:heartbeat_staleness_threshold_ms` - Node heartbeat stale/orphan threshold
+    (default: 30_000)
   - `:heartbeat_tracking_mode` - Heartbeat cache strategy: `:poll` or `:subscribe`
   - `:heartbeat_reconcile_interval_ms` - Full heartbeat cache reconcile interval
   - `:dead_node_threshold_ms` - Dead node cleanup threshold (default: 300_000)
@@ -940,6 +955,18 @@ defmodule DurableServer.Supervisor do
               {^init_ref, :ignore} ->
                 :ignore
 
+              {^init_ref, {:error, {:restart_claimed, claim_node}}} ->
+                handle_restart_claim_race(
+                  supervisor,
+                  module,
+                  init_arg,
+                  key,
+                  claim_node,
+                  retries,
+                  deadline_ms,
+                  reply_to
+                )
+
               {^init_ref, {:error, reason}} ->
                 {:error, reason}
 
@@ -969,6 +996,18 @@ defmodule DurableServer.Supervisor do
             receive do
               {^init_ref, :ignore} ->
                 :ignore
+
+              {^init_ref, {:error, {:restart_claimed, claim_node}}} ->
+                handle_restart_claim_race(
+                  supervisor,
+                  module,
+                  init_arg,
+                  key,
+                  claim_node,
+                  retries,
+                  deadline_ms,
+                  reply_to
+                )
 
               {^init_ref, {:error, reason}} ->
                 {:error, reason}
@@ -1023,6 +1062,18 @@ defmodule DurableServer.Supervisor do
                 reply_to
               )
 
+            {^init_ref, {:error, {:restart_claimed, claim_node}}} ->
+              handle_restart_claim_race(
+                supervisor,
+                module,
+                init_arg,
+                key,
+                claim_node,
+                retries,
+                deadline_ms,
+                reply_to
+              )
+
             {^init_ref, {:error, reason}} ->
               {:error, reason}
           end
@@ -1038,6 +1089,18 @@ defmodule DurableServer.Supervisor do
                 init_arg,
                 key,
                 pid,
+                retries,
+                deadline_ms,
+                reply_to
+              )
+
+            {^init_ref, {:error, {:restart_claimed, claim_node}}} ->
+              handle_restart_claim_race(
+                supervisor,
+                module,
+                init_arg,
+                key,
+                claim_node,
                 retries,
                 deadline_ms,
                 reply_to
@@ -1149,6 +1212,78 @@ defmodule DurableServer.Supervisor do
             )
         end
     end
+  end
+
+  defp handle_restart_claim_race(
+         supervisor,
+         module,
+         init_arg,
+         key,
+         claim_node,
+         retries,
+         deadline_ms,
+         reply_to
+       )
+       when is_binary(claim_node) do
+    case lookup(supervisor, key) do
+      {pid, meta} ->
+        {:error, {:already_started, {pid, meta}}}
+
+      nil ->
+        case LifecycleManager.lookup_node_health(%{supervisor: supervisor, node_str: claim_node}) do
+          {:healthy, _node_ref} ->
+            if deadline_exceeded?(deadline_ms) do
+              {:error, :timeout}
+            else
+              wait_ms =
+                case remaining_timeout_ms(deadline_ms) do
+                  :infinity -> 100
+                  timeout_ms -> min(100, max(timeout_ms, 1))
+                end
+
+              Process.sleep(wait_ms)
+
+              handle_restart_claim_race(
+                supervisor,
+                module,
+                init_arg,
+                key,
+                claim_node,
+                retries,
+                deadline_ms,
+                reply_to
+              )
+            end
+
+          unhealthy when unhealthy in [:stale, :unknown] ->
+            do_start_child(
+              supervisor,
+              {module, init_arg},
+              retries + 1,
+              deadline_ms,
+              reply_to
+            )
+        end
+    end
+  end
+
+  defp handle_restart_claim_race(
+         supervisor,
+         module,
+         init_arg,
+         _key,
+         _claim_node,
+         retries,
+         deadline_ms,
+         reply_to
+       ) do
+    do_start_child(
+      supervisor,
+      {module, init_arg},
+      retries + 1,
+      deadline_ms,
+      reply_to
+    )
   end
 
   defp try_remote_placement(supervisor, {module, init_arg} = child_spec, max_retries) do
@@ -2465,11 +2600,13 @@ defmodule DurableServer.Supervisor do
         :discovery_burst_count,
         :discovery_shuffle_batch_size,
         :parallel_restart_batch_size,
+        :restart_start_timeout_ms,
         :restart_claim_preferred_fanout,
         :restart_claim_expanded_fanout,
         :restart_claim_gate_expand_after_ms,
         :restart_claim_gate_disable_after_ms,
         :heartbeat_interval_ms,
+        :heartbeat_staleness_threshold_ms,
         :heartbeat_tracking_mode,
         :heartbeat_reconcile_interval_ms,
         :graceful_shutdown_timeout_ms,
@@ -2533,6 +2670,13 @@ defmodule DurableServer.Supervisor do
         @default_parallel_restart_batch_size
       )
 
+    restart_start_timeout_ms =
+      extract_positive_integer!(
+        opts,
+        :restart_start_timeout_ms,
+        @default_restart_start_timeout_ms
+      )
+
     restart_claim_preferred_fanout =
       extract_positive_integer!(
         opts,
@@ -2578,6 +2722,26 @@ defmodule DurableServer.Supervisor do
         storage_backend_defaults,
         @default_heartbeat_interval_ms
       )
+
+    heartbeat_staleness_threshold_ms =
+      extract_positive_integer!(
+        opts,
+        :heartbeat_staleness_threshold_ms,
+        @default_heartbeat_staleness_threshold_ms
+      )
+
+    max_heartbeat_interval = div(heartbeat_staleness_threshold_ms, 2)
+
+    if heartbeat_interval_ms > max_heartbeat_interval do
+      raise ArgumentError, """
+      Invalid heartbeat_interval_ms configuration: #{heartbeat_interval_ms}ms
+
+      heartbeat_interval_ms must be <= #{max_heartbeat_interval}ms (half of heartbeat_staleness_threshold_ms: #{heartbeat_staleness_threshold_ms}ms).
+
+      With the current value, nodes would be considered stale before they even
+      have a chance to send their next heartbeat, causing unnecessary failovers.
+      """
+    end
 
     heartbeat_tracking_mode =
       extract_heartbeat_tracking_mode_config(opts, storage_backend_defaults)
@@ -2649,7 +2813,7 @@ defmodule DurableServer.Supervisor do
           Keyword.get(opts, :module_circuit_breaker_window_ms, 5 * 60 * 1000),
         module_circuit_breaker_cooldown_ms:
           Keyword.get(opts, :module_circuit_breaker_cooldown_ms, 10 * 60 * 1000),
-        global_lock_failure_count: Keyword.get(opts, :global_lock_failure_count, 10),
+        global_lock_failure_count: Keyword.get(opts, :global_lock_failure_count, 100),
         global_lock_failure_window_ms:
           Keyword.get(opts, :global_lock_failure_window_ms, 30 * 1000),
         global_lock_failure_cooldown_ms:
@@ -2667,11 +2831,13 @@ defmodule DurableServer.Supervisor do
       discovery_burst_count: Keyword.get(opts, :discovery_burst_count, 3),
       discovery_shuffle_batch_size: discovery_shuffle_batch_size,
       parallel_restart_batch_size: parallel_restart_batch_size,
+      restart_start_timeout_ms: restart_start_timeout_ms,
       restart_claim_preferred_fanout: restart_claim_preferred_fanout,
       restart_claim_expanded_fanout: restart_claim_expanded_fanout,
       restart_claim_gate_expand_after_ms: restart_claim_gate_expand_after_ms,
       restart_claim_gate_disable_after_ms: restart_claim_gate_disable_after_ms,
       heartbeat_interval_ms: heartbeat_interval_ms,
+      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
       heartbeat_tracking_mode: heartbeat_tracking_mode,
       heartbeat_reconcile_interval_ms: heartbeat_reconcile_interval_ms,
       graceful_shutdown_timeout_ms: Keyword.get(opts, :graceful_shutdown_timeout_ms, 30_000),

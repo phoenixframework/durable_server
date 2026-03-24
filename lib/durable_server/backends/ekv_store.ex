@@ -96,7 +96,8 @@ defmodule DurableServer.Backends.EKVStore do
          heartbeat_reconcile_interval_ms: 30_000
        },
        features: %{
-         heartbeat_subscribe?: true
+         heartbeat_subscribe?: true,
+         list_includes_body?: true
        }
      }}
   end
@@ -186,13 +187,30 @@ defmodule DurableServer.Backends.EKVStore do
     {error_handler, stream_opts} =
       Keyword.pop(opts, :error_handler, fn reason -> raise inspect(reason) end)
 
-    _stream_opts = Keyword.validate!(stream_opts, [:consistent])
+    stream_opts = Keyword.validate!(stream_opts, [:consistent, :include_objects])
+    include_objects = Keyword.get(stream_opts, :include_objects, false)
 
     case ensure_ready(state) do
       :ok ->
-        case ekv_keys(state, prefix) do
-          {:ok, keys} ->
-            Stream.map(keys, fn {key, vsn} -> %{key: key, etag: encode_vsn(vsn)} end)
+        case if(include_objects, do: ekv_scan(state, prefix), else: ekv_keys(state, prefix)) do
+          {:ok, entries} ->
+            if include_objects do
+              Stream.transform(entries, :ok, fn
+                {key, value, vsn}, :ok ->
+                  case decode_body(value) do
+                    {:ok, body} ->
+                      {[%{key: key, etag: encode_vsn(vsn), body: body}], :ok}
+
+                    {:error, reason} ->
+                      case error_handler.({:decode_failed, key, reason}) do
+                        :halt -> {:halt, :ok}
+                        _ -> {[], :ok}
+                      end
+                  end
+              end)
+            else
+              Stream.map(entries, fn {key, vsn} -> %{key: key, etag: encode_vsn(vsn)} end)
+            end
 
           {:error, reason} ->
             case error_handler.(reason) do
@@ -762,6 +780,9 @@ defmodule DurableServer.Backends.EKVStore do
 
   defp ekv_keys(%{ekv_mod: mod, name: name}, prefix),
     do: ekv_raw_call(fn -> apply(mod, :keys, [name, prefix]) end)
+
+  defp ekv_scan(%{ekv_mod: mod, name: name}, prefix),
+    do: ekv_raw_call(fn -> apply(mod, :scan, [name, prefix]) end)
 
   defp ekv_lookup(%{ekv_mod: mod, name: name}, key),
     do: ekv_raw_call(fn -> apply(mod, :lookup, [name, key]) end)

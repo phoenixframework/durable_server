@@ -15,7 +15,7 @@ defmodule DurableServer.CircuitBreakerTest do
     module_circuit_breaker_window_ms: 5 * 60 * 1000,
     # 30 minutes
     module_circuit_breaker_cooldown_ms: 30 * 60 * 1000,
-    global_lock_failure_count: 10,
+    global_lock_failure_count: 100,
     # 30 seconds
     global_lock_failure_window_ms: 30 * 1000,
     # 1 minute

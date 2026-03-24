@@ -47,6 +47,7 @@ defmodule DurableServer.Backends.ObjectStore do
 
   @impl true
   def list_all_objects_stream(%ObjectStore{} = store, prefix, opts) do
+    {_include_objects, opts} = Keyword.pop(opts, :include_objects, false)
     ObjectStore.list_all_objects_stream(store, prefix, opts)
   end
 

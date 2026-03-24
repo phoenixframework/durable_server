@@ -442,6 +442,17 @@ defmodule DurableServer.EKVIntegrationTest do
 
     assert "#{prefix}a" in listed_keys
     assert "#{prefix}b" in listed_keys
+
+    listed_objects =
+      StorageBackend.list_all_objects_stream(storage_backend, prefix,
+        consistent: false,
+        include_objects: true
+      )
+      |> Enum.filter(&(&1.key in ["#{prefix}a", "#{prefix}b"]))
+      |> Enum.map(fn %{key: key, body: %StoredState{} = body} -> {key, body.state.count} end)
+
+    assert {"#{prefix}a", 1} in listed_objects
+    assert {"#{prefix}b", 2} in listed_objects
   end
 
   test "lifecycle manager discovers and restarts a seeded permanent object via shared EKV" do

@@ -19,6 +19,7 @@ defmodule DurableServer.StorageBackend do
   @type list_object :: %{
           required(:key) => String.t(),
           required(:etag) => String.t(),
+          optional(:body) => term(),
           optional(:size) => term(),
           optional(:last_modified) => term()
         }
