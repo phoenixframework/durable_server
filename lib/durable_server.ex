@@ -1402,8 +1402,9 @@ defmodule DurableServer do
   end
 
   def claim_restart_attempt(%StorageBackend{} = store, %StoredState{} = stored_state, opts) do
-    opts = Keyword.validate!(opts, [:ttl])
+    opts = Keyword.validate!(opts, [:ttl, :skip_lock_check])
     ttl_ms = Keyword.fetch!(opts, :ttl)
+    skip_lock_check? = Keyword.get(opts, :skip_lock_check, false)
     %{meta: meta} = stored_state
     storage_key = stored_state.prefix <> stored_state.key
 
@@ -1414,7 +1415,7 @@ defmodule DurableServer do
       Meta.stopped_permanently?(meta) ->
         {:error, :not_eligible}
 
-      match?({:locked, _}, check_lock(meta)) ->
+      not skip_lock_check? and match?({:locked, _}, check_lock(meta)) ->
         {:error, :not_eligible}
 
       true ->
@@ -2702,7 +2703,19 @@ defmodule DurableServer do
   end
 
   @doc false
-  def check_lock(
+  def check_lock(%Meta{supervisor: sup_name, pid: pid} = meta) do
+    case check_lock_status(meta) do
+      {:error, _reason} ->
+        report_lock_check_result(sup_name, {:locked, pid})
+        {:locked, pid}
+
+      other ->
+        other
+    end
+  end
+
+  @doc false
+  def check_lock_status(
         %Meta{supervisor: sup_name, node_ref: stored_node_ref, node_str: node_str, pid: pid} =
           meta
       ) do
@@ -2839,10 +2852,9 @@ defmodule DurableServer do
 
       # Storage fetch failed - be conservative and assume lock is held to avoid
       # incorrectly stealing a lock due to transient storage errors
-      {:error, _reason} ->
+      {:error, reason} ->
         report_lock_diagnostic(supervisor_name, :check_lock_storage_heartbeat_error)
-        report_lock_check_result(supervisor_name, {:locked, meta.pid})
-        {:locked, meta.pid}
+        {:error, reason}
     end
   end
 

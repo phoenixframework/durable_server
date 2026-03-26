@@ -242,6 +242,26 @@ defmodule DurableServer.Supervisor do
   @placement_erpc_timeout_cross_region_ms 8_000
   @ensure_started_singleflight_wait_timeout_ms :timer.seconds(30)
   @default_max_singleflight_waiters_per_key_module 50_000
+  @ekv_backend_option_keys [
+    :name,
+    :consistent_reads,
+    :cas_retries,
+    :backoff,
+    :timeout,
+    :task_supervisor,
+    :ekv_mod,
+    :ekv_supervisor_mod
+  ]
+  @ekv_backend_non_name_option_keys [
+    :consistent_reads,
+    :cas_retries,
+    :backoff,
+    :timeout,
+    :task_supervisor,
+    :ekv_mod,
+    :ekv_supervisor_mod
+  ]
+  @ekv_control_option_keys [:start]
 
   @doc """
   Checks if the DurableServer.Supervisor is ready to handle requests.
@@ -662,6 +682,17 @@ defmodule DurableServer.Supervisor do
     end
 
     Supervisor.start_link(__MODULE__, opts, name: name)
+  end
+
+  @doc false
+  def child_spec(opts) do
+    %{
+      id: Keyword.get(opts, :name, __MODULE__),
+      start: {__MODULE__, :start_link, [opts]},
+      type: :supervisor,
+      restart: :permanent,
+      shutdown: Keyword.get(opts, :supervisor_shutdown_timeout_ms, 60_000)
+    }
   end
 
   @doc """
@@ -2588,6 +2619,7 @@ defmodule DurableServer.Supervisor do
         :prefix,
         :group,
         :backend,
+        :heartbeat_backend,
         :object_store,
         :finch,
         :task_supervisor,
@@ -2639,11 +2671,18 @@ defmodule DurableServer.Supervisor do
     finch = Keyword.get(opts, :finch, DurableServer.Finch)
     task_sup = Keyword.get(opts, :task_supervisor, DurableServer.TaskSupervisor)
 
-    # Build storage backend from :backend or legacy :object_store options.
-    {storage_backend, object_store} = build_storage_backend(opts, finch, task_sup)
-    :ok = StorageBackend.ensure_ready(storage_backend)
+    backend_resources = build_backend_resources(opts, finch, task_sup)
+
+    Enum.each(backend_resources.ensure_ready_backends, fn backend ->
+      :ok = StorageBackend.ensure_ready(backend)
+    end)
+
+    storage_backend = backend_resources.storage_backend
+    heartbeat_backend = backend_resources.heartbeat_backend
+    object_store = backend_resources.object_store
 
     storage_backend_defaults = StorageBackend.defaults(storage_backend)
+    heartbeat_backend_defaults = StorageBackend.defaults(heartbeat_backend)
 
     discovery_interval_ms =
       extract_backend_tuned_interval!(
@@ -2719,7 +2758,7 @@ defmodule DurableServer.Supervisor do
       extract_backend_tuned_interval!(
         opts,
         :heartbeat_interval_ms,
-        storage_backend_defaults,
+        heartbeat_backend_defaults,
         @default_heartbeat_interval_ms
       )
 
@@ -2744,12 +2783,12 @@ defmodule DurableServer.Supervisor do
     end
 
     heartbeat_tracking_mode =
-      extract_heartbeat_tracking_mode_config(opts, storage_backend_defaults)
+      extract_heartbeat_tracking_mode_config(opts, heartbeat_backend_defaults)
 
     heartbeat_reconcile_interval_ms =
       extract_heartbeat_reconcile_interval_config(
         opts,
-        storage_backend_defaults,
+        heartbeat_backend_defaults,
         heartbeat_tracking_mode
       )
 
@@ -2825,6 +2864,7 @@ defmodule DurableServer.Supervisor do
       name: name,
       prefix: prefix,
       storage_backend: storage_backend,
+      heartbeat_backend: heartbeat_backend,
       object_store: object_store,
       discovery_interval_ms: discovery_interval_ms,
       initial_discovery_delay_ms: initial_discovery_delay_ms,
@@ -2880,31 +2920,39 @@ defmodule DurableServer.Supervisor do
         resolve_registry_conflict: {DurableServer.GroupConflictResolver, :resolve, []}
       )
 
-    children = [
-      {Group, group_opts},
-      {Registry, keys: :unique, name: ensure_started_singleflight_registry_name(name)},
-      {Registry, keys: :duplicate, name: ensure_started_singleflight_waiters_registry_name(name)},
-      {SingleflightGuard, supervisor_name: name},
-      {Task.Supervisor, name: task_sup_name},
-      {DynamicSupervisor,
-       name: dynamic_sup_name,
-       strategy: :one_for_one,
-       max_children: max_children,
-       max_restarts: 1000,
-       max_seconds: 5,
-       shutdown: shutdown_timeout},
-      {LifecycleManager,
-       supervisor_name: name,
-       task_supervisor: task_sup_name,
-       object_store: object_store,
-       storage_backend: storage_backend,
-       config: config,
-       circuit_breaker: circuit_breaker,
-       capacity_limits: capacity_limits,
-       heartbeat_meta: heartbeat_meta,
-       shutdown: shutdown_timeout},
-      {Terminator, supervisor_name: name, config: config, shutdown: shutdown_timeout}
-    ]
+    children =
+      backend_resources.managed_children ++
+        [
+          {Group, group_opts},
+          {Registry, keys: :unique, name: ensure_started_singleflight_registry_name(name)},
+          {Registry,
+           keys: :duplicate, name: ensure_started_singleflight_waiters_registry_name(name)},
+          {SingleflightGuard, supervisor_name: name},
+          {Task.Supervisor, name: task_sup_name},
+          {DynamicSupervisor,
+           name: dynamic_sup_name,
+           strategy: :one_for_one,
+           max_children: max_children,
+           max_restarts: 1000,
+           max_seconds: 5},
+          Supervisor.child_spec(
+            {LifecycleManager,
+             supervisor_name: name,
+             task_supervisor: task_sup_name,
+             object_store: object_store,
+             storage_backend: storage_backend,
+             heartbeat_backend: heartbeat_backend,
+             config: config,
+             circuit_breaker: circuit_breaker,
+             capacity_limits: capacity_limits,
+             heartbeat_meta: heartbeat_meta},
+            shutdown: shutdown_timeout
+          ),
+          Supervisor.child_spec(
+            {Terminator, supervisor_name: name, config: config},
+            shutdown: shutdown_timeout
+          )
+        ]
 
     Supervisor.init(children, strategy: :one_for_all)
   end
@@ -2966,17 +3014,175 @@ defmodule DurableServer.Supervisor do
     :"durable_supervisor_#{supervisor_name}"
   end
 
-  defp build_storage_backend(opts, finch, task_sup) do
-    backend_spec =
+  defp build_backend_resources(opts, finch, task_sup) do
+    storage_spec =
       if Keyword.has_key?(opts, :backend) do
         Keyword.fetch!(opts, :backend)
       else
         {DurableServer.Backends.ObjectStore, Keyword.fetch!(opts, :object_store)}
       end
 
-    backend = init_backend_spec(backend_spec, finch, task_sup)
-    object_store = maybe_extract_object_store(backend)
-    {backend, object_store}
+    storage_resource = init_backend_resource(storage_spec, finch, task_sup, :storage_backend)
+
+    heartbeat_resource =
+      case Keyword.fetch(opts, :heartbeat_backend) do
+        {:ok, heartbeat_spec} ->
+          init_backend_resource(heartbeat_spec, finch, task_sup, :heartbeat_backend)
+
+        :error ->
+          maybe_auto_derive_heartbeat_backend(storage_resource, finch, task_sup)
+      end
+
+    heartbeat_resource = heartbeat_resource || storage_resource
+
+    managed_children =
+      if heartbeat_resource === storage_resource do
+        storage_resource.managed_children
+      else
+        storage_resource.managed_children ++ heartbeat_resource.managed_children
+      end
+
+    %{
+      storage_backend: storage_resource.backend,
+      heartbeat_backend: heartbeat_resource.backend,
+      object_store: maybe_extract_object_store(storage_resource.backend),
+      managed_children: managed_children,
+      ensure_ready_backends:
+        [storage_resource, heartbeat_resource]
+        |> Enum.reject(& &1.managed?)
+        |> Enum.map(& &1.backend)
+        |> Enum.uniq()
+    }
+  end
+
+  defp init_backend_resource(%StorageBackend{} = backend, _finch, _task_sup, _role) do
+    %{
+      backend: backend,
+      managed_children: [],
+      managed?: false,
+      managed_ekv_child_opts: nil
+    }
+  end
+
+  defp init_backend_resource({DurableServer.Backends.EKVStore, raw_opts}, _finch, task_sup, role) do
+    raw_opts = normalize_backend_opts(raw_opts)
+    managed? = managed_ekv_backend?(raw_opts)
+
+    if not managed? do
+      validate_external_ekv_backend_opts!(raw_opts, role)
+    end
+
+    backend_opts = prepare_ekv_backend_init_opts(raw_opts, task_sup)
+    backend = init_backend!(DurableServer.Backends.EKVStore, backend_opts)
+
+    managed_children =
+      if managed? do
+        [build_managed_ekv_child_spec(raw_opts)]
+      else
+        []
+      end
+
+    %{
+      backend: backend,
+      managed_children: managed_children,
+      managed?: managed?,
+      managed_ekv_child_opts: if(managed?, do: managed_ekv_child_opts(raw_opts), else: nil)
+    }
+  end
+
+  defp init_backend_resource(spec, finch, task_sup, _role) do
+    %{
+      backend: init_backend_spec(spec, finch, task_sup),
+      managed_children: [],
+      managed?: false,
+      managed_ekv_child_opts: nil
+    }
+  end
+
+  defp maybe_auto_derive_heartbeat_backend(
+         %{
+           managed?: true,
+           backend: %StorageBackend{adapter: DurableServer.Backends.EKVStore, state: state},
+           managed_ekv_child_opts: managed_child_opts
+         },
+         _finch,
+         task_sup
+       )
+       when is_list(managed_child_opts) do
+    case Keyword.fetch(managed_child_opts, :data_dir) do
+      {:ok, data_dir} ->
+        base_name = Keyword.fetch!(managed_child_opts, :name)
+        heartbeat_name = :"#{base_name}_heartbeats"
+
+        heartbeat_child_opts =
+          managed_child_opts
+          |> Keyword.put(:name, heartbeat_name)
+          |> Keyword.put(:data_dir, Path.join(data_dir, "heartbeats"))
+          |> Keyword.put(:shards, 1)
+
+        heartbeat_backend_opts =
+          state
+          |> Map.take(@ekv_backend_option_keys)
+          |> Map.to_list()
+          |> Keyword.put(:name, heartbeat_name)
+          |> Keyword.put_new(:task_supervisor, task_sup)
+
+        %{
+          backend: init_backend!(DurableServer.Backends.EKVStore, heartbeat_backend_opts),
+          managed_children: [{state.ekv_mod, heartbeat_child_opts}],
+          managed?: true,
+          managed_ekv_child_opts: heartbeat_child_opts
+        }
+
+      :error ->
+        nil
+    end
+  end
+
+  defp maybe_auto_derive_heartbeat_backend(_resource, _finch, _task_sup), do: nil
+
+  defp managed_ekv_backend?(raw_opts) do
+    case Keyword.get(raw_opts, :start) do
+      false -> false
+      true -> true
+      nil -> raw_opts |> ekv_startup_opts() |> Kernel.!=([])
+    end
+  end
+
+  defp validate_external_ekv_backend_opts!(raw_opts, role) do
+    case ekv_startup_opts(raw_opts) do
+      [] ->
+        :ok
+
+      startup_opts ->
+        raise ArgumentError,
+              "#{inspect(role)} with EKVStore and start: false cannot include managed EKV startup opts: " <>
+                "#{inspect(Keyword.keys(startup_opts))}"
+    end
+  end
+
+  defp prepare_ekv_backend_init_opts(raw_opts, task_sup) do
+    raw_opts
+    |> Keyword.take(@ekv_backend_option_keys)
+    |> Keyword.put_new(:task_supervisor, task_sup)
+  end
+
+  defp build_managed_ekv_child_spec(raw_opts) do
+    ekv_mod =
+      raw_opts
+      |> Keyword.get(:ekv_mod, :"Elixir.EKV")
+
+    {ekv_mod, managed_ekv_child_opts(raw_opts)}
+  end
+
+  defp managed_ekv_child_opts(raw_opts) do
+    raw_opts
+    |> Keyword.drop(@ekv_backend_non_name_option_keys ++ @ekv_control_option_keys)
+  end
+
+  defp ekv_startup_opts(raw_opts) do
+    raw_opts
+    |> Keyword.drop(@ekv_backend_option_keys ++ @ekv_control_option_keys)
   end
 
   defp init_backend_spec(%StorageBackend{} = backend, _finch, _task_sup), do: backend

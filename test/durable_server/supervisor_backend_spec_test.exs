@@ -2,6 +2,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
   use ExUnit.Case, async: false
 
   alias DurableServer.LifecycleManager
+  alias DurableServer.Backends.EKVStore
   alias DurableServer.Backends.MirrorStore
   alias DurableServer.StorageBackend
 
@@ -129,6 +130,27 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert object_store == nil
   end
 
+  test "child_spec uses configured supervisor shutdown timeout" do
+    shutdown_timeout = 12_345
+    supervisor_name = unique_supervisor_name("child_spec")
+    prefix = unique_prefix("child_spec")
+
+    opts = [
+      name: supervisor_name,
+      prefix: prefix,
+      backend: {InMemoryBackend, name: :child_spec},
+      supervisor_shutdown_timeout_ms: shutdown_timeout
+    ]
+
+    child_spec = DurableServer.Supervisor.child_spec(opts)
+
+    assert child_spec.id == supervisor_name
+    assert child_spec.start == {DurableServer.Supervisor, :start_link, [opts]}
+    assert child_spec.type == :supervisor
+    assert child_spec.restart == :permanent
+    assert child_spec.shutdown == shutdown_timeout
+  end
+
   test "accepts nested backend module specs in migration store" do
     supervisor_name = unique_supervisor_name("migration")
     prefix = unique_prefix("migration")
@@ -162,6 +184,38 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert storage_backend.state.primary.state.name == :primary
     assert storage_backend.state.secondary.state.name == :secondary
     assert object_store == nil
+  end
+
+  test "EKV start: false rejects managed startup opts" do
+    assert_raise RuntimeError, ~r/start: false cannot include managed EKV startup opts/, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("ekv_external_invalid"),
+           prefix: unique_prefix("ekv_external_invalid"),
+           backend:
+             {EKVStore,
+              [
+                name: :external_ekv_invalid,
+                start: false,
+                data_dir: "/tmp/should_not_start"
+              ]}
+         ]}
+      )
+    end
+  end
+
+  test "EKV backend with only a name remains external by default" do
+    assert_raise RuntimeError, ~r/could not start child|failed to start child/i, fn ->
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: unique_supervisor_name("ekv_external_default"),
+           prefix: unique_prefix("ekv_external_default"),
+           backend: {EKVStore, [name: :external_by_default]}
+         ]}
+      )
+    end
   end
 
   test "ready? requires lifecycle manager, not just the supervisor pid" do
@@ -251,6 +305,26 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert state.restart_claim_expanded_fanout == 5
     assert state.restart_claim_gate_expand_after_ms == 5_000
     assert state.restart_claim_gate_disable_after_ms == 45_000
+  end
+
+  test "init builds lifecycle manager and terminator child specs with configured shutdown timeout" do
+    supervisor_name = unique_supervisor_name("shutdown_specs")
+    prefix = unique_prefix("shutdown_specs")
+    shutdown_timeout = 12_345
+
+    assert {:ok, {_flags, child_specs}} =
+             DurableServer.Supervisor.init(
+               name: supervisor_name,
+               prefix: prefix,
+               backend: {InMemoryBackend, name: :shutdown_specs},
+               supervisor_shutdown_timeout_ms: shutdown_timeout
+             )
+
+    lifecycle_manager_spec = Enum.find(child_specs, &(&1.id == LifecycleManager))
+    terminator_spec = Enum.find(child_specs, &(&1.id == DurableServer.Terminator))
+
+    assert lifecycle_manager_spec.shutdown == shutdown_timeout
+    assert terminator_spec.shutdown == shutdown_timeout
   end
 
   test "invalid discovery tuning options raise" do

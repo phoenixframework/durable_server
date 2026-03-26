@@ -137,6 +137,238 @@ defmodule DurableServer.LifecycleTest do
     def decode(_state, data), do: {:ok, data}
   end
 
+  defmodule HeartbeatConflictBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate =
+        case Keyword.fetch!(opts, :delegate) do
+          %StorageBackend{} = backend ->
+            backend
+
+          {adapter, raw_opts} ->
+            {:ok, backend} = StorageBackend.init_backend(adapter, raw_opts)
+            backend
+        end
+
+      conflict_keys =
+        opts
+        |> Keyword.get(:conflict_keys, [])
+        |> MapSet.new()
+
+      {:ok,
+       %{
+         state: %{delegate: delegate, conflict_keys: conflict_keys},
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate, conflict_keys: conflict_keys}, key, opts) do
+      if Keyword.get(opts, :consistent) == true and MapSet.member?(conflict_keys, key) do
+        {:error, {:consistent_read_failed, {:consistent_read_failed, ":conflict"}}}
+      else
+        StorageBackend.get_object(delegate, key, opts)
+      end
+    end
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts),
+      do: StorageBackend.put_object(delegate, key, data, opts)
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+
+    @impl true
+    def subscribe(%{delegate: delegate}, subscriber, prefix, opts),
+      do: StorageBackend.subscribe(delegate, subscriber, prefix, opts)
+
+    @impl true
+    def unsubscribe(%{delegate: delegate}, subscription_ref),
+      do: StorageBackend.unsubscribe(delegate, subscription_ref)
+  end
+
+  defmodule HeartbeatConflictAfterFirstReadBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate =
+        case Keyword.fetch!(opts, :delegate) do
+          %StorageBackend{} = backend ->
+            backend
+
+          {adapter, raw_opts} ->
+            {:ok, backend} = StorageBackend.init_backend(adapter, raw_opts)
+            backend
+        end
+
+      conflict_keys =
+        opts
+        |> Keyword.get(:conflict_keys, [])
+        |> MapSet.new()
+
+      table = :ets.new(__MODULE__, [:set, :public])
+
+      {:ok,
+       %{
+         state: %{delegate: delegate, conflict_keys: conflict_keys, table: table},
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate, conflict_keys: conflict_keys, table: table}, key, opts) do
+      if Keyword.get(opts, :consistent) == true and MapSet.member?(conflict_keys, key) do
+        attempts =
+          :ets.update_counter(table, {:consistent_get, key}, {2, 1}, {{:consistent_get, key}, 0})
+
+        if attempts > 1 do
+          {:error, {:consistent_read_failed, {:consistent_read_failed, ":conflict"}}}
+        else
+          StorageBackend.get_object(delegate, key, opts)
+        end
+      else
+        StorageBackend.get_object(delegate, key, opts)
+      end
+    end
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts),
+      do: StorageBackend.put_object(delegate, key, data, opts)
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+
+    @impl true
+    def subscribe(%{delegate: delegate}, subscriber, prefix, opts),
+      do: StorageBackend.subscribe(delegate, subscriber, prefix, opts)
+
+    @impl true
+    def unsubscribe(%{delegate: delegate}, subscription_ref),
+      do: StorageBackend.unsubscribe(delegate, subscription_ref)
+  end
+
+  defmodule DeleteTrackingBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate =
+        case Keyword.fetch!(opts, :delegate) do
+          %StorageBackend{} = backend ->
+            backend
+
+          {adapter, raw_opts} ->
+            {:ok, backend} = StorageBackend.init_backend(adapter, raw_opts)
+            backend
+        end
+
+      table = Keyword.fetch!(opts, :table)
+
+      {:ok,
+       %{
+         state: %{delegate: delegate, table: table},
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts),
+      do: StorageBackend.put_object(delegate, key, data, opts)
+
+    @impl true
+    def delete_object(%{delegate: delegate, table: table}, key) do
+      :ets.insert(table, {:deleted, key})
+      StorageBackend.delete_object(delegate, key)
+    end
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+
+    @impl true
+    def subscribe(%{delegate: delegate}, subscriber, prefix, opts),
+      do: StorageBackend.subscribe(delegate, subscriber, prefix, opts)
+
+    @impl true
+    def unsubscribe(%{delegate: delegate}, subscription_ref),
+      do: StorageBackend.unsubscribe(delegate, subscription_ref)
+  end
+
   setup do
     # Create test supervisor for this test
     supervisor_name = :"test_supervisor_#{DurableServer.UUID.uuid4()}"
@@ -544,6 +776,180 @@ defmodule DurableServer.LifecycleTest do
 
       assert {:error, :not_eligible} =
                DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
+    end
+
+    test "discovery does not keep cached skip entries when heartbeat confirmation hits a consistent-read conflict" do
+      supervisor_name = :"test_supervisor_#{DurableServer.UUID.uuid4()}"
+      prefix = "test_#{DurableServer.UUID.uuid4()}/"
+      node_str = "remote-conflict@test"
+      heartbeat_key = "#{prefix}__nodes/#{node_str}"
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: supervisor_name,
+           prefix: prefix,
+           object_store: test_object_store_opts(),
+           heartbeat_backend:
+             {HeartbeatConflictBackend,
+              [
+                delegate: {DurableServer.Backends.ObjectStore, test_object_store_opts()},
+                conflict_keys: [heartbeat_key]
+              ]},
+           initial_discovery_delay_ms: 60_000,
+           discovery_interval_ms: 60_000
+         ]},
+        id: supervisor_name
+      )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      key = "conflict-heartbeat-lock-test-#{DurableServer.UUID.uuid4()}"
+      now = System.system_time(:millisecond)
+
+      stored_state = %DurableServer.StoredState{
+        vsn: 1,
+        state: %{"count" => 1},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          permanent: true,
+          status: :running,
+          node_str: node_str,
+          node_ref: System.unique_integer([:positive]),
+          pid: self(),
+          last_heartbeat_at: now - 60_000
+        }
+      }
+
+      assert {:ok, %{etag: etag}} =
+               DurableServer.StorageBackend.put_object(
+                 backend,
+                 "#{prefix}#{key}",
+                 stored_state
+               )
+
+      {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
+      manager_state = :sys.get_state(manager_pid)
+
+      :ets.insert(
+        manager_state.discovery_skip_table,
+        {key, etag, stored_state.meta, System.monotonic_time(:millisecond)}
+      )
+
+      send(manager_pid, :discover_and_restart)
+      wait_for_discovery_completion(manager_pid, 1000)
+
+      assert [] = :ets.lookup(manager_state.discovery_skip_table, key)
+      assert nil == DurableServer.Supervisor.lookup(supervisor_name, key)
+    end
+
+    test "running orphan proved expired by the first heartbeat read can still be claimed even if a second read would conflict" do
+      supervisor_name = :"test_supervisor_#{DurableServer.UUID.uuid4()}"
+      prefix = "test_#{DurableServer.UUID.uuid4()}/"
+      node_str = "remote-once-missing@test"
+      heartbeat_key = "#{prefix}__nodes/#{node_str}"
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         [
+           name: supervisor_name,
+           prefix: prefix,
+           object_store: test_object_store_opts(),
+           heartbeat_backend:
+             {HeartbeatConflictAfterFirstReadBackend,
+              [
+                delegate: {DurableServer.Backends.ObjectStore, test_object_store_opts()},
+                conflict_keys: [heartbeat_key]
+              ]},
+           initial_discovery_delay_ms: 60_000,
+           discovery_interval_ms: 60_000
+         ]},
+        id: supervisor_name
+      )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      key = "conflict-after-expired-#{DurableServer.UUID.uuid4()}"
+      now = System.system_time(:millisecond)
+
+      stored_state = %DurableServer.StoredState{
+        vsn: 1,
+        state: %{"count" => 1},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          permanent: true,
+          status: :running,
+          node_str: node_str,
+          node_ref: System.unique_integer([:positive]),
+          pid: self(),
+          last_heartbeat_at: now - 60_000
+        }
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 backend,
+                 "#{prefix}#{key}",
+                 stored_state
+               )
+
+      {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
+
+      send(manager_pid, :discover_and_restart)
+      wait_for_discovery_completion(manager_pid, 1000)
+
+      diagnostics = LifecycleManager.get_discovery_diagnostics(supervisor_name)
+      assert Map.get(diagnostics, :restart_claim_ok, 0) >= 1
+      assert Map.get(diagnostics, :restart_claim_not_eligible, 0) == 0
+
+      assert Map.get(diagnostics, :restart_start_ok, 0) +
+               Map.get(diagnostics, :restart_start_already_started, 0) >= 1
+    end
+
+    test "orderly lifecycle manager shutdown deletes the local heartbeat key", %{
+      supervisor_name: supervisor_name,
+      config: config
+    } do
+      table = :ets.new(__MODULE__, [:set, :public])
+
+      {:ok, heartbeat_backend} =
+        DurableServer.StorageBackend.init_backend(DeleteTrackingBackend,
+          delegate: {DurableServer.Backends.ObjectStore, test_object_store_opts()},
+          table: table
+        )
+
+      {:ok, manager_pid} =
+        start_standalone_lifecycle_manager(
+          supervisor_name,
+          config,
+          heartbeat_backend: heartbeat_backend
+        )
+
+      standalone_supervisor_name = :sys.get_state(manager_pid).supervisor_name
+
+      heartbeat_key = "#{config.prefix}__nodes/#{to_string(Node.self())}"
+
+      assert_eventually(fn ->
+        match?(
+          {:ok, %{body: _}},
+          DurableServer.StorageBackend.get_object(heartbeat_backend, heartbeat_key,
+            consistent: false
+          )
+        )
+      end)
+
+      assert :ok = LifecycleManager.stop_discovery(standalone_supervisor_name)
+      GenServer.stop(manager_pid, :shutdown, 15_000)
+
+      assert_eventually(fn ->
+        match?([{:deleted, ^heartbeat_key}], :ets.lookup(table, :deleted))
+      end)
     end
 
     test "restart preserves complex server state", %{
@@ -1069,7 +1475,7 @@ defmodule DurableServer.LifecycleTest do
 
     # Create ETS table for standalone supervisor
     table_name = :"durable_supervisor_#{standalone_supervisor_name}"
-    ^table_name = :ets.new(table_name, [:named_table, :set, :protected, read_concurrency: true])
+    ^table_name = :ets.new(table_name, [:named_table, :set, :public, read_concurrency: true])
 
     config = %{config | name: standalone_supervisor_name, ets_table: table_name}
 
@@ -1118,6 +1524,24 @@ defmodule DurableServer.LifecycleTest do
       timeout ->
         Process.demonitor(ref, [:flush])
         :ok
+    end
+  end
+
+  defp assert_eventually(fun, timeout \\ 5_000, interval \\ 25) when is_function(fun, 0) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_assert_eventually(fun, deadline, interval)
+  end
+
+  defp do_assert_eventually(fun, deadline, interval) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("condition was not met within timeout")
+      else
+        Process.sleep(interval)
+        do_assert_eventually(fun, deadline, interval)
+      end
     end
   end
 

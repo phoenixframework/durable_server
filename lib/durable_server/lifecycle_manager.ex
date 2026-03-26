@@ -110,6 +110,7 @@ defmodule DurableServer.LifecycleManager do
             config: nil,
             circuit_breaker: nil,
             object_store: nil,
+            heartbeat_store: nil,
             prefix: nil,
             node_module: nil,
             current_discovery_task: nil,
@@ -302,6 +303,22 @@ defmodule DurableServer.LifecycleManager do
           raise ArgumentError, "LifecycleManager requires :storage_backend or :object_store"
       end
 
+    heartbeat_store =
+      case Keyword.get(
+             opts,
+             :heartbeat_backend,
+             Keyword.get(opts, :heartbeat_store, object_store)
+           ) do
+        %StorageBackend{} = backend ->
+          backend
+
+        %ObjectStore{} = store ->
+          StorageBackend.new(DurableServer.Backends.ObjectStore, store)
+
+        nil ->
+          object_store
+      end
+
     capacity_limits = Keyword.get(opts, :capacity_limits, %{})
     heartbeat_meta = Keyword.get(opts, :heartbeat_meta)
 
@@ -369,6 +386,7 @@ defmodule DurableServer.LifecycleManager do
       config: config,
       circuit_breaker: circuit_breaker,
       object_store: object_store,
+      heartbeat_store: heartbeat_store,
       prefix: config.prefix,
       node_module: Keyword.get(opts, :node_module, Node),
       current_discovery_task: nil,
@@ -751,6 +769,7 @@ defmodule DurableServer.LifecycleManager do
 
   @impl true
   def terminate(_reason, %LifecycleManager{} = state) do
+    _ = maybe_delete_own_heartbeat(state)
     _ = maybe_stop_heartbeat_subscription(state)
     :ok
   end
@@ -831,7 +850,7 @@ defmodule DurableServer.LifecycleManager do
        ) do
     heartbeat_prefix = "#{state.prefix}__nodes/"
 
-    case StorageBackend.subscribe(state.object_store, self(), heartbeat_prefix) do
+    case StorageBackend.subscribe(state.heartbeat_store, self(), heartbeat_prefix) do
       {:ok, subscription_ref} ->
         %{state | heartbeat_subscription_ref: subscription_ref}
 
@@ -855,7 +874,35 @@ defmodule DurableServer.LifecycleManager do
        do: :ok
 
   defp maybe_stop_heartbeat_subscription(%LifecycleManager{} = state) do
-    StorageBackend.unsubscribe(state.object_store, state.heartbeat_subscription_ref)
+    StorageBackend.unsubscribe(state.heartbeat_store, state.heartbeat_subscription_ref)
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_delete_own_heartbeat(%LifecycleManager{} = state) do
+    if state.discovery_stopped or supervisor_shutting_down?(state.supervisor_name) do
+      node_str = to_string(Node.self())
+      key = "#{state.prefix}__nodes/#{node_str}"
+
+      :ets.delete(state.heartbeat_table, node_str)
+
+      case StorageBackend.delete_object(state.heartbeat_store, key) do
+        :ok ->
+          :ok
+
+        {:error, :not_found} ->
+          :ok
+
+        {:error, reason} ->
+          log(state, :warning, fn ->
+            "Failed to delete local heartbeat during shutdown: #{inspect(reason)}"
+          end)
+
+          :ok
+      end
+    else
+      :ok
+    end
   rescue
     _ -> :ok
   end
@@ -993,7 +1040,7 @@ defmodule DurableServer.LifecycleManager do
       # backend retries inside the same deadline window.
       put_opts = [max_retries: 0, timeout: remaining_ms]
 
-      case StorageBackend.put_object(state.object_store, key, heartbeat_data, put_opts) do
+      case StorageBackend.put_object(state.heartbeat_store, key, heartbeat_data, put_opts) do
         {:ok, _} = ok ->
           ok
 
@@ -1095,7 +1142,7 @@ defmodule DurableServer.LifecycleManager do
     current_time = System.system_time(:millisecond)
 
     entries =
-      StorageBackend.list_all_objects_stream(state.object_store, "#{state.prefix}__nodes/",
+      StorageBackend.list_all_objects_stream(state.heartbeat_store, "#{state.prefix}__nodes/",
         include_objects: true,
         error_handler: fn reason ->
           log(state, :warning, fn -> "List stream error: #{inspect(reason)}" end)
@@ -1175,7 +1222,7 @@ defmodule DurableServer.LifecycleManager do
       |> Enum.map(fn {:dead, key, node, _node_ref, _timestamp} ->
         :ets.delete(state.heartbeat_table, node)
 
-        case StorageBackend.delete_object(state.object_store, key) do
+        case StorageBackend.delete_object(state.heartbeat_store, key) do
           :ok ->
             log(state, :info, fn -> "Cleaned up dead node heartbeat: #{node}" end)
             1
@@ -1223,7 +1270,7 @@ defmodule DurableServer.LifecycleManager do
          dead_node_threshold_ms
        )
        when is_binary(key) and is_integer(current_time) and is_integer(dead_node_threshold_ms) do
-    case StorageBackend.get_object(state.object_store, key, consistent: false) do
+    case StorageBackend.get_object(state.heartbeat_store, key, consistent: false) do
       {:ok, %{body: body}} ->
         process_heartbeat_list_entry(
           %{key: key, body: body},
@@ -1398,16 +1445,15 @@ defmodule DurableServer.LifecycleManager do
   def fetch_node_heartbeat_from_storage(supervisor_name, node_str, opts \\ [])
       when is_atom(supervisor_name) and is_binary(node_str) do
     opts = Keyword.validate!(opts, [:consistent])
-
-    %{
-      prefix: prefix,
-      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms,
-      storage_backend: storage_backend
-    } = DurableServer.Supervisor.__get_config__(supervisor_name)
+    config = DurableServer.Supervisor.__get_config__(supervisor_name)
+    prefix = config.prefix
+    heartbeat_staleness_threshold_ms = config.heartbeat_staleness_threshold_ms
+    storage_backend = config.storage_backend
+    heartbeat_store = Map.get(config, :heartbeat_backend, storage_backend)
 
     key = "#{prefix}__nodes/#{node_str}"
 
-    case StorageBackend.get_object(storage_backend, key, opts) do
+    case StorageBackend.get_object(heartbeat_store, key, opts) do
       {:ok, %{body: body}} ->
         case parse_heartbeat_data(body) do
           {:ok,
@@ -1908,7 +1954,7 @@ defmodule DurableServer.LifecycleManager do
     |> Task.async_stream(
       fn %{key: key, etag: etag} = entry ->
         case get_restartable_object(state, entry) do
-          %{} = obj ->
+          {:restartable, %{} = obj, claim_opts} ->
             now = System.system_time(:millisecond)
             gate_first_seen_at = touch_restart_gate_state(state, key, now)
 
@@ -1920,7 +1966,7 @@ defmodule DurableServer.LifecycleManager do
                  now,
                  gate_first_seen_at
                ) do
-              attempt_restart(state, obj)
+              attempt_restart(state, obj, claim_opts)
             else
               :noop
             end
@@ -2096,10 +2142,15 @@ defmodule DurableServer.LifecycleManager do
                      ) do
                   :ok ->
                     # proceed with existing health checks
-                    if appears_restartable?(state, meta) do
-                      obj
-                    else
-                      {:skip, meta}
+                    case appears_restartable?(state, meta) do
+                      {:restartable, claim_opts} ->
+                        {:restartable, obj, claim_opts}
+
+                      :transient ->
+                        nil
+
+                      false ->
+                        {:skip, meta}
                     end
 
                   {:circuit_open, cooldown_ms} ->
@@ -2200,9 +2251,15 @@ defmodule DurableServer.LifecycleManager do
       :healthy ->
         false
 
-      :orphaned ->
+      {:orphaned, claim_opts} ->
         # server is orphaned, check if this node should handle it
-        orphan_claimable?(meta)
+        if orphan_claimable?(meta), do: {:restartable, claim_opts}, else: false
+
+      :orphaned ->
+        if orphan_claimable?(meta), do: {:restartable, []}, else: false
+
+      :transient ->
+        :transient
     end
   end
 
@@ -2357,12 +2414,20 @@ defmodule DurableServer.LifecycleManager do
             true
 
           :ok ->
-            if appears_restartable?(state, meta) do
-              # Now restartable — remove from cache, let async task do fresh GET
-              :ets.delete(state.discovery_skip_table, key)
-              false
-            else
-              true
+            case appears_restartable?(state, meta) do
+              {:restartable, _claim_opts} ->
+                # Now restartable — remove from cache, let async task do fresh GET
+                :ets.delete(state.discovery_skip_table, key)
+                false
+
+              :transient ->
+                # Heartbeat/read uncertainty is not a stable "non-restartable" state.
+                # Drop the cache entry so the next async pass does a fresh read.
+                :ets.delete(state.discovery_skip_table, key)
+                false
+
+              false ->
+                true
             end
         end
 
@@ -2402,11 +2467,14 @@ defmodule DurableServer.LifecycleManager do
 
   defp attempt_restart(
          %LifecycleManager{} = state,
-         %StoredState{meta: %Meta{} = meta} = stored_state
+         %StoredState{meta: %Meta{} = meta} = stored_state,
+         claim_opts
        ) do
     claim_result =
-      DurableServer.claim_restart_attempt(state.object_store, stored_state,
-        ttl: restart_claim_ttl_ms(state)
+      DurableServer.claim_restart_attempt(
+        state.object_store,
+        stored_state,
+        Keyword.merge([ttl: restart_claim_ttl_ms(state)], claim_opts)
       )
 
     report_diagnostic(state.supervisor_name, restart_claim_diag_key(claim_result))
@@ -2579,6 +2647,7 @@ defmodule DurableServer.LifecycleManager do
   defp fetch_orphaned_slow_path(%Meta{} = meta) do
     report_diagnostic(meta.supervisor, :slow_path_lock_checks)
     node_health = lookup_node_health(meta)
+    lock_result = DurableServer.check_lock_status(meta)
 
     cond do
       # node is healthy but can't accept this module (at capacity)
@@ -2587,8 +2656,8 @@ defmodule DurableServer.LifecycleManager do
         :orphaned
 
       # check if the process lock has expired
-      DurableServer.check_lock(meta) == :expired ->
-        :orphaned
+      lock_result == :expired ->
+        {:orphaned, [skip_lock_check: true]}
 
       # server explicitly marked as crashed
       Meta.crashed?(meta) ->
@@ -2598,10 +2667,24 @@ defmodule DurableServer.LifecycleManager do
       Meta.restart_attempt_expired?(meta) ->
         :orphaned
 
+      transient_lock_check_error?(lock_result) ->
+        :transient
+
       true ->
         :healthy
     end
   end
+
+  defp transient_lock_check_error?({:error, reason}), do: conflict_consistent_read_error?(reason)
+  defp transient_lock_check_error?(_), do: false
+
+  defp conflict_consistent_read_error?(:conflict), do: true
+  defp conflict_consistent_read_error?(":conflict"), do: true
+
+  defp conflict_consistent_read_error?({:consistent_read_failed, reason}),
+    do: conflict_consistent_read_error?(reason)
+
+  defp conflict_consistent_read_error?(_), do: false
 
   @doc """
   Checks if the supervisor can accept a new child of the given module.

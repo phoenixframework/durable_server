@@ -36,7 +36,7 @@ defmodule DurableServer.EKVIntegrationTest do
        [
          name: supervisor_name,
          prefix: prefix,
-         backend: {EKVStore, [name: ekv_name]},
+         backend: {EKVStore, [name: ekv_name, start: false]},
          graceful_shutdown_timeout_ms: 500
        ]}
     )
@@ -45,7 +45,8 @@ defmodule DurableServer.EKVIntegrationTest do
       File.rm_rf(data_dir)
     end)
 
-    {:ok, supervisor_name: supervisor_name, prefix: prefix, ekv_name: ekv_name}
+    {:ok,
+     supervisor_name: supervisor_name, prefix: prefix, ekv_name: ekv_name, data_dir: data_dir}
   end
 
   test "uses EKV backend defaults for heartbeat tracking and intervals", %{
@@ -72,7 +73,7 @@ defmodule DurableServer.EKVIntegrationTest do
            [
              name: supervisor_name,
              prefix: prefix,
-             backend: {EKVStore, [name: ekv_name]},
+             backend: {EKVStore, [name: ekv_name, start: false]},
              discovery_interval_ms: 11_000,
              heartbeat_interval_ms: 7_000,
              heartbeat_tracking_mode: :poll,
@@ -87,6 +88,57 @@ defmodule DurableServer.EKVIntegrationTest do
     assert config.heartbeat_interval_ms == 7_000
     assert config.heartbeat_tracking_mode == :poll
     assert config.heartbeat_reconcile_interval_ms == 21_000
+  end
+
+  test "managed EKV backend auto-starts a separate heartbeat EKV", %{
+    data_dir: data_dir
+  } do
+    unique_id = System.unique_integer([:positive, :monotonic])
+    ekv_name = :"durable_managed_ekv_#{unique_id}"
+    supervisor_name = :"durable_managed_ekv_supervisor_#{unique_id}"
+    prefix = "ekv_managed/#{unique_id}/"
+    managed_dir = Path.join(data_dir, "managed_#{unique_id}")
+
+    start_supervised!(%{
+      id: {DurableServer.Supervisor, supervisor_name},
+      start:
+        {DurableServer.Supervisor, :start_link,
+         [
+           [
+             name: supervisor_name,
+             prefix: prefix,
+             backend:
+               {EKVStore,
+                [
+                  name: ekv_name,
+                  data_dir: managed_dir,
+                  cluster_size: 1,
+                  node_id: 1,
+                  log: false
+                ]},
+             graceful_shutdown_timeout_ms: 500
+           ]
+         ]}
+    })
+
+    config = DurableServer.Supervisor.__get_config__(supervisor_name)
+    heartbeat_name = :"#{ekv_name}_heartbeats"
+
+    assert config.storage_backend.state.name == ekv_name
+    assert config.heartbeat_backend.state.name == heartbeat_name
+    assert Process.whereis(:"#{ekv_name}_ekv_sup") != nil
+    assert Process.whereis(:"#{heartbeat_name}_ekv_sup") != nil
+
+    assert_eventually(fn ->
+      Enum.empty?(EKV.keys(ekv_name, "#{prefix}__nodes/") |> Enum.to_list())
+    end)
+
+    assert_eventually(fn ->
+      heartbeat_keys = EKV.keys(heartbeat_name, "#{prefix}__nodes/") |> Enum.to_list()
+      heartbeat_keys != []
+    end)
+
+    assert File.dir?(Path.join(managed_dir, "heartbeats"))
   end
 
   test "EKV backend accepts client-mode EKV instances" do
@@ -527,7 +579,7 @@ defmodule DurableServer.EKVIntegrationTest do
            [
              name: supervisor_name,
              prefix: prefix,
-             backend: {EKVStore, [name: ekv_name]},
+             backend: {EKVStore, [name: ekv_name, start: false]},
              discovery_interval_ms: 200,
              heartbeat_interval_ms: 250,
              heartbeat_reconcile_interval_ms: 10_000,
@@ -548,7 +600,7 @@ defmodule DurableServer.EKVIntegrationTest do
                   [
                     name: supervisor_name,
                     prefix: prefix,
-                    backend: {EKVStore, [name: ekv_name]},
+                    backend: {EKVStore, [name: ekv_name, start: false]},
                     discovery_interval_ms: 200,
                     heartbeat_interval_ms: 250,
                     heartbeat_reconcile_interval_ms: 10_000,
