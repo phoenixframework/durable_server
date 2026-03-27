@@ -488,6 +488,26 @@ defmodule Group.Replica.Data do
     end)
   end
 
+  def local_pg_count_by_prefix(name, num_shards, cluster, prefix) do
+    local_node = node()
+    prefix_end = next_binary_prefix(prefix)
+
+    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
+      table = pg_by_key_table(name, shard)
+
+      count =
+        :ets.select_count(table, [
+          {{{cluster, :"$1", :_}, :_, :_, :"$2"},
+           [
+             {:==, :"$2", local_node},
+             {:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}
+           ], [true]}
+        ])
+
+      acc + count
+    end)
+  end
+
   # =====================================================================
   # Cluster membership (dual-index: cluster_nodes + node_clusters)
   # =====================================================================

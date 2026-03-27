@@ -992,6 +992,21 @@ defmodule GroupTest do
 
       assert Group.local_member_count(name, group) == 2
     end
+
+    test "counts local group members by prefix", %{name: name} do
+      prefix = "my_group/"
+      group1 = prefix <> "a"
+      group2 = prefix <> "b"
+      other = "other_group/a"
+      assert Group.local_member_count(name, prefix) == 0
+
+      :ok = Group.join(name, group1, %{})
+      :ok = Group.join(name, group2, %{})
+      :ok = Group.join(name, other, %{})
+
+      assert Group.local_member_count(name, prefix) == 2
+      assert Group.local_member_count(name, other) == 1
+    end
   end
 
   describe "concurrent operations" do

@@ -735,10 +735,13 @@ defmodule Group do
   @doc """
   Count processes in a group on the local node.
 
+  Supports prefix matching: if `group` ends with `"/"`, counts all local
+  members whose group key starts with that prefix.
+
   ## Parameters
 
   - `name` - The Group name
-  - `group` - The group to count (string)
+  - `group` - The group to count (string). Append `"/"` for prefix matching.
   - `opts` - Keyword list of options
 
   ## Options
@@ -755,7 +758,12 @@ defmodule Group do
       when is_atom(name) and is_binary(group) and is_list(opts) do
     cluster = Keyword.get(opts, :cluster)
     num_shards = get_config(name).num_shards
-    Data.local_pg_count(name, num_shards, cluster, group)
+
+    if String.ends_with?(group, "/") do
+      Data.local_pg_count_by_prefix(name, num_shards, cluster, group)
+    else
+      Data.local_pg_count(name, num_shards, cluster, group)
+    end
   end
 
   # ===========================================================================

@@ -2733,7 +2733,12 @@ defmodule DurableServer.LifecycleManager do
 
       max_children_limits ->
         global_count = Group.local_registry_count(supervisor_name)
-        module_count = Group.local_member_count(supervisor_name, inspect(module))
+
+        module_count =
+          Group.local_member_count(
+            supervisor_name,
+            DurableServer.Supervisor.__module_group_prefix__(module)
+          )
 
         total_limit = max_children_limits[:total]
         module_limit = max_children_limits[module]

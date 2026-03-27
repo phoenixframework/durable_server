@@ -1,6 +1,8 @@
 defmodule DurableServer.SupervisorBackendSpecTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias DurableServer.LifecycleManager
   alias DurableServer.Backends.EKVStore
   alias DurableServer.Backends.MirrorStore
@@ -325,6 +327,43 @@ defmodule DurableServer.SupervisorBackendSpecTest do
 
     assert lifecycle_manager_spec.shutdown == shutdown_timeout
     assert terminator_spec.shutdown == shutdown_timeout
+  end
+
+  test "warns when supervisor shutdown timeout is shorter than child shutdown requirements" do
+    supervisor_name = unique_supervisor_name("shutdown_warning")
+    prefix = unique_prefix("shutdown_warning")
+    unique_id = System.unique_integer([:positive, :monotonic])
+    ekv_name = :"durable_shutdown_warning_ekv_#{unique_id}"
+    data_dir = Path.join(System.tmp_dir!(), "durable_shutdown_warning_#{unique_id}")
+
+    log =
+      capture_log(fn ->
+        assert {:ok, {_flags, _child_specs}} =
+                 DurableServer.Supervisor.init(
+                   name: supervisor_name,
+                   prefix: prefix,
+                   backend:
+                     {EKVStore,
+                      [
+                        name: ekv_name,
+                        data_dir: data_dir,
+                        cluster_size: 1,
+                        node_id: 1,
+                        log: false,
+                        shutdown_barrier: 120_000
+                      ]},
+                   graceful_shutdown_timeout_ms: 90_000,
+                   supervisor_shutdown_timeout_ms: 60_000
+                 )
+      end)
+
+    assert log =~
+             "supervisor_shutdown_timeout_ms (60000) is less than graceful_shutdown_timeout_ms (90000)"
+
+    assert log =~
+             "supervisor_shutdown_timeout_ms (60000) is less than managed EKV shutdown requirement"
+
+    assert log =~ inspect(ekv_name)
   end
 
   test "invalid discovery tuning options raise" do

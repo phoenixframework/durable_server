@@ -605,7 +605,12 @@ defmodule DurableServer.Supervisor do
           max_children
           |> Enum.reject(fn {k, _v} -> k == :total end)
           |> Enum.reduce(capacity_map, fn {module, limit}, acc ->
-            current = Group.local_member_count(supervisor_name, inspect(module))
+            current =
+              Group.local_member_count(
+                supervisor_name,
+                __module_group_prefix__(module)
+              )
+
             Map.put(acc, module, %{current: current, limit: limit})
           end)
 
@@ -2565,8 +2570,10 @@ defmodule DurableServer.Supervisor do
   end
 
   def global_members(sup_name, module) when is_atom(sup_name) and is_atom(module) do
+    module_group_prefix = __module_group_prefix__(module)
+
     sup_name
-    |> Group.members(inspect(module), extract_meta: & &1)
+    |> Group.members(module_group_prefix, extract_meta: & &1)
     |> Enum.reduce(%{}, fn {pid, meta}, acc ->
       if node(pid) == Node.self() && !Process.alive?(pid) do
         acc
@@ -2592,7 +2599,7 @@ defmodule DurableServer.Supervisor do
           [{:capacity_limits, limits}] = :ets.lookup(table_name, :capacity_limits)
 
           if is_map(limits[:max_children]) and Map.has_key?(limits[:max_children], module) do
-            Group.join(sup_name, inspect(module), meta)
+            Group.join(sup_name, __module_group_key__(sup_name, module, key), meta)
           end
         end
 
@@ -2605,6 +2612,27 @@ defmodule DurableServer.Supervisor do
 
   def get_dynamic_supervisor(supervisor) do
     :"#{supervisor}_dynamic"
+  end
+
+  @doc false
+  def __module_group_prefix__(module) when is_atom(module) do
+    "module/#{inspect(module)}/"
+  end
+
+  @doc false
+  def __module_group_key__(supervisor, module, key)
+      when is_atom(supervisor) and is_atom(module) and is_binary(key) do
+    bucket_count =
+      case Group.get_config(supervisor) do
+        %{num_shards: num_shards} when is_integer(num_shards) and num_shards > 0 ->
+          max(16, num_shards * 4)
+
+        _ ->
+          32
+      end
+
+    bucket = :erlang.phash2(key, bucket_count)
+    __module_group_prefix__(module) <> Integer.to_string(bucket)
   end
 
   def get_task_supervisor(supervisor) do
@@ -2894,6 +2922,8 @@ defmodule DurableServer.Supervisor do
       ets_table: table_name
     }
 
+    warn_on_shutdown_timeout_mismatch(config, backend_resources)
+
     Logger.info("starting #{inspect(name)}: #{inspect(config)}")
 
     :ets.insert(table_name, {:config, config})
@@ -3053,6 +3083,44 @@ defmodule DurableServer.Supervisor do
         |> Enum.map(& &1.backend)
         |> Enum.uniq()
     }
+  end
+
+  defp warn_on_shutdown_timeout_mismatch(config, backend_resources) do
+    supervisor_timeout = config.supervisor_shutdown_timeout_ms
+    graceful_timeout = config.graceful_shutdown_timeout_ms
+
+    if supervisor_timeout < graceful_timeout do
+      Logger.warning(
+        "supervisor_shutdown_timeout_ms (#{supervisor_timeout}) is less than " <>
+          "graceful_shutdown_timeout_ms (#{graceful_timeout}); the parent supervisor may cut off " <>
+          "DurableServer shutdown before Terminator finishes draining children"
+      )
+    end
+
+    backend_resources.managed_children
+    |> Enum.each(fn
+      {ekv_mod, ekv_opts} when is_atom(ekv_mod) and is_list(ekv_opts) ->
+        case Keyword.get(ekv_opts, :shutdown_barrier) do
+          timeout when is_integer(timeout) and timeout >= 0 ->
+            required_timeout = timeout + 1_000
+            ekv_name = Keyword.get(ekv_opts, :name, ekv_mod)
+
+            if supervisor_timeout < required_timeout do
+              Logger.warning(
+                "supervisor_shutdown_timeout_ms (#{supervisor_timeout}) is less than managed EKV " <>
+                  "shutdown requirement for #{inspect(ekv_name)} (shutdown_barrier=#{timeout}, " <>
+                  "required child shutdown=#{required_timeout}); the parent supervisor may cut off " <>
+                  "EKV coordinated shutdown early"
+              )
+            end
+
+          _ ->
+            :ok
+        end
+
+      _ ->
+        :ok
+    end)
   end
 
   defp init_backend_resource(%StorageBackend{} = backend, _finch, _task_sup, _role) do

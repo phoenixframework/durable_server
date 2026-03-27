@@ -319,7 +319,33 @@ defmodule GroupTest do
       assert Group.member_count(sup, room1) == 1
       assert Group.local_member_count(sup, room1) == 1
       assert Group.member_count(sup, "rooms/") == 2
+      assert Group.local_member_count(sup, "rooms/") == 2
       assert Group.member_count(sup, "other/") == 1
+    end
+
+    test "module membership uses sharded prefix groups" do
+      sup = :"test_cluster_#{DurableServer.UUID.uuid4()}"
+      prefix = "test_cluster_#{DurableServer.UUID.uuid4()}/"
+      key1 = "module/#{DurableServer.UUID.uuid4()}"
+      key2 = "module/#{DurableServer.UUID.uuid4()}"
+      module_prefix = DurableServer.Supervisor.__module_group_prefix__(TestServer)
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: sup,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{TestServer => 10}}
+      )
+
+      {:ok, {_pid1, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key1}})
+      {:ok, {_pid2, _}} = DurableServer.Supervisor.start_child(sup, {TestServer, %{key: key2}})
+
+      assert Group.member_count(sup, module_prefix) == 2
+      assert Group.local_member_count(sup, module_prefix) == 2
+
+      members = DurableServer.Supervisor.global_members(sup, TestServer)
+      assert Map.keys(members) |> Enum.sort() == Enum.sort([key1, key2])
     end
   end
 
