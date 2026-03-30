@@ -264,6 +264,17 @@ defmodule Group.TestCluster do
     end)
   end
 
+  @doc "Kill many remote processes in one RPC so their DOWNs arrive tightly."
+  def kill_pids(node, pids, reason \\ :kill) do
+    :erpc.call(node, __MODULE__, :do_kill_pids, [pids, reason])
+  end
+
+  @doc false
+  def do_kill_pids(pids, reason) do
+    Enum.each(pids, &Process.exit(&1, reason))
+    :ok
+  end
+
   @doc "Spawn a process on a remote node that registers in a named cluster and sleeps.
   Waits for the registration to complete before returning."
   def spawn_register_in_cluster(node, name, key, meta, cluster) do

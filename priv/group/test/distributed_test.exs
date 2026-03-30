@@ -12,6 +12,29 @@ defmodule Group.DistributedTest do
     end
   end
 
+  defp keys_for_shard(cluster, prefix, num_shards, target_shard, count) do
+    Stream.iterate(0, &(&1 + 1))
+    |> Stream.map(fn i -> "#{prefix}/#{i}" end)
+    |> Stream.filter(fn key -> :erlang.phash2({cluster, key}, num_shards) == target_shard end)
+    |> Enum.take(count)
+  end
+
+  defp receive_batches_until(expected_event_count, acc \\ []) do
+    received = Enum.sum(Enum.map(acc, &length/1))
+
+    if received >= expected_event_count do
+      Enum.reverse(acc)
+    else
+      receive do
+        {:got_batch, events} ->
+          receive_batches_until(expected_event_count, [events | acc])
+      after
+        5000 ->
+          flunk("timed out waiting for #{expected_event_count} batched events, got #{received}")
+      end
+    end
+  end
+
   describe "registration replication" do
     test "register replicates to other nodes" do
       peers = TestCluster.start_peers(2)
@@ -164,6 +187,91 @@ defmodule Group.DistributedTest do
       # Clean up remaining peer
       [{peer_a_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_a end)
       on_exit(fn -> :peer.stop(peer_a_pid) end)
+    end
+
+    test "process DOWN cleanup arrives as one remote batch per dead pid" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_down_batch_#{System.unique_integer([:positive])}"
+      num_shards = 2
+      opts = [name: name, shards: num_shards]
+
+      [reg_key, join_key] =
+        keys_for_shard(nil, "down_batch", num_shards, 0, 2)
+
+      start_group_on_peers(peers, opts)
+
+      pid =
+        TestCluster.spawn_register_and_join(
+          node_a,
+          name,
+          reg_key,
+          %{type: :reg},
+          join_key,
+          %{type: :pg}
+        )
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key]) != nil and
+          TestCluster.rpc!(node_b, Group, :members, [name, join_key]) != []
+      end)
+
+      TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, _}, 5000
+
+      Process.exit(pid, :kill)
+
+      assert_receive {:got_batch, events}, 5000
+      assert Enum.sort(Enum.map(events, & &1.type)) == [:left, :unregistered]
+      assert Enum.sort(Enum.map(events, & &1.key)) == Enum.sort([join_key, reg_key])
+      refute_receive {:got_batch, _}, 100
+    end
+
+    test "process DOWN cleanup batches up to 32 member pids per shard turn" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_down_batch_many_#{System.unique_integer([:positive])}"
+      num_shards = 2
+      opts = [name: name, shards: num_shards]
+
+      keys =
+        keys_for_shard(nil, "down_batch_many", num_shards, 0, 66)
+        |> Enum.chunk_every(2)
+
+      start_group_on_peers(peers, opts)
+
+      pids =
+        Enum.map(keys, fn [reg_key, join_key] ->
+          TestCluster.spawn_register_and_join(
+            node_a,
+            name,
+            reg_key,
+            %{type: :reg},
+            join_key,
+            %{type: :pg}
+          )
+        end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :registry_count, [name]) == 33 and
+          TestCluster.rpc!(node_b, Group, :member_count, [name, "down_batch_many/"]) == 33
+      end)
+
+      TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, _}, 5000
+
+      :ok = TestCluster.kill_pids(node_a, pids)
+
+      batches = receive_batches_until(66)
+      batch_sizes = Enum.map(batches, &length/1)
+
+      assert Enum.sum(batch_sizes) == 66
+      assert length(batches) >= 2
+      assert Enum.max(batch_sizes) <= 64
     end
   end
 

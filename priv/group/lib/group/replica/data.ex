@@ -258,42 +258,93 @@ defmodule Group.Replica.Data do
 
   @doc """
   Delete all entries for a pid from this shard. Used on process DOWN.
-  Deletes from by_key tables individually (need the key), but batch-deletes
-  from by_pid tables with match_delete (all entries for this pid are contiguous).
-  Returns {reg_entries, pg_entries} for dispatch.
+  Returns lean `{cluster, key, meta}` tuples for dispatch.
   """
   def delete_all_for_pid(name, shard, pid) do
+    case delete_all_for_pids(name, shard, [pid]) do
+      {[{^pid, cluster, key, meta}], pg_entries} ->
+        {[{cluster, key, meta}], Enum.map(pg_entries, fn {^pid, c, k, m} -> {c, k, m} end)}
+
+      {reg_entries, pg_entries} ->
+        {
+          Enum.map(reg_entries, fn {^pid, cluster, key, meta} -> {cluster, key, meta} end),
+          Enum.map(pg_entries, fn {^pid, cluster, key, meta} -> {cluster, key, meta} end)
+        }
+    end
+  end
+
+  @doc """
+  Delete all entries for the given pids from this shard. Used to batch local
+  process DOWN cleanup. Returns lean `{pid, cluster, key, meta}` tuples for
+  dispatch/event building.
+  """
+  def delete_all_for_pids(_name, _shard, []), do: {[], []}
+
+  def delete_all_for_pids(name, shard, pids) do
+    pids = Enum.uniq(pids)
     reg_table = reg_by_key_table(name, shard)
     reg_pid_table = reg_by_pid_table(name, shard)
 
-    reg_entries =
-      :ets.select(reg_pid_table, [
-        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [], [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
-      ])
+    reg_entries = select_entries_for_pids(reg_pid_table, pids)
 
-    for {cluster, key, _meta, _time, _node} <- reg_entries do
+    for {_pid, cluster, key, _meta} <- reg_entries do
       :ets.delete(reg_table, {cluster, key})
     end
 
-    # Batch-delete all reg_by_pid entries for this pid
-    :ets.match_delete(reg_pid_table, {{pid, :_, :_}, :_, :_, :_})
+    select_delete_pids(reg_pid_table, pids)
 
     pg_table = pg_by_key_table(name, shard)
     pg_pid_table = pg_by_pid_table(name, shard)
 
-    pg_entries =
-      :ets.select(pg_pid_table, [
-        {{{pid, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [], [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
-      ])
+    pg_entries = select_entries_for_pids(pg_pid_table, pids)
 
-    for {cluster, key, _meta, _time, _node} <- pg_entries do
+    for {pid, cluster, key, _meta} <- pg_entries do
       :ets.delete(pg_table, {cluster, key, pid})
     end
 
-    # Batch-delete all pg_by_pid entries for this pid
-    :ets.match_delete(pg_pid_table, {{pid, :_, :_}, :_, :_, :_})
+    select_delete_pids(pg_pid_table, pids)
 
     {reg_entries, pg_entries}
+  end
+
+  def registry_delete_matching_many(_name, _shard, []), do: []
+
+  def registry_delete_matching_many(name, shard, entries) do
+    reg_table = reg_by_key_table(name, shard)
+    reg_pid_table = reg_by_pid_table(name, shard)
+
+    Enum.reduce(entries, [], fn {pid, cluster, key, _meta, _reason} = entry, acc ->
+      case :ets.lookup(reg_table, {cluster, key}) do
+        [{{^cluster, ^key}, ^pid, _current_meta, _time, _node}] ->
+          :ets.delete(reg_table, {cluster, key})
+          :ets.delete(reg_pid_table, {pid, cluster, key})
+          [entry | acc]
+
+        _ ->
+          acc
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  def pg_delete_matching_many(_name, _shard, []), do: []
+
+  def pg_delete_matching_many(name, shard, entries) do
+    pg_table = pg_by_key_table(name, shard)
+    pg_pid_table = pg_by_pid_table(name, shard)
+
+    Enum.reduce(entries, [], fn {pid, cluster, key, _meta, _reason} = entry, acc ->
+      case :ets.lookup(pg_table, {cluster, key, pid}) do
+        [{{^cluster, ^key, ^pid}, _current_meta, _time, _node}] ->
+          :ets.delete(pg_table, {cluster, key, pid})
+          :ets.delete(pg_pid_table, {pid, cluster, key})
+          [entry | acc]
+
+        _ ->
+          acc
+      end
+    end)
+    |> Enum.reverse()
   end
 
   # =====================================================================
@@ -351,6 +402,24 @@ defmodule Group.Replica.Data do
       end)
 
     reg_entries ++ pg_entries
+  end
+
+  defp select_entries_for_pids(table, pids) do
+    :ets.select(
+      table,
+      Enum.map(pids, fn pid ->
+        {{{pid, :"$1", :"$2"}, :"$3", :_, :_}, [], [{{pid, :"$1", :"$2", :"$3"}}]}
+      end)
+    )
+  end
+
+  defp select_delete_pids(table, pids) do
+    :ets.select_delete(
+      table,
+      Enum.map(pids, fn pid ->
+        {{{pid, :_, :_}, :_, :_, :_}, [], [true]}
+      end)
+    )
   end
 
   def local_data_by_cluster(name, shard, clusters) do

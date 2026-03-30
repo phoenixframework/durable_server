@@ -3,6 +3,8 @@ defmodule Group.Replica do
 
   use GenServer
 
+  @process_down_batch_size 32
+
   _archdoc = ~S"""
   Sharded GenServer: peer discovery, replication, monitoring, conflict resolution.
 
@@ -1081,44 +1083,45 @@ defmodule Group.Replica do
       state = %{state | monitors: Map.delete(state.monitors, pid)}
       {:noreply, state}
     else
-      # Regular process died — clean up its entries in this shard
-      # Batch-delete from by_pid tables (one match_delete per table type)
-      # and individual deletes from by_key tables
-      {purged_reg, purged_pg} = Data.delete_all_for_pid(name, shard, pid)
-
-      log_verbose(state, fn ->
-        "#{log_prefix_shard(state)} process_down pid=#{inspect(pid)} reason=#{inspect(reason)} (#{length(purged_reg) + length(purged_pg)} entries cleaned)"
-      end)
-
-      events =
-        Enum.reduce(purged_reg, [], fn {cluster, key, meta, _time, _node}, acc ->
-          broadcast_to_cluster(
-            state,
-            cluster,
-            {:replicate_unregister, cluster, key, pid, meta, reason}
+      if Map.has_key?(state.monitors, pid) do
+        {downs, monitors} =
+          collect_local_process_downs(
+            [{pid, reason}],
+            state.monitors,
+            @process_down_batch_size - 1
           )
 
-          [
-            build_event(name, :unregistered, key, pid, meta, %{reason: reason, cluster: cluster})
-            | acc
-          ]
+        pids = Enum.map(downs, &elem(&1, 0))
+        reason_by_pid = Map.new(downs)
+        {purged_reg, purged_pg} = Data.delete_all_for_pids(name, shard, pids)
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} process_down_batch pids=#{length(downs)} (#{length(purged_reg) + length(purged_pg)} entries cleaned)"
         end)
 
-      events =
-        Enum.reduce(purged_pg, events, fn {cluster, key, meta, _time, _node}, acc ->
-          broadcast_to_cluster(
-            state,
-            cluster,
-            {:replicate_leave, cluster, key, pid, meta, reason}
-          )
-
-          [build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster}) | acc]
-        end)
-
-      notify_monitors(name, events)
-      state = %{state | monitors: Map.delete(state.monitors, pid)}
-      {:noreply, state}
+        broadcast_process_down_batch(state, reason_by_pid, purged_reg, purged_pg)
+        events = build_process_down_events(name, purged_reg, purged_pg, reason_by_pid)
+        notify_monitors(name, events)
+        state = %{state | monitors: Map.drop(monitors, pids)}
+        {:noreply, state}
+      else
+        {:noreply, state}
+      end
     end
+  end
+
+  def handle_info({:replicate_process_down_batch, reg_entries, pg_entries}, state) do
+    %{name: name, shard_index: shard} = state
+
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} replicate_process_down_batch (#{length(reg_entries)} reg, #{length(pg_entries)} pg)"
+    end)
+
+    deleted_reg = Data.registry_delete_matching_many(name, shard, reg_entries)
+    deleted_pg = Data.pg_delete_matching_many(name, shard, pg_entries)
+    events = build_process_down_batch_events(name, deleted_reg, deleted_pg)
+    notify_monitors(name, events)
+    {:noreply, state}
   end
 
   def handle_info({:send_cluster_data, clusters, target_node}, state) do
@@ -1170,6 +1173,118 @@ defmodule Group.Replica do
     for target_node <- Data.cluster_nodes(name, cluster), target_node != node() do
       send({shard_name, target_node}, message)
     end
+  end
+
+  defp broadcast_process_down_batch(state, reason_by_pid, reg_entries, pg_entries) do
+    messages =
+      Enum.reduce(reg_entries, %{}, fn {pid, cluster, key, meta}, acc ->
+        accumulate_process_down_entry(
+          acc,
+          process_down_targets(state, cluster),
+          {:reg, pid, cluster, key, meta, Map.fetch!(reason_by_pid, pid)}
+        )
+      end)
+      |> then(fn acc ->
+        Enum.reduce(pg_entries, acc, fn {pid, cluster, key, meta}, inner ->
+          accumulate_process_down_entry(
+            inner,
+            process_down_targets(state, cluster),
+            {:pg, pid, cluster, key, meta, Map.fetch!(reason_by_pid, pid)}
+          )
+        end)
+      end)
+
+    shard_name = shard_name(state.name, state.shard_index)
+
+    Enum.each(messages, fn {target_node, {reg_entries, pg_entries}} ->
+      send(
+        {shard_name, target_node},
+        {:replicate_process_down_batch, Enum.reverse(reg_entries), Enum.reverse(pg_entries)}
+      )
+    end)
+  end
+
+  defp process_down_targets(state, nil) do
+    for {target_node, _pid} <- state.remote_shards, do: target_node
+  end
+
+  defp process_down_targets(%{name: name}, cluster) do
+    for target_node <- Data.cluster_nodes(name, cluster), target_node != node(), do: target_node
+  end
+
+  defp accumulate_process_down_entry(acc, target_nodes, {:reg, pid, cluster, key, meta, reason}) do
+    Enum.reduce(target_nodes, acc, fn target_node, inner ->
+      Map.update(
+        inner,
+        target_node,
+        {[{pid, cluster, key, meta, reason}], []},
+        fn {reg_entries, pg_entries} ->
+          {[{pid, cluster, key, meta, reason} | reg_entries], pg_entries}
+        end
+      )
+    end)
+  end
+
+  defp accumulate_process_down_entry(acc, target_nodes, {:pg, pid, cluster, key, meta, reason}) do
+    Enum.reduce(target_nodes, acc, fn target_node, inner ->
+      Map.update(
+        inner,
+        target_node,
+        {[], [{pid, cluster, key, meta, reason}]},
+        fn {reg_entries, pg_entries} ->
+          {reg_entries, [{pid, cluster, key, meta, reason} | pg_entries]}
+        end
+      )
+    end)
+  end
+
+  defp collect_local_process_downs(acc, monitors, 0), do: {Enum.reverse(acc), monitors}
+
+  defp collect_local_process_downs(acc, monitors, remaining) do
+    receive do
+      {:DOWN, _mref, :process, pid, reason} when is_map_key(monitors, pid) ->
+        collect_local_process_downs([{pid, reason} | acc], monitors, remaining - 1)
+    after
+      0 ->
+        {Enum.reverse(acc), monitors}
+    end
+  end
+
+  defp build_process_down_events(name, reg_entries, pg_entries, reason_by_pid) do
+    events =
+      Enum.reduce(reg_entries, [], fn {pid, cluster, key, meta}, acc ->
+        [
+          build_event(name, :unregistered, key, pid, meta, %{
+            reason: Map.fetch!(reason_by_pid, pid),
+            cluster: cluster
+          })
+          | acc
+        ]
+      end)
+
+    Enum.reduce(pg_entries, events, fn {pid, cluster, key, meta}, acc ->
+      [
+        build_event(name, :left, key, pid, meta, %{
+          reason: Map.fetch!(reason_by_pid, pid),
+          cluster: cluster
+        })
+        | acc
+      ]
+    end)
+  end
+
+  defp build_process_down_batch_events(name, reg_entries, pg_entries) do
+    events =
+      Enum.reduce(reg_entries, [], fn {pid, cluster, key, meta, reason}, acc ->
+        [
+          build_event(name, :unregistered, key, pid, meta, %{reason: reason, cluster: cluster})
+          | acc
+        ]
+      end)
+
+    Enum.reduce(pg_entries, events, fn {pid, cluster, key, meta, reason}, acc ->
+      [build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster}) | acc]
+    end)
   end
 
   defp fan_out_to_siblings(state, message) do
