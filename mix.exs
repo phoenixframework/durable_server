@@ -10,7 +10,7 @@ defmodule DurableServer.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       package: package(),
-      homepage_url: "https://github.com/chrismccord/durable_server",
+      homepage_url: "https://github.com/phoenixframework/durable_server",
       description: """
       DurableServer provides durable, distributed GenServer processes backed by object storage.
       """
@@ -25,7 +25,7 @@ defmodule DurableServer.MixProject do
       maintainers: ["Chris McCord"],
       licenses: ["MIT"],
       links: %{
-        GitHub: "https://github.com/chrismccord/durable_server"
+        GitHub: "https://github.com/phoenixframework/durable_server"
       },
       files: ~w(lib CHANGELOG.md LICENSE.md mix.exs README.md .formatter.exs)
     ]
