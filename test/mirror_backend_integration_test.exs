@@ -28,7 +28,8 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
       do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
 
     @impl true
-    def put_object(_state, _key, _data, _opts), do: {:error, :promotion_write_rejected}
+    def put_object(state, _key, _data, _opts),
+      do: {:error, Map.get(state, :reason, :promotion_write_rejected)}
 
     @impl true
     def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
@@ -159,6 +160,43 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
 
     assert {:error, {:promotion_failed, :promotion_write_rejected}} =
              StorageBackend.get_object(read_only_mirror, key)
+  end
+
+  test "required mirror failure does not hide a committed authoritative write", %{
+    primary: primary,
+    secondary: secondary
+  } do
+    key = "mirror/required_partial_write"
+
+    assert {:ok, %{etag: original_etag}} =
+             StorageBackend.put_object(primary, key, "value-v1")
+
+    assert {:ok, _obj} = StorageBackend.put_object(secondary, key, "value-v1")
+
+    rejecting_secondary =
+      StorageBackend.new(RejectingPutBackend, %{
+        delegate: secondary,
+        reason: :mirror_write_rejected
+      })
+
+    required_mirror = mirror_backend(primary, rejecting_secondary)
+
+    assert {:error, {:mirror_failed, :mirror_write_rejected}} =
+             StorageBackend.put_object(required_mirror, key, "value-v2",
+               etag: original_etag,
+               max_retries: 0
+             )
+
+    assert {:ok, %{body: authoritative_body}} = StorageBackend.get_object(primary, key)
+
+    assert {:error, :conflict} =
+             StorageBackend.put_object(primary, key, "retry-with-old-etag",
+               etag: original_etag,
+               max_retries: 0
+             )
+
+    assert authoritative_body == "value-v1",
+           "ordinary mirror failure hid committed authoritative value #{inspect(authoritative_body)}"
   end
 
   test "mirror writes propagate put and delete to secondary", %{
