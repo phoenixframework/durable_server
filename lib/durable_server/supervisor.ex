@@ -232,8 +232,9 @@ defmodule DurableServer.Supervisor do
   @shutdown_placement_attempt_wait_timeout :timer.seconds(1)
   @default_placement_timeout :timer.seconds(15)
   @default_start_child_timeout 5_000
-  @already_started_registration_wait_ms 5_000
-  @already_started_registration_poll_ms 100
+  @owner_transition_retry_base_ms 25
+  @owner_transition_retry_max_ms 250
+  @owner_transition_retry_multipliers {1, 2, 4, 8, 16}
   @default_discovery_interval_ms 60_000
   @default_initial_discovery_delay_ms {1_000, 6_000}
   @default_discovery_shuffle_batch_size 20_000
@@ -2050,15 +2051,16 @@ defmodule DurableServer.Supervisor do
     When set, if all placement attempts fail, retries with fresh eligible nodes every
     #{@placement_retry_interval}ms until the deadline. Default: `nil` (no retry).
   - `:timeout` - Maximum total time in milliseconds to wait for the process to be
-    found or bootstrapped. Returns `{:error, :timeout}` on expiration, unless a
-    live storage lock is found without a reachable Group entry. Set to `:infinity`
-    to disable. Default: `#{@default_start_child_timeout}`ms.
+    found or bootstrapped. Owner transitions are re-evaluated until this deadline
+    instead of using a separate registration wait. Returns `{:error, :timeout}` on
+    expiration, unless a live storage lock was found without a reachable Group entry.
+    Set to `:infinity` to disable. Default: `#{@default_start_child_timeout}`ms.
 
   ## Returns
 
   - `{:ok, {pid, meta}}` - Process is running (either found or newly started)
   - `{:error, {:unreachable, pid}}` - Storage has a live lock for `pid`, but no
-    Group metadata became reachable before the registration-race wait expired
+    owner became reachable before the caller's `:timeout` expired
   - `{:error, reason}` - Failed to start the process
 
   ## Examples
@@ -2151,7 +2153,19 @@ defmodule DurableServer.Supervisor do
              singleflight_key,
              singleflight_wait_timeout_ms,
              fn ->
-               do_ensure_started_child(supervisor, module, key, child_spec, opts, deadline_ms)
+               retry_owner_transition(
+                 fn ->
+                   do_ensure_started_child(
+                     supervisor,
+                     module,
+                     key,
+                     child_spec,
+                     opts,
+                     deadline_ms
+                   )
+                 end,
+                 deadline_ms
+               )
              end,
              %{
                leader: :ensure_started_singleflight_leader,
@@ -2352,45 +2366,59 @@ defmodule DurableServer.Supervisor do
     do: {:error, {:already_started, :deleting}}
 
   defp normalize_already_started_result(_supervisor, _key, :noproc, _deadline_ms),
-    do: {:error, {:unreachable, :noproc}}
+    do: {:retry_owner_transition, :noproc}
 
-  defp normalize_already_started_result(supervisor, key, pid, deadline_ms) when is_pid(pid) do
-    await_group_registration_or_unreachable(
-      supervisor,
-      key,
-      pid,
-      already_started_registration_deadline(deadline_ms)
-    )
-  end
-
-  defp already_started_registration_deadline(deadline_ms) do
-    registration_deadline =
-      System.monotonic_time(:millisecond) + @already_started_registration_wait_ms
-
-    earlier_deadline(deadline_ms, registration_deadline)
-  end
-
-  defp await_group_registration_or_unreachable(supervisor, key, pid, wait_deadline_ms) do
+  defp normalize_already_started_result(supervisor, key, pid, _deadline_ms) when is_pid(pid) do
     case lookup(supervisor, key) do
-      {^pid, meta} ->
-        {:ok, {pid, meta}}
+      {registered_pid, meta} ->
+        {:ok, {registered_pid, meta}}
 
-      _ ->
-        remaining_ms = remaining_timeout_ms(wait_deadline_ms)
-
-        if remaining_ms == 0 do
-          {:error, {:unreachable, pid}}
-        else
-          sleep_ms =
-            case remaining_ms do
-              :infinity -> @already_started_registration_poll_ms
-              timeout_ms -> min(@already_started_registration_poll_ms, timeout_ms)
-            end
-
-          Process.sleep(sleep_ms)
-          await_group_registration_or_unreachable(supervisor, key, pid, wait_deadline_ms)
-        end
+      nil ->
+        {:retry_owner_transition, pid}
     end
+  end
+
+  defp retry_owner_transition(operation, deadline_ms) when is_function(operation, 0) do
+    retry_owner_transition(operation, deadline_ms, 0, nil)
+  end
+
+  defp retry_owner_transition(operation, deadline_ms, attempt, last_unreachable) do
+    if deadline_exceeded?(deadline_ms) do
+      owner_transition_timeout_result(last_unreachable)
+    else
+      case operation.() do
+        {:retry_owner_transition, unreachable} ->
+          sleep_before_owner_transition_retry(deadline_ms, attempt)
+          retry_owner_transition(operation, deadline_ms, attempt + 1, unreachable)
+
+        {:error, :timeout} when not is_nil(last_unreachable) ->
+          owner_transition_timeout_result(last_unreachable)
+
+        result ->
+          result
+      end
+    end
+  end
+
+  defp owner_transition_timeout_result(nil), do: {:error, :timeout}
+
+  defp owner_transition_timeout_result(last_unreachable),
+    do: {:error, {:unreachable, last_unreachable}}
+
+  defp sleep_before_owner_transition_retry(deadline_ms, attempt) do
+    multiplier_index = min(attempt, tuple_size(@owner_transition_retry_multipliers) - 1)
+    multiplier = elem(@owner_transition_retry_multipliers, multiplier_index)
+    base_ms = min(@owner_transition_retry_base_ms * multiplier, @owner_transition_retry_max_ms)
+    jitter_ms = :erlang.phash2({self(), attempt}, div(base_ms, 4) + 1)
+    retry_ms = min(base_ms + jitter_ms, @owner_transition_retry_max_ms)
+
+    sleep_ms =
+      case remaining_timeout_ms(deadline_ms) do
+        :infinity -> retry_ms
+        remaining_ms -> min(retry_ms, remaining_ms)
+      end
+
+    Process.sleep(sleep_ms)
   end
 
   defp with_supervisor_singleflight(
@@ -3042,21 +3070,7 @@ defmodule DurableServer.Supervisor do
             [] ->
               # No remote nodes, try local
               Logger.info("No remote nodes available, trying local for rehoming #{key}")
-
-              case __start_child__(
-                     supervisor,
-                     child_spec,
-                     max_placement_retries: 0
-                   ) do
-                {:ok, {pid, meta}} ->
-                  {:ok, {pid, meta}}
-
-                {:error, {:already_started, other}} ->
-                  normalize_already_started_result(supervisor, key, other, nil)
-
-                {:error, reason} ->
-                  {:error, reason}
-              end
+              force_local_rehome_start(supervisor, key, child_spec)
 
             nodes ->
               try_nodes(supervisor, child_spec, nodes)
@@ -3068,6 +3082,31 @@ defmodule DurableServer.Supervisor do
           __ensure_started_child__(supervisor, child_spec)
       end
     end
+  end
+
+  defp force_local_rehome_start(supervisor, key, child_spec) do
+    deadline_ms = deadline_after_timeout(@default_start_child_timeout)
+
+    retry_owner_transition(
+      fn ->
+        case __start_child__(
+               supervisor,
+               child_spec,
+               max_placement_retries: 0,
+               timeout: timeout_option(deadline_ms)
+             ) do
+          {:ok, {pid, meta}} ->
+            {:ok, {pid, meta}}
+
+          {:error, {:already_started, other}} ->
+            normalize_already_started_result(supervisor, key, other, deadline_ms)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end,
+      deadline_ms
+    )
   end
 
   defp rehome_reservation_ttl_ms(supervisor) when is_atom(supervisor) do

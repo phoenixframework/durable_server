@@ -275,6 +275,7 @@ defmodule DurableServerTest do
          state: %{
            table: :ets.new(__MODULE__, [:set, :public]),
            owner: Map.get(opts, :owner),
+           after_get: Map.get(opts, :after_get),
            after_put: Map.get(opts, :after_put),
            delete_error: Map.get(opts, :delete_error)
          },
@@ -286,20 +287,27 @@ defmodule DurableServerTest do
     def ensure_ready(_state), do: :ok
 
     @impl true
-    def get_object(%{table: table, owner: owner}, key, opts) do
+    def get_object(%{table: table, owner: owner} = state, key, opts) do
       record_get_call(table, key, opts, owner)
       consistent = Keyword.get(opts, :consistent, :unset)
 
-      case :ets.lookup(table, {:override, key, consistent}) do
-        [{{:override, ^key, ^consistent}, response}] ->
-          response
+      result =
+        case :ets.lookup(table, {:override, key, consistent}) do
+          [{{:override, ^key, ^consistent}, response}] ->
+            response
 
-        [] ->
-          case :ets.lookup(table, {:data, key}) do
-            [{{:data, ^key}, %{body: body, etag: etag}}] -> {:ok, %{body: body, etag: etag}}
-            [] -> {:error, :not_found}
-          end
-      end
+          [] ->
+            case :ets.lookup(table, {:data, key}) do
+              [{{:data, ^key}, %{body: body, etag: etag}}] ->
+                {:ok, %{body: body, etag: etag}}
+
+              [] ->
+                {:error, :not_found}
+            end
+        end
+
+      maybe_after_get(state, key, opts, result)
+      result
     end
 
     @impl true
@@ -427,6 +435,13 @@ defmodule DurableServerTest do
       :ets.insert(table, {{:data, key}, %{body: data, etag: etag}})
       {:ok, %{body: data, etag: etag}}
     end
+
+    defp maybe_after_get(%{after_get: after_get} = state, key, opts, result)
+         when is_function(after_get, 4) do
+      after_get.(state, key, opts, result)
+    end
+
+    defp maybe_after_get(_state, _key, _opts, _result), do: :ok
 
     defp maybe_after_put(%{after_put: after_put} = state, key, data, opts, result)
          when is_function(after_put, 5) do
@@ -1219,6 +1234,164 @@ defmodule DurableServerTest do
       assert_receive {:registrar_registered, ^registrar}, 500
     end
 
+    test "concurrent ensure callers remain coalesced while an owner registers", %{
+      prefix: _default_prefix
+    } do
+      parent = self()
+      key = "ensure-coalesced-transition-#{DurableServer.UUID.uuid4()}"
+
+      after_get = fn %{table: table}, fetched_key, _opts, result ->
+        if String.ends_with?(fetched_key, key) and
+             :ets.insert_new(table, {{:initial_lock_read, fetched_key}, true}) do
+          send(parent, {:initial_lock_read, fetched_key, result})
+        end
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), after_get: after_get}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(backend)
+      storage_key = prefix <> key
+      user_meta = %{source: :coalesced_owner}
+      registrar = start_group_registrar(supervisor_name, prefix, key, user_meta)
+      insert_running_lock(table, storage_key, supervisor_name, prefix, key, registrar)
+
+      callers_task =
+        Task.async(fn ->
+          1..12
+          |> Task.async_stream(
+            fn _ ->
+              DurableServer.Supervisor.ensure_started_child(
+                supervisor_name,
+                {TestServer, key: key, initial_state: %{}},
+                timeout: 1_000
+              )
+            end,
+            max_concurrency: 12,
+            ordered: false,
+            timeout: 2_000
+          )
+          |> Enum.to_list()
+        end)
+
+      assert_receive {:initial_lock_read, ^storage_key, {:ok, %{body: %StoredState{}}}}, 500
+      send(registrar, :register)
+      assert_receive {:registrar_registered, ^registrar}, 500
+      results = Task.await(callers_task, 2_000)
+
+      assert Enum.all?(results, fn result ->
+               result == {:ok, {:ok, {registrar, user_meta}}}
+             end)
+
+      assert length(recorded_get_opts(table, storage_key)) < 12
+    end
+
+    test "ensure_started_child returns a replacement owner that registers during transition", %{
+      prefix: _default_prefix
+    } do
+      parent = self()
+      key = "ensure-replacement-owner-#{DurableServer.UUID.uuid4()}"
+
+      after_get = fn %{table: table}, fetched_key, _opts, result ->
+        if String.ends_with?(fetched_key, key) and
+             :ets.insert_new(table, {{:initial_lock_read, fetched_key}, true}) do
+          send(parent, {:initial_lock_read, fetched_key, result})
+        end
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), after_get: after_get}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(backend)
+      storage_key = prefix <> key
+      replacement_meta = %{source: :replacement_owner}
+
+      old_owner = start_group_registrar(supervisor_name, prefix, key, %{source: :old_owner})
+      replacement_owner = start_group_registrar(supervisor_name, prefix, key, replacement_meta)
+      insert_running_lock(table, storage_key, supervisor_name, prefix, key, old_owner)
+
+      ensure_task =
+        Task.async(fn ->
+          DurableServer.Supervisor.ensure_started_child(
+            supervisor_name,
+            {TestServer, key: key, initial_state: %{}},
+            timeout: 1_000
+          )
+        end)
+
+      assert_receive {:initial_lock_read, ^storage_key, {:ok, %{body: %StoredState{}}}}, 500
+      insert_running_lock(table, storage_key, supervisor_name, prefix, key, replacement_owner)
+      send(replacement_owner, :register)
+      assert_receive {:registrar_registered, ^replacement_owner}, 500
+
+      assert {:ok, {^replacement_owner, ^replacement_meta}} = Task.await(ensure_task, 2_000)
+    end
+
+    test "ensure_started_child retries startup after the old owner releases its lock", %{
+      prefix: _default_prefix
+    } do
+      parent = self()
+      key = "ensure-released-owner-#{DurableServer.UUID.uuid4()}"
+
+      after_get = fn %{table: table}, fetched_key, _opts, result ->
+        if String.ends_with?(fetched_key, key) and
+             :ets.insert_new(table, {{:initial_lock_read, fetched_key}, true}) do
+          send(parent, {:initial_lock_read, fetched_key, result})
+        end
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), after_get: after_get}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      table = backend_table(backend)
+      storage_key = prefix <> key
+      old_owner = start_group_registrar(supervisor_name, prefix, key, %{source: :old_owner})
+
+      stored_state =
+        insert_running_lock(table, storage_key, supervisor_name, prefix, key, old_owner)
+
+      ensure_task =
+        Task.async(fn ->
+          DurableServer.Supervisor.ensure_started_child(
+            supervisor_name,
+            {TestServer, key: key, initial_state: %{}},
+            timeout: 1_000
+          )
+        end)
+
+      assert_receive {:initial_lock_read, ^storage_key, {:ok, %{body: %StoredState{}}}}, 500
+
+      released_state = %{
+        stored_state
+        | meta: %{stored_state.meta | status: :stopped_graceful}
+      }
+
+      :ets.insert(
+        table,
+        {{:data, storage_key}, %{body: released_state, etag: "released-#{key}"}}
+      )
+
+      assert {:ok, {replacement_owner, _meta}} = Task.await(ensure_task, 2_000)
+      assert replacement_owner != old_owner
+      assert Process.alive?(replacement_owner)
+
+      assert {:ok, %StoredState{meta: %Meta{pid: ^replacement_owner, status: :running}}} =
+               DurableServer.fetch_stored_state(
+                 backend,
+                 %{key: key, prefix: prefix},
+                 consistent: true
+               )
+    end
+
     test "ensure_started_child returns unreachable when storage lock has no Group registration",
          %{
            prefix: _default_prefix
@@ -1234,14 +1407,27 @@ defmodule DurableServerTest do
       registrar = start_group_registrar(supervisor_name, prefix, key, %{unused: true})
       insert_running_lock(table, storage_key, supervisor_name, prefix, key, registrar)
 
-      assert {:error, {:unreachable, ^registrar}} =
-               DurableServer.Supervisor.ensure_started_child(
-                 supervisor_name,
-                 {TestServer, key: key, initial_state: %{}},
-                 timeout: 300
-               )
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          DurableServer.Supervisor.ensure_started_child(
+            supervisor_name,
+            {TestServer, key: key, initial_state: %{}},
+            timeout: 300
+          )
+        end)
 
+      assert {:error, {:unreachable, ^registrar}} = result
+      assert elapsed_us >= 250_000
+      assert elapsed_us < 1_000_000
+      assert length(recorded_get_opts(table, storage_key)) > 1
       assert DurableServer.Supervisor.lookup(supervisor_name, key) == nil
+
+      assert {:ok, %StoredState{meta: %Meta{pid: ^registrar, status: :running}}} =
+               DurableServer.fetch_stored_state(
+                 backend,
+                 %{key: key, prefix: prefix},
+                 consistent: true
+               )
     end
 
     test "ensure_started_child performs one final retry when restart claim expires before timeout",
