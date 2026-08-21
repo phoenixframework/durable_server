@@ -8,6 +8,10 @@ defmodule DurableServer.StickyPlacementTest do
 
     @impl true
     def init(state, info) do
+      if delay_ms = state[:init_delay_ms] || state["init_delay_ms"] do
+        Process.sleep(delay_ms)
+      end
+
       {:ok, Map.put(state, :key, info.key)}
     end
 
@@ -344,6 +348,61 @@ defmodule DurableServer.StickyPlacementTest do
       assert stored_state.meta.sticky_placement == [
                %{env_var: "FLY_MACHINE_ID", value: nil}
              ]
+    end
+
+    test "local fallback uses the caller's remaining timeout", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      previous_region = System.get_env("FLY_REGION")
+
+      on_exit(fn ->
+        if previous_region do
+          System.put_env("FLY_REGION", previous_region)
+        else
+          System.delete_env("FLY_REGION")
+        end
+      end)
+
+      System.put_env("FLY_REGION", "ord")
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         sticky_placement: %{
+           StickyPlacementTestServer => [FLY_REGION: 0, any: 0]
+         }}
+      )
+
+      key = "sticky-fallback-timeout"
+
+      {:ok, {seed_pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {StickyPlacementTestServer, key: key, initial_state: %{init_delay_ms: 300}},
+          timeout: 2_000
+        )
+
+      seed_ref = Process.monitor(seed_pid)
+      assert :ok = DurableServer.Supervisor.terminate_child(supervisor_name, seed_pid)
+      assert_receive {:DOWN, ^seed_ref, :process, ^seed_pid, _reason}, 2_000
+
+      System.put_env("FLY_REGION", "sjc")
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          DurableServer.Supervisor.ensure_started_child(
+            supervisor_name,
+            {StickyPlacementTestServer, key: key, initial_state: %{init_delay_ms: 300}},
+            placement_timeout: 0,
+            timeout: 100
+          )
+        end)
+
+      assert {:error, :timeout} = result
+      assert elapsed_us < 250_000
     end
   end
 

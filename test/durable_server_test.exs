@@ -102,6 +102,30 @@ defmodule DurableServerTest do
     end
   end
 
+  defp await_stored_pid(supervisor_name, prefix, key, timeout_ms \\ 2_000) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_stored_pid(supervisor_name, prefix, key, deadline_ms)
+  end
+
+  defp do_await_stored_pid(supervisor_name, prefix, key, deadline_ms) do
+    case DurableServer.fetch_stored_state(
+           supervisor_name,
+           %{key: key, prefix: prefix},
+           consistent: true
+         ) do
+      {:ok, %StoredState{meta: %Meta{pid: pid}}} when is_pid(pid) ->
+        pid
+
+      _ ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          flunk("storage lock for #{inspect(key)} was not written before timeout")
+        else
+          Process.sleep(25)
+          do_await_stored_pid(supervisor_name, prefix, key, deadline_ms)
+        end
+    end
+  end
+
   defp backend_table(%StorageBackend{state: %{table: table}}), do: table
 
   defp put_backend_override(table, key, consistent, response) do
@@ -1242,6 +1266,42 @@ defmodule DurableServerTest do
                )
 
       assert DurableServer.Supervisor.lookup(supervisor_name, key) == nil
+    end
+
+    test "ensure_started_child honors a caller timeout longer than the Group registration wait",
+         %{
+           supervisor_name: supervisor_name,
+           prefix: prefix
+         } do
+      key = "ensure-slow-init-registration-#{DurableServer.UUID.uuid4()}"
+      init_sleep_ms = 6_500
+
+      child_spec =
+        {TestServer, key: key, initial_state: %{init_sleep_ms: init_sleep_ms}}
+
+      starter =
+        Task.async(fn ->
+          DurableServer.Supervisor.start_child(
+            supervisor_name,
+            child_spec,
+            timeout: 10_000
+          )
+        end)
+
+      owner_pid = await_stored_pid(supervisor_name, prefix, key)
+
+      {elapsed_us, ensure_result} =
+        :timer.tc(fn ->
+          DurableServer.Supervisor.ensure_started_child(
+            supervisor_name,
+            child_spec,
+            timeout: 10_000
+          )
+        end)
+
+      assert {:ok, {^owner_pid, _meta}} = ensure_result
+      assert elapsed_us >= 5_000_000
+      assert {:ok, {^owner_pid, _meta}} = Task.await(starter, 5_000)
     end
 
     test "ensure_started_child performs one final retry when restart claim expires before timeout",

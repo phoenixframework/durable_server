@@ -232,7 +232,6 @@ defmodule DurableServer.Supervisor do
   @shutdown_placement_attempt_wait_timeout :timer.seconds(1)
   @default_placement_timeout :timer.seconds(15)
   @default_start_child_timeout 5_000
-  @already_started_registration_wait_ms 5_000
   @already_started_registration_poll_ms 100
   @default_discovery_interval_ms 60_000
   @default_initial_discovery_delay_ms {1_000, 6_000}
@@ -2299,7 +2298,8 @@ defmodule DurableServer.Supervisor do
                 stored_object,
                 child_spec_with_boot_info,
                 matching_level,
-                placement_deadline_ms
+                placement_deadline_ms,
+                deadline_ms
               )
 
             true ->
@@ -2359,15 +2359,8 @@ defmodule DurableServer.Supervisor do
       supervisor,
       key,
       pid,
-      already_started_registration_deadline(deadline_ms)
+      deadline_ms
     )
-  end
-
-  defp already_started_registration_deadline(deadline_ms) do
-    registration_deadline =
-      System.monotonic_time(:millisecond) + @already_started_registration_wait_ms
-
-    earlier_deadline(deadline_ms, registration_deadline)
   end
 
   defp await_group_registration_or_unreachable(supervisor, key, pid, wait_deadline_ms) do
@@ -2621,17 +2614,19 @@ defmodule DurableServer.Supervisor do
          stored_object,
          child_spec,
          matching_level,
-         deadline
+         placement_deadline_ms,
+         caller_deadline_ms
        ) do
     # First attempt remote placement (single round, no retry loop — we handle retry here)
-    case try_remote_placement(supervisor, child_spec, 3, deadline) do
+    case try_remote_placement(supervisor, child_spec, 3, placement_deadline_ms) do
       {:ok, result} ->
         {:ok, result}
 
       {:error, {:capacity_limit, reason}}
       when reason in [:no_available_nodes, :all_placement_attempts_failed] ->
-        if deadline != nil and
-             System.monotonic_time(:millisecond) + @placement_retry_interval < deadline do
+        if placement_deadline_ms != nil and
+             System.monotonic_time(:millisecond) + @placement_retry_interval <
+               placement_deadline_ms do
           Process.sleep(@placement_retry_interval)
 
           # Re-check Group — the server may have been restarted on its preferred node
@@ -2647,7 +2642,8 @@ defmodule DurableServer.Supervisor do
                 stored_object,
                 child_spec,
                 matching_level,
-                deadline
+                placement_deadline_ms,
+                caller_deadline_ms
               )
           end
         else
@@ -2660,7 +2656,7 @@ defmodule DurableServer.Supervisor do
             child_spec,
             matching_level,
             reason,
-            deadline
+            caller_deadline_ms
           )
         end
 
@@ -2731,7 +2727,10 @@ defmodule DurableServer.Supervisor do
     {_, init_arg, _boot_info} = child_spec
     key = ensure_started_child_key!(init_arg)
 
-    case __start_child__(supervisor, child_spec, max_placement_retries: 0) do
+    case __start_child__(supervisor, child_spec,
+           max_placement_retries: 0,
+           timeout: timeout_option(deadline_ms)
+         ) do
       {:ok, {pid, meta}} ->
         {:ok, {pid, meta}}
 
