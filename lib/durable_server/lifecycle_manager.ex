@@ -1143,16 +1143,21 @@ defmodule DurableServer.LifecycleManager do
   defp refresh_node_heartbeat_cache(%LifecycleManager{} = state) do
     dead_node_threshold_ms = state.config.dead_node_threshold_ms
     current_time = System.system_time(:millisecond)
+    heartbeat_prefix = "#{state.prefix}__nodes/"
+    warnings_counter = :counters.new(1, [])
 
-    entries =
-      StorageBackend.list_all_objects_stream(state.heartbeat_store, "#{state.prefix}__nodes/",
+    {entries, seen_nodes} =
+      StorageBackend.list_all_objects_stream(state.heartbeat_store, heartbeat_prefix,
         include_objects: true,
         error_handler: fn reason ->
+          :counters.add(warnings_counter, 1, 1)
           log(state, :warning, fn -> "List stream error: #{inspect(reason)}" end)
           :continue
         end
       )
-      |> Enum.to_list()
+      |> Enum.map_reduce(MapSet.new(), fn %{key: key} = entry, seen ->
+        {entry, MapSet.put(seen, String.replace_prefix(key, heartbeat_prefix, ""))}
+      end)
 
     results =
       entries
@@ -1223,6 +1228,7 @@ defmodule DurableServer.LifecycleManager do
     end
 
     error_count = length(errors)
+    listing_complete? = errors == [] and :counters.get(warnings_counter, 1) == 0
 
     # extract heartbeat data for alive nodes
     live_heartbeats =
@@ -1254,6 +1260,12 @@ defmodule DurableServer.LifecycleManager do
       |> Enum.sum()
 
     :ets.insert(state.heartbeat_table, live_heartbeats)
+
+    # The listing must be complete, otherwise nodes missing from
+    # `live_heartbeats` would look prunable
+    if listing_complete? do
+      prune_orphaned_heartbeat_entries(state, seen_nodes, current_time, dead_node_threshold_ms)
+    end
 
     {:ok, length(live_heartbeats), cleaned_count, error_count}
   end
@@ -1320,6 +1332,32 @@ defmodule DurableServer.LifecycleManager do
       {:error, reason} ->
         {:fetch_error, key, reason}
     end
+  end
+
+  defp prune_orphaned_heartbeat_entries(
+         %LifecycleManager{} = state,
+         seen_nodes,
+         current_time,
+         dead_node_threshold_ms
+       ) do
+    self_node = to_string(Node.self())
+    # Re-check staleness to avoid racing late heartbeat writes
+    stale_guard = [{:>, {:-, current_time, :"$1"}, dead_node_threshold_ms}]
+
+    orphans =
+      state.heartbeat_table
+      |> :ets.select([{{:"$2", :_, :"$1", :_, :_, :_, :_}, stale_guard, [:"$2"]}])
+      |> Enum.reject(fn node -> node == self_node or MapSet.member?(seen_nodes, node) end)
+
+    delete_spec =
+      Enum.map(orphans, fn node -> {{node, :_, :"$1", :_, :_, :_, :_}, stale_guard, [true]} end)
+
+    with [_ | _] <- delete_spec,
+         pruned when pruned > 0 <- :ets.select_delete(state.heartbeat_table, delete_spec) do
+      log(state, :debug, fn -> "Pruned #{pruned} orphaned heartbeat cache entries" end)
+    end
+
+    :ok
   end
 
   defp heartbeat_table_name(supervisor_name) when is_atom(supervisor_name) do

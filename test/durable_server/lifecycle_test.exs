@@ -216,6 +216,92 @@ defmodule DurableServer.LifecycleTest do
     def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
   end
 
+  defmodule HeartbeatListBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate =
+        case Keyword.fetch!(opts, :delegate) do
+          %StorageBackend{} = backend ->
+            backend
+
+          {adapter, raw_opts} ->
+            {:ok, backend} = StorageBackend.init_backend(adapter, raw_opts)
+            backend
+        end
+
+      {:ok,
+       %{
+         state: %{
+           delegate: delegate,
+           mode: Keyword.fetch!(opts, :mode),
+           heartbeat_prefix: Keyword.fetch!(opts, :heartbeat_prefix),
+           inject_key: Keyword.get(opts, :inject_key)
+         },
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate} = state, prefix, opts) do
+      stream = StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+      if prefix == state.heartbeat_prefix do
+        inject_list_fault(stream, state, opts)
+      else
+        stream
+      end
+    end
+
+    defp inject_list_fault(stream, %{mode: :truncate}, opts) do
+      error_handler = Keyword.get(opts, :error_handler, fn _reason -> :continue end)
+      Stream.concat(stream, reported_error_stream(error_handler, :simulated_page_failure))
+    end
+
+    defp inject_list_fault(stream, %{mode: :inject_key} = state, _opts) do
+      Stream.concat(stream, [%{key: state.inject_key}])
+    end
+
+    defp reported_error_stream(error_handler, reason) do
+      Stream.flat_map([reason], fn reason ->
+        _ = error_handler.({:list_failed, reason})
+        []
+      end)
+    end
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts),
+      do: StorageBackend.put_object(delegate, key, data, opts)
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+  end
+
   defmodule HeartbeatDelayBackend do
     @behaviour DurableServer.StorageBackend
 
@@ -1846,6 +1932,55 @@ defmodule DurableServer.LifecycleTest do
     end
   end
 
+  @stale_heartbeat_age_ms 48 * 60 * 60 * 1000
+
+  defp await_heartbeat_cycle(manager_pid) do
+    before = :sys.get_state(manager_pid).last_successful_heartbeat_monotonic_at
+    refute is_nil(before)
+
+    send(manager_pid, :heartbeat)
+
+    assert_eventually(fn ->
+      :sys.get_state(manager_pid).last_successful_heartbeat_monotonic_at != before
+    end)
+  end
+
+  defp seed_peer_heartbeat(config, prefix, node, current_time) do
+    ObjectStore.put_object(
+      config.object_store,
+      "#{prefix}__nodes/#{node}",
+      JSON.encode!(%{
+        node: node,
+        node_ref: "#{node}-ref",
+        last_heartbeat_at: current_time - 1_000
+      })
+    )
+  end
+
+  defp insert_stale_heartbeat(heartbeat_table, node, current_time) do
+    :ets.insert(
+      heartbeat_table,
+      {node, "#{node}-ref", current_time - @stale_heartbeat_age_ms, %{}, %{}, %{}, nil}
+    )
+  end
+
+  defp heartbeat_list_store(config, prefix, opts) do
+    {:ok, store} =
+      DurableServer.StorageBackend.init_backend(
+        HeartbeatListBackend,
+        [
+          delegate:
+            DurableServer.StorageBackend.new(
+              DurableServer.Backends.ObjectStore,
+              config.object_store
+            ),
+          heartbeat_prefix: "#{prefix}__nodes/"
+        ] ++ opts
+      )
+
+    store
+  end
+
   defp assert_eventually(fun, timeout \\ 5_000, interval \\ 25) when is_function(fun, 0) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_assert_eventually(fun, deadline, interval)
@@ -2923,6 +3058,89 @@ defmodule DurableServer.LifecycleTest do
 
       {:error, :not_found} =
         ObjectStore.get_object(config.object_store, "#{prefix}__nodes/#{dead_node2}")
+
+      GenServer.stop(manager_pid)
+    end
+
+    test "prunes cached heartbeat entries for nodes absent from a complete listing", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      config: config
+    } do
+      current_time = System.system_time(:millisecond)
+      peer_node = "peer-complete@test"
+      orphan_node = "orphan-complete@test"
+
+      seed_peer_heartbeat(config, prefix, peer_node, current_time)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, config)
+      heartbeat_table = :sys.get_state(manager_pid).heartbeat_table
+      insert_stale_heartbeat(heartbeat_table, orphan_node, current_time)
+
+      await_heartbeat_cycle(manager_pid)
+
+      assert :ets.lookup(heartbeat_table, orphan_node) == []
+      assert :ets.lookup(heartbeat_table, peer_node) != []
+
+      GenServer.stop(manager_pid)
+    end
+
+    test "does not prune cached heartbeat entries when the listing was truncated by an error", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      config: config
+    } do
+      current_time = System.system_time(:millisecond)
+      peer_node = "peer-truncated@test"
+      orphan_node = "orphan-truncated@test"
+
+      seed_peer_heartbeat(config, prefix, peer_node, current_time)
+
+      {:ok, manager_pid} =
+        start_standalone_lifecycle_manager(supervisor_name, config,
+          heartbeat_store: heartbeat_list_store(config, prefix, mode: :truncate)
+        )
+
+      heartbeat_table = :sys.get_state(manager_pid).heartbeat_table
+      insert_stale_heartbeat(heartbeat_table, orphan_node, current_time)
+
+      await_heartbeat_cycle(manager_pid)
+
+      assert :ets.lookup(heartbeat_table, peer_node) != []
+      assert :ets.lookup(heartbeat_table, orphan_node) != []
+
+      GenServer.stop(manager_pid)
+    end
+
+    test "does not prune a node whose heartbeat key was listed but could not be fetched", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      config: config
+    } do
+      current_time = System.system_time(:millisecond)
+      peer_node = "peer-missing@test"
+      orphan_node = "orphan-missing@test"
+
+      seed_peer_heartbeat(config, prefix, peer_node, current_time)
+
+      heartbeat_store =
+        heartbeat_list_store(config, prefix,
+          mode: :inject_key,
+          inject_key: "#{prefix}__nodes/#{orphan_node}"
+        )
+
+      {:ok, manager_pid} =
+        start_standalone_lifecycle_manager(supervisor_name, config,
+          heartbeat_store: heartbeat_store
+        )
+
+      heartbeat_table = :sys.get_state(manager_pid).heartbeat_table
+      insert_stale_heartbeat(heartbeat_table, orphan_node, current_time)
+
+      await_heartbeat_cycle(manager_pid)
+
+      assert :ets.lookup(heartbeat_table, peer_node) != []
+      assert :ets.lookup(heartbeat_table, orphan_node) != []
 
       GenServer.stop(manager_pid)
     end
