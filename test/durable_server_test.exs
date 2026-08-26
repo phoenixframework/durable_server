@@ -136,6 +136,67 @@ defmodule DurableServerTest do
     :ets.insert(table, {{:delete_override, key}, response})
   end
 
+  defp put_backend_write_override(table, key, response) do
+    :ets.insert(table, {{:put_override, key}, response})
+  end
+
+  defp clear_backend_write_override(table, key) do
+    :ets.delete(table, {:put_override, key})
+  end
+
+  defp start_server_with_write_failure(module, initial_state \\ %{}) do
+    test_pid = self()
+
+    after_put = fn _state, key, _data, opts, result ->
+      send(test_pid, {:consistency_probe_put, key, opts, result})
+    end
+
+    {supervisor_name, _supervisor_pid, prefix} =
+      start_test_supervisor(
+        backend: {DurableServerTest.ConsistencyProbeBackend, owner: self(), after_put: after_put}
+      )
+
+    key = "sync-failure-#{DurableServer.UUID.uuid4()}"
+
+    {:ok, {pid, _meta}} =
+      DurableServer.Supervisor.start_child(
+        supervisor_name,
+        {module, key: key, initial_state: initial_state}
+      )
+
+    %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    storage_key = prefix <> key
+    table = backend_table(backend)
+
+    assert_receive {:consistency_probe_put, ^storage_key, _opts, {:ok, _object}}
+
+    put_backend_write_override(table, storage_key, {:error, :unavailable})
+
+    %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      key: key,
+      pid: pid,
+      backend: backend,
+      table: table,
+      storage_key: storage_key
+    }
+  end
+
+  defp fatal_sync_exit(reason) do
+    {:shutdown, {:durable, {:fatal_exit, {:sync_failed, reason}}}}
+  end
+
+  defp assert_call_sync_failure(pid, request, reason) do
+    monitor_ref = Process.monitor(pid)
+    expected_exit = fatal_sync_exit(reason)
+
+    assert {^expected_exit, {GenServer, :call, _call_args}} =
+             catch_exit(GenServer.call(pid, request))
+
+    assert_receive {:DOWN, ^monitor_ref, :process, ^pid, ^expected_exit}
+  end
+
   defp insert_running_lock(table, storage_key, supervisor_name, prefix, key, pid) do
     node_ref = DurableServer.Supervisor.node_ref(supervisor_name)
 
@@ -340,21 +401,27 @@ defmodule DurableServerTest do
     @impl true
     def put_object(%{table: table} = state, key, data, opts) do
       result =
-        case Keyword.fetch(opts, :etag) do
-          {:ok, expected_etag} ->
-            case :ets.lookup(table, {:data, key}) do
-              [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+        case :ets.lookup(table, {:put_override, key}) do
+          [{{:put_override, ^key}, response}] ->
+            response
+
+          [] ->
+            case Keyword.fetch(opts, :etag) do
+              {:ok, expected_etag} ->
+                case :ets.lookup(table, {:data, key}) do
+                  [{{:data, ^key}, %{etag: ^expected_etag}}] ->
+                    store_value(table, key, data)
+
+                  [{{:data, ^key}, _value}] ->
+                    {:error, :conflict}
+
+                  [] ->
+                    {:error, :not_found}
+                end
+
+              :error ->
                 store_value(table, key, data)
-
-              [{{:data, ^key}, _value}] ->
-                {:error, :conflict}
-
-              [] ->
-                {:error, :not_found}
             end
-
-          :error ->
-            store_value(table, key, data)
         end
 
       maybe_after_put(state, key, data, opts, result)
@@ -537,6 +604,17 @@ defmodule DurableServerTest do
     def handle_call(:increment_and_sync, _from, %{count: count} = state) do
       new_state = %{state | count: count + 1}
       {:reply, count + 1, new_state, :sync}
+    end
+
+    def handle_call(:increment_and_sync_metadata, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      metadata = %{last_heartbeat_at: System.system_time(:millisecond)}
+      {:reply, count + 1, new_state, {:sync, metadata}}
+    end
+
+    def handle_call(:increment_with_sync_option, _from, %{count: count} = state) do
+      new_state = %{state | count: count + 1}
+      {:reply, count + 1, new_state, sync: true}
     end
 
     def handle_call(:increment_with_timeout, _from, %{count: count} = state) do
@@ -2115,6 +2193,53 @@ defmodule DurableServerTest do
       assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
     end
 
+    test "keeps dirty state after a transient failure and persists it on a later sync" do
+      test_pid = self()
+
+      after_put = fn _state, key, _data, opts, result ->
+        send(test_pid, {:consistency_probe_put, key, opts, result})
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), after_put: after_put}
+        )
+
+      key = "auto-sync-retry-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {AutoSyncServer, key: key, initial_state: %{}}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+      table = backend_table(backend)
+
+      assert_receive {:consistency_probe_put, ^storage_key, _opts, {:ok, _object}}
+
+      put_backend_write_override(table, storage_key, {:error, :unavailable})
+
+      assert GenServer.call(pid, :increment) == 1
+
+      assert_receive {:consistency_probe_put, ^storage_key, failed_opts, {:error, :unavailable}}
+
+      assert Keyword.fetch!(failed_opts, :max_retries) == 5
+      assert Process.alive?(pid)
+
+      assert {:ok, %StoredState{state: %{count: 0}}} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix})
+
+      clear_backend_write_override(table, storage_key)
+
+      assert GenServer.call(pid, :increment) == 2
+      assert_receive {:consistency_probe_put, ^storage_key, _opts, {:ok, _object}}
+
+      assert {:ok, %StoredState{state: %{count: 2}}} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix})
+    end
+
     test "does not auto sync when disabled", %{supervisor_name: supervisor_name, prefix: prefix} do
       key = "no-auto-sync-test-#{DurableServer.UUID.uuid4()}"
 
@@ -2166,6 +2291,54 @@ defmodule DurableServerTest do
 
       # Verify server is still responsive
       assert GenServer.call(pid, :increment) == 2
+    end
+
+    test "keeps dirty state after a transient failure and retries on the next interval" do
+      test_pid = self()
+
+      after_put = fn _state, key, _data, opts, result ->
+        send(test_pid, {:consistency_probe_put, key, opts, result})
+      end
+
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(
+          backend: {ConsistencyProbeBackend, owner: self(), after_put: after_put}
+        )
+
+      key = "periodic-sync-retry-#{DurableServer.UUID.uuid4()}"
+      sync_ms = 25
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(
+          supervisor_name,
+          {PeriodicSyncServer, key: key, initial_state: %{sync_ms: sync_ms}}
+        )
+
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+      table = backend_table(backend)
+
+      assert_receive {:consistency_probe_put, ^storage_key, _opts, {:ok, _object}}
+
+      put_backend_write_override(table, storage_key, {:error, :unavailable})
+
+      assert GenServer.call(pid, :increment) == 1
+
+      assert_receive {:consistency_probe_put, ^storage_key, failed_opts, {:error, :unavailable}},
+                     1_000
+
+      assert Keyword.fetch!(failed_opts, :max_retries) == 5
+      assert Process.alive?(pid)
+
+      assert {:ok, %StoredState{state: %{count: 0}}} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix})
+
+      clear_backend_write_override(table, storage_key)
+
+      assert_receive {:consistency_probe_put, ^storage_key, _opts, {:ok, _object}}, 1_000
+
+      assert {:ok, %StoredState{state: %{count: 1}}} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix})
     end
   end
 
@@ -2624,12 +2797,49 @@ defmodule DurableServerTest do
     end
   end
 
-  describe "error handling" do
-    test "continues operation when sync operations encounter errors", %{
-      supervisor_name: supervisor_name,
-      prefix: _prefix
-    } do
-      key = "test-server-#{DurableServer.UUID.uuid4()}"
+  describe "explicit sync failure handling" do
+    test "does not acknowledge a failed sync and restarts from the last durable state" do
+      context = start_server_with_write_failure(TestServer)
+
+      assert_call_sync_failure(context.pid, :increment_and_sync, :unavailable)
+
+      assert_receive {:consistency_probe_put, storage_key, failed_opts, {:error, :unavailable}}
+      assert storage_key == context.storage_key
+      assert Keyword.fetch!(failed_opts, :max_retries) == 5
+
+      assert {:ok, %StoredState{state: %{count: 0}, meta: %Meta{pid: failed_pid}}} =
+               DurableServer.fetch_stored_state(context.backend, %{
+                 key: context.key,
+                 prefix: context.prefix
+               })
+
+      assert failed_pid == context.pid
+
+      clear_backend_write_override(context.table, context.storage_key)
+
+      assert {:ok, {restarted_pid, _meta}} =
+               DurableServer.Supervisor.ensure_started_child(
+                 context.supervisor_name,
+                 {TestServer, key: context.key, initial_state: %{}},
+                 timeout: 5_000
+               )
+
+      refute restarted_pid == context.pid
+      assert GenServer.call(restarted_pid, :get_count) == 0
+    end
+
+    for request <- [:increment_and_sync_metadata, :increment_with_sync_option] do
+      test "makes #{inspect(request)} a strict durability boundary" do
+        context = start_server_with_write_failure(TestServer)
+        assert_call_sync_failure(context.pid, unquote(request), :unavailable)
+      end
+    end
+
+    test "terminates with a structured sync failure after a storage conflict" do
+      {supervisor_name, _supervisor_pid, prefix} =
+        start_test_supervisor(backend: {ConsistencyProbeBackend, owner: self()})
+
+      key = "explicit-sync-conflict-#{DurableServer.UUID.uuid4()}"
 
       {:ok, {pid, _meta}} =
         DurableServer.Supervisor.start_child(
@@ -2637,27 +2847,49 @@ defmodule DurableServerTest do
           {TestServer, key: key, initial_state: %{}}
         )
 
-      # Basic operations should work
-      assert GenServer.call(pid, :increment) == 1
-      assert GenServer.call(pid, :increment_and_sync) == 2
-      assert GenServer.call(pid, :get_count) == 2
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+      storage_key = prefix <> key
+      {:ok, %{body: stored_state, etag: etag}} = StorageBackend.get_object(backend, storage_key)
+
+      assert {:ok, _object} =
+               StorageBackend.put_object(backend, storage_key, stored_state, etag: etag)
+
+      assert_call_sync_failure(pid, :increment_and_sync, :conflict)
     end
 
-    test "auto-sync servers continue operating", %{
-      supervisor_name: supervisor_name,
-      prefix: _prefix
-    } do
-      key = "error-handling-test-#{DurableServer.UUID.uuid4()}"
+    for callback_type <- [:cast, :info] do
+      test "terminates after a failed explicit sync from #{callback_type}" do
+        context = start_server_with_write_failure(TestServer)
+        monitor_ref = Process.monitor(context.pid)
+        expected_exit = fatal_sync_exit(:unavailable)
 
-      {:ok, {pid, _meta}} =
-        DurableServer.Supervisor.start_child(
-          supervisor_name,
-          {AutoSyncServer, key: key, initial_state: %{}}
-        )
+        case unquote(callback_type) do
+          :cast -> GenServer.cast(context.pid, :increment_and_sync)
+          :info -> send(context.pid, :increment_and_sync)
+        end
 
-      # Even if sync fails, server should continue
-      assert GenServer.call(pid, :increment) == 1
-      assert GenServer.call(pid, :increment) == 2
+        assert_receive {:DOWN, ^monitor_ref, :process, pid, ^expected_exit}
+        assert pid == context.pid
+      end
+    end
+
+    test "terminates when an explicit sync returned from handle_continue fails" do
+      context = start_server_with_write_failure(TestServer)
+      monitor_ref = Process.monitor(context.pid)
+      expected_exit = fatal_sync_exit(:unavailable)
+
+      assert GenServer.call(context.pid, :continue_and_sync_test) == :ok
+      assert_receive {:DOWN, ^monitor_ref, :process, pid, ^expected_exit}
+      assert pid == context.pid
+    end
+
+    test "does not invoke handle_sync after a failed write" do
+      context =
+        start_server_with_write_failure(HandleSyncTestServer, %{count: 0, test_pid: self()})
+
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
+      assert_call_sync_failure(context.pid, :increment_sync, :unavailable)
+      refute_receive {:handle_sync, _info, _old_state, _new_state}, 100
     end
   end
 
