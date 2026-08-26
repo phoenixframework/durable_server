@@ -2076,7 +2076,7 @@ defmodule DurableServer.LifecycleManager do
           :skip ->
             # permanently non-restartable — cache without meta
             now = System.monotonic_time(:millisecond)
-            :ets.insert(state.discovery_skip_table, {key, etag, :skip, now})
+            skip_cache_put(state, {key, etag, :skip, now})
             clear_restart_gate_state(state, key)
             :noop
 
@@ -2085,7 +2085,7 @@ defmodule DurableServer.LifecycleManager do
             # health check) — cache trimmed meta for re-evaluation next round
             now = System.monotonic_time(:millisecond)
             trimmed = trim_meta_for_cache(meta)
-            :ets.insert(state.discovery_skip_table, {key, etag, trimmed, now})
+            skip_cache_put(state, {key, etag, trimmed, now})
             clear_restart_gate_state(state, key)
             :noop
 
@@ -2123,6 +2123,15 @@ defmodule DurableServer.LifecycleManager do
 
     log_discovery_diagnostics_delta(state, diagnostics_before)
     :ok
+  end
+
+  defp skip_cache_put(%LifecycleManager{} = state, entry) do
+    case :ets.whereis(state.discovery_skip_table) do
+      :undefined -> :ok
+      _ -> :ets.insert(state.discovery_skip_table, entry)
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   defp discovery_diag_snapshot(%LifecycleManager{} = state) do
