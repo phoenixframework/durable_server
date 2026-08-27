@@ -192,9 +192,14 @@ defmodule DurableServer do
 
   1. **Manual sync**: Return `:sync` from any callback, ie: `{:noreply, state, :sync}`
      You can also combine sync with other actions via callback options,
-     e.g. `{:noreply, state, {:continue, term}, sync: true}`.
+     e.g. `{:noreply, state, {:continue, term}, sync: true}`. Manual sync is a strict
+     durability boundary: the configured backend exhausts its bounded transient retry
+     policy before returning an error, and DurableServer terminates without acknowledging
+     the callback if the write still fails.
   2. **Automatic sync**: When `:auto_sync` is enabled all changes are immediately written when
     any callback returns, or the `:sync_every_ms` interval can be provided to periodically sync changes.
+    Automatic and periodic syncs log transient failures and keep the server alive so a later
+    sync can persist the dirty state. Storage conflicts remain fatal.
   3. **Graceful shutdown**: Automatically synced during normal termination, ie: cold deploys
   4. **Before stopping**: When returning `{:stop, reason, state}` from callbacks
 
@@ -3292,9 +3297,6 @@ defmodule DurableServer do
       {:ok, %DurableServer{} = synced_state} ->
         synced_state
 
-      {:error, :conflict} ->
-        fatal_sync_conflict!(state)
-
       {:error, reason} ->
         if is_map(metadata) do
           Logger.error("Failed to sync state with metadata: #{inspect(reason)}")
@@ -3302,8 +3304,9 @@ defmodule DurableServer do
           Logger.error("Failed to sync state: #{inspect(reason)}")
         end
 
-        # continue with updated state even if sync failed for transient reason (ie timeout)
-        state
+        # The backend has already exhausted its bounded retry policy. Explicit sync is a
+        # durability boundary, so never acknowledge the callback after the final write fails.
+        fatal_exit!({:sync_failed, reason})
     end
   end
 

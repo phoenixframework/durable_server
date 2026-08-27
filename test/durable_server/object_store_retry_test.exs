@@ -34,6 +34,27 @@ defmodule DurableServer.ObjectStoreRetryTest do
     assert Process.get(responses_key) == [:unexpected_retry]
   end
 
+  test "put stops after the configured transient retry limit" do
+    responses_key = make_ref()
+
+    Process.put(responses_key, [
+      %Req.Response{status: 503},
+      %Req.Response{status: 503},
+      :unexpected_retry
+    ])
+
+    assert {:error, %Req.Response{status: 503}} =
+             ObjectStore.put_object(
+               store(adapter(responses_key)),
+               "__nodes/test@localhost",
+               "heartbeat",
+               max_retries: 1,
+               timeout: 1_000
+             )
+
+    assert Process.get(responses_key) == [:unexpected_retry]
+  end
+
   test "finite operation deadlines cap each HTTP receive attempt" do
     parent = self()
 

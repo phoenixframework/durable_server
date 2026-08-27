@@ -194,9 +194,20 @@ DurableServer supports these options in the `init/1` return tuple:
 
 State is synchronized to storage in these scenarios:
 
-1. **Manual sync**: Return `:sync` from any callback: `{:noreply, state, :sync}`
-2. **Automatic sync**: When `:auto_sync` is enabled, changes sync on the `:sync_every_ms` interval
+1. **Manual sync**: Return `:sync` from any callback: `{:noreply, state, :sync}`. Manual sync,
+   `{:sync, metadata}`, and the `sync: true` callback option are strict durability boundaries.
+   The backend retries classified transient failures within its bounded retry policy. If the
+   write still fails, the server exits with a structured `{:sync_failed, reason}` fatal-exit
+   reason before acknowledging the callback.
+2. **Automatic sync**: When `:auto_sync` is enabled, changes sync on callback return. Periodic
+   sync uses the configured `:sync_every_ms` interval. After the backend exhausts transient
+   retries, automatic and periodic sync log the failure and keep the dirty in-memory state
+   eligible for a later sync. Storage conflicts remain fatal.
 3. **Graceful shutdown**: State is always synced before termination
+
+Manual synchronization performs storage work inline. A `GenServer.call/3` timeout should be
+long enough to cover the configured backend's retry window. A caller timeout does not cancel
+storage work already running in the DurableServer process.
 
 ## Group
 
