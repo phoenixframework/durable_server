@@ -1,4 +1,4 @@
-## 0.1.5 (unreleased)
+## 0.1.5 (2026-08-27)
 - Treat explicit `:sync`, `{:sync, metadata}`, and `sync: true` callback returns as strict durability boundaries. Built-in backends first exhaust their bounded transient retry policy; if the write still fails, the DurableServer exits with a structured `{:sync_failed, reason}` fatal-exit reason before acknowledging the callback. Automatic and periodic sync remain best effort for transient failures, while storage conflicts remain fatal.
 - Honor the caller-supplied `ensure_started_child/3` timeout while waiting for a live storage owner to finish Group registration, and preserve the caller's remaining overall deadline when sticky placement falls back to a local start instead of applying fresh fixed 5-second waits.
 - Prune stale heartbeat cache entries whose node heartbeat objects are absent from a complete storage listing, preventing stopped nodes from remaining in `get_cluster_nodes/1` indefinitely while avoiding pruning after partial or failed listings.
