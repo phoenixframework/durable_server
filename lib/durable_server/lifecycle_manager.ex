@@ -1144,6 +1144,7 @@ defmodule DurableServer.LifecycleManager do
     dead_node_threshold_ms = state.config.dead_node_threshold_ms
     current_time = System.system_time(:millisecond)
     heartbeat_prefix = "#{state.prefix}__nodes/"
+    # List errors are reported out-of-band, so track them to detect partial listings.
     warnings_counter = :counters.new(1, [])
 
     {entries, seen_nodes} =
