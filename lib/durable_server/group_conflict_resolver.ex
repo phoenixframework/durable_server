@@ -22,6 +22,23 @@ defmodule DurableServer.GroupConflictResolver do
 
   alias DurableServer.GroupMeta
 
+  # Group 0.2.1 ranks each claim independently and terminates the local loser.
+  # DurableServer still terminates every conflicting owner so the object-store
+  # lock, rather than eventually consistent registry metadata, selects the
+  # process that may restart.
+  def resolve(name, key, {pid, %GroupMeta{}, time}) do
+    Logger.error(fn ->
+      "#{inspect(__MODULE__)}: registry conflict detected: " <>
+        "name=#{inspect(name)}, key=#{inspect(key)}, " <>
+        "pid=#{inspect(pid)}, terminating owner for clean restart"
+    end)
+
+    DurableServer.fatal_exit!(pid, :registry_conflict)
+    {time, pid}
+  end
+
+  def resolve(_name, _key, {pid, _meta, time}), do: {time, pid}
+
   def resolve(name, key, {pid1, %GroupMeta{}, _time1}, {pid2, %GroupMeta{}, _time2}) do
     Logger.error(fn ->
       "#{inspect(__MODULE__)}: registry conflict detected: " <>

@@ -686,6 +686,37 @@ defmodule GroupTest do
   end
 
   describe "GroupConflictResolver" do
+    test "per-claim resolver terminates every conflicting DurableServer owner", %{
+      supervisor_name: sup
+    } do
+      key = "conflict/test/#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _}} =
+        DurableServer.Supervisor.start_child(
+          sup,
+          {TestServer, key: key, initial_state: %{}}
+        )
+
+      {^pid, meta} = Group.lookup(sup, key, extract_meta: & &1)
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      ref_real = Process.monitor(pid)
+      ref_fake = Process.monitor(fake_pid)
+      time = System.system_time()
+
+      assert {^time, ^pid} =
+               DurableServer.GroupConflictResolver.resolve(sup, key, {pid, meta, time})
+
+      assert {time, fake_pid} ==
+               DurableServer.GroupConflictResolver.resolve(
+                 sup,
+                 key,
+                 {fake_pid, %DurableServer.GroupMeta{}, time}
+               )
+
+      assert_receive {:DOWN, ^ref_real, :process, ^pid, _}, 1000
+      assert_receive {:DOWN, ^ref_fake, :process, ^fake_pid, _}, 1000
+    end
+
     test "conflict resolver kills both processes for clean restart", %{supervisor_name: sup} do
       key = "conflict/test/#{DurableServer.UUID.uuid4()}"
 
