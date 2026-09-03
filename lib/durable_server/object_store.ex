@@ -909,12 +909,20 @@ defmodule DurableServer.ObjectStore do
   - `:etag` - The existing etag to match. Conflicts return `{:error, :conflict}`
   - `:timeout` - Total time in ms for the operation including retries. If exceeded,
     no further retries will be attempted. Default: no timeout (unlimited retries until max_retries).
+  - `:retry_observer` - Optional three-arity callback invoked with the request,
+    response/error, and retryable classification for each HTTP attempt.
   """
   def put_object(%__MODULE__{} = client, key, data, opts \\ []) do
     opts = validate_opts!(opts)
     content_type = Keyword.get(opts, :content_type, "application/octet-stream")
     consistent = Keyword.get(opts, :consistent, true)
     timeout = Keyword.get(opts, :timeout)
+    retry_observer = Keyword.get(opts, :retry_observer)
+
+    unless is_nil(retry_observer) or is_function(retry_observer, 3) do
+      raise ArgumentError,
+            "expected :retry_observer to be a 3-arity function, got: #{inspect(retry_observer)}"
+    end
 
     # Handle :infinity and nil as no deadline
     deadline_at =
@@ -944,30 +952,22 @@ defmodule DurableServer.ObjectStore do
     req = new_req(client, consistent: consistent, headers: headers)
     req = Req.merge(req, receive_timeout: retry_attempt_timeout(timeout))
 
+    retry = fn %Req.Request{} = request, response_or_exception ->
+      retryable? = put_retryable?(response_or_exception, deadline_at)
+      notify_retry_observer(retry_observer, request, response_or_exception, retryable?)
+      retryable?
+    end
+
     req_with_retries =
       case Keyword.fetch(opts, :max_retries) do
         {:ok, retries} when is_integer(retries) and retries >= 0 ->
-          Req.merge(req,
-            max_retries: retries,
-            retry: fn
-              %Req.Request{}, %Req.Response{status: status}
-              when status in [408, 429, 500, 502, 503, 504] ->
-                within_retry_deadline?(deadline_at)
+          Req.merge(req, max_retries: retries, retry: retry)
 
-              %Req.Request{}, %Req.TransportError{reason: reason}
-              when reason in [:timeout, :econnrefused, :closed] ->
-                within_retry_deadline?(deadline_at)
-
-              %Req.Request{}, %Req.HTTPError{protocol: :http2, reason: :unprocessed} ->
-                within_retry_deadline?(deadline_at)
-
-              %Req.Request{}, _response_or_exception ->
-                false
-            end
-          )
+        :error when is_nil(retry_observer) ->
+          req
 
         :error ->
-          req
+          Req.merge(req, max_retries: 0, retry: retry)
       end
 
     case Req.put(req_with_retries, url: key, body: data) do
@@ -993,6 +993,33 @@ defmodule DurableServer.ObjectStore do
 
   defp within_retry_deadline?(deadline_at) do
     System.monotonic_time(:millisecond) < deadline_at
+  end
+
+  defp put_retryable?(%Req.Response{status: status}, deadline_at)
+       when status in [408, 429, 500, 502, 503, 504] do
+    within_retry_deadline?(deadline_at)
+  end
+
+  # A transport failure says that the caller does not have an authoritative
+  # HTTP response. Mint may add new socket/TLS reasons over time, so all
+  # variants are ambiguous and safe to retry inside the caller's hard deadline.
+  defp put_retryable?(%Req.TransportError{}, deadline_at) do
+    within_retry_deadline?(deadline_at)
+  end
+
+  defp put_retryable?(
+         %Req.HTTPError{protocol: :http2, reason: :unprocessed},
+         deadline_at
+       ) do
+    within_retry_deadline?(deadline_at)
+  end
+
+  defp put_retryable?(_response_or_exception, _deadline_at), do: false
+
+  defp notify_retry_observer(nil, _request, _response_or_exception, _retryable?), do: :ok
+
+  defp notify_retry_observer(observer, request, response_or_exception, retryable?) do
+    observer.(request, response_or_exception, retryable?)
   end
 
   defp retry_attempt_timeout(timeout) when is_integer(timeout) and timeout >= 0,
@@ -1021,7 +1048,8 @@ defmodule DurableServer.ObjectStore do
       :max_results,
       :continuation_token,
       :prefix,
-      :etag
+      :etag,
+      :retry_observer
     ])
   end
 

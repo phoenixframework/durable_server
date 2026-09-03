@@ -1,3 +1,6 @@
+## Unreleased
+- Add bounded heartbeat telemetry and live metrics for attempt outcomes, consecutive failures, last-success age, watchdog budget, cache-degraded duration, watchdog terminations, and fenced child counts. Heartbeat writes now retry every ambiguous `Req.TransportError` variant within the hard deadline while permanent HTTP authentication/configuration failures still fail immediately.
+
 ## 0.1.5 (2026-08-27)
 - Treat explicit `:sync`, `{:sync, metadata}`, and `sync: true` callback returns as strict durability boundaries. Built-in backends first exhaust their bounded transient retry policy; if the write still fails, the DurableServer exits with a structured `{:sync_failed, reason}` fatal-exit reason before acknowledging the callback. Automatic and periodic sync remain best effort for transient failures, while storage conflicts remain fatal.
 - Honor the caller-supplied `ensure_started_child/3` timeout while waiting for a live storage owner to finish Group registration, and preserve the caller's remaining overall deadline when sticky placement falls back to a local start instead of applying fresh fixed 5-second waits.
