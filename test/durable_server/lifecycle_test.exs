@@ -1137,6 +1137,68 @@ defmodule DurableServer.LifecycleTest do
                DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
     end
 
+    test "degraded discovery rejects stale orphan claims at the storage mutation boundary", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      %{ets_table: coordination_table, storage_backend: backend} =
+        DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      key = "degraded-stale-claim-test-#{DurableServer.UUID.uuid4()}"
+      now = System.system_time(:millisecond)
+
+      stored_state = %DurableServer.StoredState{
+        vsn: 1,
+        state: %{"count" => 1},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          permanent: true,
+          status: :running,
+          node_str: "remote@test",
+          node_ref: System.unique_integer([:positive]),
+          pid: self(),
+          last_heartbeat_at: now - 60_000
+        }
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 backend,
+                 "#{prefix}#{key}",
+                 stored_state
+               )
+
+      assert {:ok, %DurableServer.StoredState{} = stored_state} =
+               DurableServer.fetch_stored_state(
+                 backend,
+                 %{key: key, prefix: prefix}
+               )
+
+      :ets.insert(coordination_table, {:discovery_degraded, true})
+
+      assert {:error, :discovery_degraded} =
+               DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
+
+      assert {:error, :discovery_degraded} =
+               DurableServer.claim_restart_attempt_with_verified_expired_lock(
+                 backend,
+                 stored_state,
+                 ttl: 10_000
+               )
+
+      assert {:ok, unchanged_state} =
+               DurableServer.fetch_stored_state(
+                 backend,
+                 %{key: key, prefix: prefix}
+               )
+
+      assert unchanged_state.etag == stored_state.etag
+      assert unchanged_state.meta.restart_attempt_node == nil
+    end
+
     test "running restart claims revalidate heartbeat before claiming stale running meta", %{
       supervisor_name: supervisor_name,
       prefix: prefix
