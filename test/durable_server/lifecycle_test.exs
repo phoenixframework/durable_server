@@ -111,12 +111,12 @@ defmodule DurableServer.LifecycleTest do
     def list_all_objects_stream(_state, _prefix, _opts), do: []
 
     @impl true
-    def put_object(%{table: table, fail_count: fail_count}, _key, data, opts) do
+    def put_object(%{table: table, fail_count: fail_count} = state, _key, data, opts) do
       attempt = :ets.update_counter(table, :attempts, {2, 1}, {:attempts, 0})
       :ets.insert(table, {:last_put_opts, opts})
 
       if attempt <= fail_count do
-        {:error, {:mirror_failed, :no_quorum}}
+        {:error, Map.get(state, :failure_reason, {:mirror_failed, :no_quorum})}
       else
         :ets.insert(table, {:last_write, data})
         {:ok, %{body: data, etag: Integer.to_string(attempt)}}
@@ -1135,6 +1135,68 @@ defmodule DurableServer.LifecycleTest do
 
       assert {:error, :not_eligible} =
                DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
+    end
+
+    test "degraded discovery rejects stale orphan claims at the storage mutation boundary", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      %{ets_table: coordination_table, storage_backend: backend} =
+        DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      key = "degraded-stale-claim-test-#{DurableServer.UUID.uuid4()}"
+      now = System.system_time(:millisecond)
+
+      stored_state = %DurableServer.StoredState{
+        vsn: 1,
+        state: %{"count" => 1},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          permanent: true,
+          status: :running,
+          node_str: "remote@test",
+          node_ref: System.unique_integer([:positive]),
+          pid: self(),
+          last_heartbeat_at: now - 60_000
+        }
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 backend,
+                 "#{prefix}#{key}",
+                 stored_state
+               )
+
+      assert {:ok, %DurableServer.StoredState{} = stored_state} =
+               DurableServer.fetch_stored_state(
+                 backend,
+                 %{key: key, prefix: prefix}
+               )
+
+      :ets.insert(coordination_table, {:discovery_degraded, true})
+
+      assert {:error, :discovery_degraded} =
+               DurableServer.claim_restart_attempt(backend, stored_state, ttl: 10_000)
+
+      assert {:error, :discovery_degraded} =
+               DurableServer.claim_restart_attempt_with_verified_expired_lock(
+                 backend,
+                 stored_state,
+                 ttl: 10_000
+               )
+
+      assert {:ok, unchanged_state} =
+               DurableServer.fetch_stored_state(
+                 backend,
+                 %{key: key, prefix: prefix}
+               )
+
+      assert unchanged_state.etag == stored_state.etag
+      assert unchanged_state.meta.restart_attempt_node == nil
     end
 
     test "running restart claims revalidate heartbeat before claiming stale running meta", %{
@@ -2979,7 +3041,7 @@ defmodule DurableServer.LifecycleTest do
         |> Map.put(:object_store, storage_backend)
         |> Map.put(:storage_backend, storage_backend)
 
-      {:ok, _pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
 
       assert [{:attempts, attempts}] = :ets.lookup(table, :attempts)
       assert attempts >= 3
@@ -2988,6 +3050,47 @@ defmodule DurableServer.LifecycleTest do
       assert [{:last_write, heartbeat_data}] = :ets.lookup(table, :last_write)
       assert is_map(heartbeat_data)
       assert Map.has_key?(heartbeat_data, "last_heartbeat_at")
+
+      manager_name = :sys.get_state(manager_pid).supervisor_name
+      metrics = LifecycleManager.get_heartbeat_metrics(manager_name)
+
+      assert metrics.attempts.total == attempts
+      assert metrics.attempts.by_result == %{backend_error: 2, success: 1}
+      assert metrics.consecutive_failures == 0
+      assert is_integer(metrics.last_success_age_ms)
+      assert metrics.remaining_watchdog_budget_ms > 0
+      refute metrics.cache_degraded?
+      assert metrics.cache_degraded_duration_ms == 0
+    end
+
+    test "retries ambiguous Req transport errors from a heartbeat backend", %{
+      supervisor_name: supervisor_name,
+      config: config
+    } do
+      table = :ets.new(__MODULE__.HeartbeatRetryBackend, [:set, :public])
+
+      storage_backend =
+        DurableServer.StorageBackend.new(HeartbeatRetryBackend, %{
+          table: table,
+          fail_count: 2,
+          failure_reason: %Req.TransportError{reason: {:future_transport_reason, make_ref()}}
+        })
+
+      test_config =
+        config
+        |> Map.put(:object_store, storage_backend)
+        |> Map.put(:storage_backend, storage_backend)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+
+      assert [{:attempts, 3}] = :ets.lookup(table, :attempts)
+
+      manager_name = :sys.get_state(manager_pid).supervisor_name
+      metrics = LifecycleManager.get_heartbeat_metrics(manager_name)
+
+      assert metrics.attempts.by_result == %{success: 1, transport_error: 2}
+      assert metrics.attempts.by_transport_class == %{other: 2}
+      assert metrics.consecutive_failures == 0
     end
 
     test "heartbeat watchdog terminates lifecycle manager even when message handling is suspended",
@@ -3306,6 +3409,10 @@ defmodule DurableServer.LifecycleTest do
       assert :ets.lookup(heartbeat_table, known_node) == known_snapshot
       assert :ets.lookup(heartbeat_table, new_node) == []
 
+      degraded_metrics = LifecycleManager.get_heartbeat_metrics(manager_supervisor)
+      assert degraded_metrics.cache_degraded?
+      assert is_integer(degraded_metrics.cache_degraded_duration_ms)
+
       :ets.insert(control, {:mode, :ok})
       await_heartbeat_reconciliation(manager_pid)
 
@@ -3313,6 +3420,10 @@ defmodule DurableServer.LifecycleTest do
       refute recovered_state.discovery_degraded
       refute LifecycleManager.discovery_degraded?(manager_supervisor)
       assert :ets.lookup(heartbeat_table, new_node) != []
+
+      recovered_metrics = LifecycleManager.get_heartbeat_metrics(manager_supervisor)
+      refute recovered_metrics.cache_degraded?
+      assert recovered_metrics.cache_degraded_duration_ms == 0
 
       GenServer.stop(manager_pid)
     end

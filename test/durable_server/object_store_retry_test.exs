@@ -34,6 +34,70 @@ defmodule DurableServer.ObjectStoreRetryTest do
     assert Process.get(responses_key) == [:unexpected_retry]
   end
 
+  test "put reports authentication responses as non-retryable" do
+    parent = self()
+    responses_key = make_ref()
+    Process.put(responses_key, [%Req.Response{status: 403}, :unexpected_retry])
+
+    observer = fn _request, response_or_error, retryable? ->
+      send(parent, {:attempt, response_or_error, retryable?})
+    end
+
+    assert {:error, %Req.Response{status: 403}} =
+             ObjectStore.put_object(
+               store(adapter(responses_key)),
+               "__nodes/test@localhost",
+               "heartbeat",
+               max_retries: 10,
+               timeout: 1_000,
+               retry_observer: observer
+             )
+
+    assert_receive {:attempt, %Req.Response{status: 403}, false}
+    assert Process.get(responses_key) == [:unexpected_retry]
+  end
+
+  test "put retries every Req transport error variant within its deadline" do
+    adapter =
+      adapter([
+        %Req.TransportError{reason: :enetunreach},
+        %Req.TransportError{reason: {:tls_alert, :unknown_ca}},
+        %Req.Response{status: 200, headers: %{"etag" => ["retry-etag"]}}
+      ])
+
+    assert {:ok, %{etag: "retry-etag", body: "heartbeat"}} =
+             ObjectStore.put_object(store(adapter), "__nodes/test@localhost", "heartbeat",
+               max_retries: 10,
+               timeout: 1_000
+             )
+  end
+
+  test "put retry observer receives every classified attempt" do
+    parent = self()
+
+    adapter =
+      adapter([
+        %Req.Response{status: 503},
+        %Req.TransportError{reason: :enetunreach},
+        %Req.Response{status: 200, headers: %{"etag" => ["retry-etag"]}}
+      ])
+
+    observer = fn _request, response_or_error, retryable? ->
+      send(parent, {:attempt, response_or_error, retryable?})
+    end
+
+    assert {:ok, %{etag: "retry-etag"}} =
+             ObjectStore.put_object(store(adapter), "__nodes/test@localhost", "heartbeat",
+               max_retries: 10,
+               timeout: 1_000,
+               retry_observer: observer
+             )
+
+    assert_receive {:attempt, %Req.Response{status: 503}, true}
+    assert_receive {:attempt, %Req.TransportError{reason: :enetunreach}, true}
+    assert_receive {:attempt, %Req.Response{status: 200}, false}
+  end
+
   test "put stops after the configured transient retry limit" do
     responses_key = make_ref()
 
