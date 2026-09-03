@@ -3595,6 +3595,13 @@ defmodule DurableServer do
     report_lock_diagnostic(sup_name, :check_lock_calls)
 
     cond do
+      # A partial heartbeat snapshot must never be used to justify taking a lock
+      # from another owner. The lifecycle manager clears this gate only after a
+      # complete cache reconciliation.
+      LifecycleManager.discovery_degraded?(sup_name) ->
+        report_lock_diagnostic(sup_name, :check_lock_discovery_degraded)
+        {:error, :discovery_degraded}
+
       # delete tombstones are not live process locks and may not have owner fields
       Meta.deleting?(meta) ->
         report_lock_diagnostic(sup_name, :check_lock_deleting)
