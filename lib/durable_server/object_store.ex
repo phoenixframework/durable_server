@@ -712,12 +712,24 @@ defmodule DurableServer.ObjectStore do
         aws_endpoint_url_s3: client.s3_endpoint,
         aws_sigv4: config
       )
+      |> Req.Request.prepend_request_steps(reset_aws_sigv4_headers: &reset_aws_sigv4_headers/1)
 
     req = Req.merge(req, headers: client.headers ++ caller_headers ++ computed_headers)
 
     req_opts = [finch: client.finch, receive_timeout: @default_timeout]
 
     Req.merge(req, Keyword.merge(req_opts, base_url: "s3://#{client.bucket}"))
+  end
+
+  # Req retries by running the request pipeline again with the request returned
+  # by the previous attempt. Remove generated signing headers so SigV4 signs a
+  # clean request instead of folding the previous signature into the retry.
+  defp reset_aws_sigv4_headers(%Req.Request{} = request) do
+    Enum.reduce(
+      ["authorization", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token"],
+      request,
+      &Req.Request.delete_header(&2, &1)
+    )
   end
 
   @doc """

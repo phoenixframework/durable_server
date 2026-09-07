@@ -18,6 +18,44 @@ defmodule DurableServer.ObjectStoreRetryTest do
              )
   end
 
+  test "put signs each retry from clean generated headers" do
+    parent = self()
+    responses_key = make_ref()
+
+    Process.put(responses_key, [
+      %Req.Response{status: 503},
+      %Req.Response{status: 200, headers: %{"etag" => ["retry-etag"]}}
+    ])
+
+    adapter = fn request ->
+      send(parent, {
+        :signed_headers,
+        Req.Request.get_header(request, "authorization"),
+        Req.Request.get_header(request, "x-amz-content-sha256"),
+        Req.Request.get_header(request, "x-amz-date")
+      })
+
+      case Process.get(responses_key) do
+        [response | rest] ->
+          Process.put(responses_key, rest)
+          {request, response}
+      end
+    end
+
+    assert {:ok, %{etag: "retry-etag"}} =
+             ObjectStore.put_object(store(adapter), "__nodes/test@localhost", "heartbeat",
+               max_retries: 1,
+               timeout: 1_000
+             )
+
+    for _attempt <- 1..2 do
+      assert_receive {:signed_headers, [authorization], [content_sha256], [date]}
+      refute authorization =~ "SignedHeaders=authorization;"
+      assert byte_size(content_sha256) > 0
+      assert byte_size(date) > 0
+    end
+  end
+
   test "put does not retry permanent Req responses" do
     responses_key = make_ref()
     Process.put(responses_key, [%Req.Response{status: 400}, :unexpected_retry])
