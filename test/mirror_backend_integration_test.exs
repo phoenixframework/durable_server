@@ -1,5 +1,6 @@
 defmodule DurableServer.MirrorBackendIntegrationTest do
   use ExUnit.Case, async: false
+  import DurableServer.TestHelper
 
   alias DurableServer.StorageBackend
   alias DurableServer.Backends.EKVStore
@@ -55,7 +56,7 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
       do: StorageBackend.unsubscribe(delegate, subscription_ref)
   end
 
-  @moduletag :integration
+  @moduletag :ekv
   @moduletag :capture_log
 
   setup do
@@ -64,13 +65,8 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
     primary_name = :"durable_mirror_primary_#{unique_id}"
     secondary_name = :"durable_mirror_secondary_#{unique_id}"
 
-    primary_dir = Path.join(System.tmp_dir!(), "durable_server_mirror_primary_#{unique_id}")
-
-    secondary_dir =
-      Path.join(System.tmp_dir!(), "durable_server_mirror_secondary_#{unique_id}")
-
-    File.rm_rf(primary_dir)
-    File.rm_rf(secondary_dir)
+    primary_dir = test_data_dir("mirror_primary")
+    secondary_dir = test_data_dir("mirror_secondary")
 
     start_supervised!(
       {ekv_mod(),
@@ -97,11 +93,6 @@ defmodule DurableServer.MirrorBackendIntegrationTest do
     primary = StorageBackend.new(EKVStore, EKVStore.normalize_opts(name: primary_name))
     secondary = StorageBackend.new(EKVStore, EKVStore.normalize_opts(name: secondary_name))
     mirror = mirror_backend(primary, secondary)
-
-    on_exit(fn ->
-      File.rm_rf(primary_dir)
-      File.rm_rf(secondary_dir)
-    end)
 
     {:ok, primary: primary, secondary: secondary, mirror: mirror}
   end

@@ -301,18 +301,51 @@ These are independent - joining does not monitor events, and monitoring does not
 
 ## Running Tests
 
-### Unit Tests (with LocalStack)
+### Storage-free tests
 
-Start LocalStack for S3-compatible storage:
+The default suite needs neither Docker nor cloud credentials:
 
 ```bash
-docker run -d --name localstack -p 4566:4566 localstack/localstack
+mix deps.get
+mix test
 ```
 
-Run the tests:
+### LocalStack tests
+
+Start the pinned LocalStack version, wait for its health endpoint to respond,
+then include the storage-backed server, lifecycle, placement, and mirror tests:
 
 ```bash
-mix test
+docker run -d --name localstack -p 127.0.0.1:4566:4566 localstack/localstack:4.14.0
+curl http://localhost:4566/_localstack/health
+mix test --include localstack
+```
+
+Each suite invocation creates a unique bucket only if a LocalStack test runs.
+Tests use unique prefixes within it, and the bucket is emptied and deleted after
+test supervisors stop. No shared bucket is cleared at startup, so concurrent
+suite invocations do not delete each other's data.
+
+New LocalStack-backed test modules should use `DurableServer.LocalStackCase`.
+Selecting a storage-free test file never connects to LocalStack.
+
+### Local EKV tests
+
+EKV tests, including the two-node tests, run locally without cloud credentials.
+The Erlang port mapper must be running for the peer nodes:
+
+```bash
+epmd -daemon
+mix test --include ekv
+```
+
+EKV data directories are unique to each test allocation, live under the
+gitignored `tmp/` directory, and are removed on exit.
+
+Run all local tests (including LocalStack/EKV migration tests) with:
+
+```bash
+mix test --include localstack --include ekv
 ```
 
 ### Integration Tests (with Tigris)
@@ -330,8 +363,12 @@ export DURABLE_AWS_REGION=<your-region>
 export DURABLE_BUCKET=<your-bucket-name>
 ```
 
-Run integration tests (which hit t3.storage.dev directly):
+The `integration` tag is reserved for credentialed cloud tests. These hit
+Tigris directly and create cloud resources:
 
 ```bash
 mix test --include integration
 ```
+
+For repeatability, pass `--seed <integer>`. To replay a failed storage-backed
+test, retain its inclusion flag, for example `mix test --failed --include localstack`.

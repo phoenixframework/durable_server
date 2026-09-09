@@ -1,5 +1,6 @@
 defmodule DurableServer.EKVIntegrationTest do
   use ExUnit.Case, async: false
+  import DurableServer.TestHelper
 
   alias DurableServer.Backends.EKVStore
   alias DurableServer.{LifecycleManager, Meta, StoredState}
@@ -7,7 +8,7 @@ defmodule DurableServer.EKVIntegrationTest do
   alias DurableServer.TestCounterServer, as: CounterServer
   alias DurableServer.TestTemporalServer
 
-  @moduletag :integration
+  @moduletag :ekv
   @moduletag :capture_log
 
   setup do
@@ -16,9 +17,7 @@ defmodule DurableServer.EKVIntegrationTest do
     ekv_name = :"durable_ekv_integration_#{unique_id}"
     supervisor_name = :"durable_ekv_supervisor_#{unique_id}"
     prefix = "ekv_integration/#{unique_id}/"
-    data_dir = Path.join(System.tmp_dir!(), "durable_server_ekv_integration_#{unique_id}")
-
-    File.rm_rf(data_dir)
+    data_dir = test_data_dir("ekv_integration")
 
     start_supervised!(
       {ekv_mod(),
@@ -40,10 +39,6 @@ defmodule DurableServer.EKVIntegrationTest do
          graceful_shutdown_timeout_ms: 500
        ]}
     )
-
-    on_exit(fn ->
-      File.rm_rf(data_dir)
-    end)
 
     {:ok,
      supervisor_name: supervisor_name, prefix: prefix, ekv_name: ekv_name, data_dir: data_dir}
@@ -185,15 +180,11 @@ defmodule DurableServer.EKVIntegrationTest do
     ensure_distributed_node!()
 
     unique_id = System.unique_integer([:positive, :monotonic])
-    peer_name = :"durable_ekv_client_peer_#{unique_id}"
+    peer_name = :"durable_ekv_client_peer_#{DurableServer.UUID.uuid4()}"
     ekv_name = :"durable_ekv_client_cluster_#{unique_id}"
 
-    remote_data_dir =
-      Path.join(System.tmp_dir!(), "durable_server_ekv_client_remote_#{unique_id}")
-
+    remote_data_dir = test_data_dir("ekv_client_remote")
     key = "client-existing-key"
-
-    File.rm_rf(remote_data_dir)
 
     {:ok, peer, peer_node} = :peer.start_link(%{name: peer_name})
 
@@ -203,8 +194,6 @@ defmodule DurableServer.EKVIntegrationTest do
       catch
         :exit, _ -> :ok
       end
-
-      File.rm_rf(remote_data_dir)
     end)
 
     assert Node.connect(peer_node)
@@ -503,16 +492,13 @@ defmodule DurableServer.EKVIntegrationTest do
     ensure_distributed_node!()
 
     unique_id = System.unique_integer([:positive, :monotonic])
-    peer_name = :"durable_ekv_peer_#{unique_id}"
+    peer_name = :"durable_ekv_peer_#{DurableServer.UUID.uuid4()}"
     ekv_name = :"durable_ekv_cluster_#{unique_id}"
     supervisor_name = :"durable_ekv_cluster_sup_#{unique_id}"
     prefix = "ekv_cluster/#{unique_id}/"
-    local_data_dir = Path.join(System.tmp_dir!(), "durable_server_ekv_local_#{unique_id}")
-    remote_data_dir = Path.join(System.tmp_dir!(), "durable_server_ekv_remote_#{unique_id}")
+    local_data_dir = test_data_dir("ekv_local")
+    remote_data_dir = test_data_dir("ekv_remote")
     key = "seeded-restart"
-
-    File.rm_rf(local_data_dir)
-    File.rm_rf(remote_data_dir)
 
     {:ok, peer, peer_node} = :peer.start_link(%{name: peer_name})
 
@@ -522,9 +508,6 @@ defmodule DurableServer.EKVIntegrationTest do
       catch
         :exit, _ -> :ok
       end
-
-      File.rm_rf(local_data_dir)
-      File.rm_rf(remote_data_dir)
     end)
 
     assert Node.connect(peer_node)
@@ -701,7 +684,7 @@ defmodule DurableServer.EKVIntegrationTest do
     if Node.alive?() do
       :ok
     else
-      name = :"durable_server_test_#{System.unique_integer([:positive, :monotonic])}"
+      name = :"durable_server_test_#{DurableServer.UUID.uuid4()}"
       {:ok, _} = Node.start(name, :shortnames)
       :ok
     end
