@@ -1,5 +1,5 @@
 defmodule DurableServer.LifecycleTest do
-  use ExUnit.Case, async: true
+  use DurableServer.LocalStackCase, async: true
   import DurableServer.TestHelper
 
   alias DurableServer
@@ -709,49 +709,31 @@ defmodule DurableServer.LifecycleTest do
       })
 
     object_store = test_object_store()
-    test_bucket_name = "durable-test-lifecycle-#{DurableServer.UUID.uuid4()}"
+    supervisor_config = DurableServer.Supervisor.__get_config__(supervisor_name)
+    circuit_breaker = supervisor_config.circuit_breaker
 
-    case ObjectStore.create_bucket_with_credentials(object_store, test_bucket_name) do
-      {:ok, %ObjectStore{} = store} ->
-        on_exit(fn ->
-          try do
-            ObjectStore.delete_bucket(store, test_bucket_name)
-          catch
-            _, _ -> :ok
-          end
-        end)
+    # Create test config that mimics what supervisor provides.
+    test_config = %{
+      name: supervisor_name,
+      prefix: prefix,
+      object_store: object_store,
+      discovery_interval_ms: 60_000,
+      heartbeat_interval_ms: 10_000,
+      graceful_shutdown_timeout_ms: 30_000,
+      dead_node_threshold_ms: 24 * 60 * 60 * 1000,
+      crash_threshold_count: 5,
+      crash_threshold_window_ms: 60 * 60 * 1000,
+      module_circuit_breaker_count: 50,
+      module_circuit_breaker_window_ms: 5 * 60 * 1000,
+      module_circuit_breaker_cooldown_ms: 30 * 60 * 1000,
+      ets_table: supervisor_config.ets_table
+    }
 
-        supervisor_config = DurableServer.Supervisor.__get_config__(supervisor_name)
-        circuit_breaker = supervisor_config.circuit_breaker
-
-        # Create test config that mimics what supervisor provides
-        test_config = %{
-          name: supervisor_name,
-          prefix: prefix,
-          object_store: object_store,
-          discovery_interval_ms: 60_000,
-          heartbeat_interval_ms: 10_000,
-          graceful_shutdown_timeout_ms: 30_000,
-          dead_node_threshold_ms: 24 * 60 * 60 * 1000,
-          crash_threshold_count: 5,
-          crash_threshold_window_ms: 60 * 60 * 1000,
-          module_circuit_breaker_count: 50,
-          module_circuit_breaker_window_ms: 5 * 60 * 1000,
-          module_circuit_breaker_cooldown_ms: 30 * 60 * 1000,
-          ets_table: supervisor_config.ets_table
-        }
-
-        {:ok,
-         test_bucket: test_bucket_name,
-         store: store,
-         supervisor_name: supervisor_name,
-         prefix: prefix,
-         config: test_config,
-         circuit_breaker: circuit_breaker}
-
-      {:error, reason} ->
-        {:skip, "Failed to create test bucket: #{inspect(reason)}"}
-    end
+    {:ok,
+     supervisor_name: supervisor_name,
+     prefix: prefix,
+     config: test_config,
+     circuit_breaker: circuit_breaker}
   end
 
   describe "stop modes" do

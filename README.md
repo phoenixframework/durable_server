@@ -301,7 +301,16 @@ These are independent - joining does not monitor events, and monitoring does not
 
 ## Running Tests
 
-### Unit Tests (with LocalStack)
+### Default suite (no LocalStack or cloud credentials)
+
+```bash
+mix test
+```
+
+The default suite includes backend-independent tests and local EKV integration
+tests. To run only the local EKV lane, use `mix test --only ekv`.
+
+### LocalStack suite
 
 Start LocalStack for S3-compatible storage:
 
@@ -309,11 +318,18 @@ Start LocalStack for S3-compatible storage:
 docker run -d --name localstack -p 4566:4566 localstack/localstack
 ```
 
-Run the tests:
+Run the default suite plus LocalStack cases, including mirror end-to-end cases:
 
 ```bash
-mix test
+mix test --include localstack
 ```
+
+Use `mix test --only localstack` for only this lane. CI should run both the
+default suite and the LocalStack lane; a default-only run does not cover S3.
+Set `DURABLE_TEST_S3_ENDPOINT` to use a different local endpoint.
+
+Each test run allocates its own bucket and cleans up only that bucket. Selecting
+a backend-independent test never creates or clears storage.
 
 ### Integration Tests (with Tigris)
 

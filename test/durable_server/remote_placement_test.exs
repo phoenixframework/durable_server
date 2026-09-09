@@ -1,5 +1,5 @@
 defmodule DurableServer.RemotePlacementTest do
-  use ExUnit.Case, async: false
+  use DurableServer.LocalStackCase, async: false
   import DurableServer.TestHelper
   alias DurableServer
 
