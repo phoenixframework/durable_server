@@ -1954,24 +1954,6 @@ defmodule DurableServer.LifecycleTest do
     store
   end
 
-  defp assert_eventually(fun, timeout \\ 5_000, interval \\ 25) when is_function(fun, 0) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_assert_eventually(fun, deadline, interval)
-  end
-
-  defp do_assert_eventually(fun, deadline, interval) do
-    if fun.() do
-      :ok
-    else
-      if System.monotonic_time(:millisecond) >= deadline do
-        flunk("condition was not met within timeout")
-      else
-        Process.sleep(interval)
-        do_assert_eventually(fun, deadline, interval)
-      end
-    end
-  end
-
   defp setup_restart_gate_tables(supervisor_name) do
     config_table = :"durable_supervisor_#{supervisor_name}"
     heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"

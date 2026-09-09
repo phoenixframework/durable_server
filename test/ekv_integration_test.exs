@@ -689,23 +689,4 @@ defmodule DurableServer.EKVIntegrationTest do
       :ok
     end
   end
-
-  defp assert_eventually(fun, timeout \\ 2_000, interval \\ 25)
-       when is_function(fun, 0) and is_integer(timeout) and timeout > 0 do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_assert_eventually(fun, deadline, interval)
-  end
-
-  defp do_assert_eventually(fun, deadline, interval) do
-    if fun.() do
-      :ok
-    else
-      if System.monotonic_time(:millisecond) >= deadline do
-        flunk("eventual assertion timed out")
-      else
-        Process.sleep(interval)
-        do_assert_eventually(fun, deadline, interval)
-      end
-    end
-  end
 end

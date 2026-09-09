@@ -2,6 +2,29 @@ defmodule DurableServer.TestHelperTest do
   use ExUnit.Case, async: true
   import DurableServer.TestHelper
 
+  test "eventual assertions retry the predicate and return as soon as it succeeds" do
+    attempts = make_ref()
+
+    assert :ok =
+             assert_eventually(
+               fn ->
+                 count = Process.get(attempts, 0)
+                 Process.put(attempts, count + 1)
+                 count == 1
+               end,
+               5_000,
+               0
+             )
+
+    assert Process.get(attempts) == 2
+  end
+
+  test "eventual assertions fail when the predicate stays false until the deadline" do
+    assert_raise ExUnit.AssertionError, ~r/condition was not met within timeout/, fn ->
+      assert_eventually(fn -> false end, 0)
+    end
+  end
+
   test "object-store configuration uses the suite bucket without connecting to storage" do
     opts = test_object_store_opts()
     assert opts[:bucket] == Application.fetch_env!(:durable_server, :test_object_store_bucket)

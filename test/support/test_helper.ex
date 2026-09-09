@@ -3,7 +3,32 @@ defmodule DurableServer.TestHelper do
   Test helpers for DurableServer tests.
   """
 
+  import ExUnit.Assertions, only: [flunk: 1]
+
   alias DurableServer.ObjectStore
+
+  @doc """
+  Waits for a predicate to become truthy, failing if it stays false until the deadline.
+  """
+  def assert_eventually(fun, timeout \\ 5_000, interval \\ 25)
+      when is_function(fun, 0) and is_integer(timeout) and timeout >= 0 do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_assert_eventually(fun, deadline, interval)
+  end
+
+  defp do_assert_eventually(fun, deadline, interval) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("condition was not met within timeout")
+
+      true ->
+        Process.sleep(interval)
+        do_assert_eventually(fun, deadline, interval)
+    end
+  end
 
   @doc """
   Returns LocalStack options with a bucket unique to this suite invocation.
