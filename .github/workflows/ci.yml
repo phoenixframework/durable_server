@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Elixir 1.19 / OTP 26
+            elixir: "1.19.x"
+            otp: "26.x"
+          # Ranges select stable releases; setup-beam's "latest" includes prereleases.
+          - name: Latest stable Elixir / OTP
+            elixir: "1.x"
+            otp: "> 0"
+
+    env:
+      MIX_ENV: test
+
+    services:
+      localstack:
+        image: localstack/localstack:4.14.0
+        env:
+          SERVICES: s3,iam
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "awslocal s3 ls && awslocal iam list-users"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        id: beam
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ runner.os }}-${{ runner.arch }}-otp-${{ steps.beam.outputs.otp-version }}-elixir-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('mix.lock') }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Check formatting
+        if: matrix.name == 'Latest stable Elixir / OTP'
+        run: mix format --check-formatted
+
+      - name: Compile with warnings as errors
+        run: mix compile --warnings-as-errors
+
+      - name: Test with warnings as errors
+        run: mix test --warnings-as-errors
