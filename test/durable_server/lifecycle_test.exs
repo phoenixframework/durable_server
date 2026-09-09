@@ -1,6 +1,7 @@
 defmodule DurableServer.LifecycleTest do
-  use ExUnit.Case, async: true
+  use DurableServer.LocalStackCase, async: true
   import DurableServer.TestHelper
+  import DurableServer.LifecycleHelpers
 
   alias DurableServer
   alias DurableServer.{CircuitBreaker, LifecycleManager, Meta}
@@ -50,6 +51,69 @@ defmodule DurableServer.LifecycleTest do
     def handle_call(:stop_permanent, _from, %{} = state) do
       {:stop, {:shutdown, :permanent}, :bye, state}
     end
+  end
+
+  defmodule FailingLoadServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: state
+    def load_state(_vsn, _state), do: raise("injected state loading failure")
+    def init(state), do: {:ok, state}
+  end
+
+  defmodule RestartClaimBarrierBackend do
+    @behaviour DurableServer.StorageBackend
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      {:ok, delegate} =
+        StorageBackend.init_backend(
+          DurableServer.Backends.ObjectStore,
+          Keyword.fetch!(opts, :store)
+        )
+
+      {:ok, %{state: %{delegate: delegate, owner: Keyword.fetch!(opts, :owner)}}}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate}, key, opts),
+      do: StorageBackend.get_object(delegate, key, opts)
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(%{delegate: delegate, owner: owner}, key, body, opts) do
+      send(owner, {:restart_claim_ready, self()})
+
+      receive do
+        :release_restart_claim -> StorageBackend.put_object(delegate, key, body, opts)
+      after
+        5_000 -> raise "restart claim barrier was not released"
+      end
+    end
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
   end
 
   defmodule DelayedTerminateServer do
@@ -702,56 +766,46 @@ defmodule DurableServer.LifecycleTest do
     supervisor_name = :"test_supervisor_#{DurableServer.UUID.uuid4()}"
     prefix = "test_#{DurableServer.UUID.uuid4()}/"
 
+    # Discovery tests explicitly drive each cycle, without startup bursts racing
+    # their storage assertions or contributing extra diagnostic counts.
     _supervisor_pid =
       start_supervised!({
         DurableServer.Supervisor,
-        name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()
+        name: supervisor_name,
+        prefix: prefix,
+        object_store: test_object_store_opts(),
+        initial_discovery_delay_ms: 60_000,
+        discovery_burst_count: 0
       })
 
     object_store = test_object_store()
-    test_bucket_name = "durable-test-lifecycle-#{DurableServer.UUID.uuid4()}"
+    supervisor_config = DurableServer.Supervisor.__get_config__(supervisor_name)
+    circuit_breaker = supervisor_config.circuit_breaker
 
-    case ObjectStore.create_bucket_with_credentials(object_store, test_bucket_name) do
-      {:ok, %ObjectStore{} = store} ->
-        on_exit(fn ->
-          try do
-            ObjectStore.delete_bucket(store, test_bucket_name)
-          catch
-            _, _ -> :ok
-          end
-        end)
+    # Standalone managers use the same storage as the real test supervisor.
+    test_config = %{
+      name: supervisor_name,
+      prefix: prefix,
+      object_store: object_store,
+      initial_discovery_delay_ms: 60_000,
+      discovery_burst_count: 0,
+      discovery_interval_ms: 60_000,
+      heartbeat_interval_ms: 10_000,
+      graceful_shutdown_timeout_ms: 30_000,
+      dead_node_threshold_ms: 24 * 60 * 60 * 1000,
+      crash_threshold_count: 5,
+      crash_threshold_window_ms: 60 * 60 * 1000,
+      module_circuit_breaker_count: 50,
+      module_circuit_breaker_window_ms: 5 * 60 * 1000,
+      module_circuit_breaker_cooldown_ms: 30 * 60 * 1000,
+      ets_table: supervisor_config.ets_table
+    }
 
-        supervisor_config = DurableServer.Supervisor.__get_config__(supervisor_name)
-        circuit_breaker = supervisor_config.circuit_breaker
-
-        # Create test config that mimics what supervisor provides
-        test_config = %{
-          name: supervisor_name,
-          prefix: prefix,
-          object_store: object_store,
-          discovery_interval_ms: 60_000,
-          heartbeat_interval_ms: 10_000,
-          graceful_shutdown_timeout_ms: 30_000,
-          dead_node_threshold_ms: 24 * 60 * 60 * 1000,
-          crash_threshold_count: 5,
-          crash_threshold_window_ms: 60 * 60 * 1000,
-          module_circuit_breaker_count: 50,
-          module_circuit_breaker_window_ms: 5 * 60 * 1000,
-          module_circuit_breaker_cooldown_ms: 30 * 60 * 1000,
-          ets_table: supervisor_config.ets_table
-        }
-
-        {:ok,
-         test_bucket: test_bucket_name,
-         store: store,
-         supervisor_name: supervisor_name,
-         prefix: prefix,
-         config: test_config,
-         circuit_breaker: circuit_breaker}
-
-      {:error, reason} ->
-        {:skip, "Failed to create test bucket: #{inspect(reason)}"}
-    end
+    {:ok,
+     supervisor_name: supervisor_name,
+     prefix: prefix,
+     config: test_config,
+     circuit_breaker: circuit_breaker}
   end
 
   describe "stop modes" do
@@ -1014,9 +1068,7 @@ defmodule DurableServer.LifecycleTest do
       # Use the real supervisor's LifecycleManager for actual restart testing
       {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
 
-      # Manually trigger discovery
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 5000)
+      discover_and_wait(manager_pid)
 
       assert {restarted_pid, _meta} =
                DurableServer.Supervisor.lookup(supervisor_name, key)
@@ -1232,8 +1284,7 @@ defmodule DurableServer.LifecycleTest do
         {key, etag, stored_state.meta, System.monotonic_time(:millisecond)}
       )
 
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 1000)
+      discover_and_wait(manager_pid)
 
       assert [] = :ets.lookup(manager_state.discovery_skip_table, key)
       assert nil == DurableServer.Supervisor.lookup(supervisor_name, key)
@@ -1294,8 +1345,7 @@ defmodule DurableServer.LifecycleTest do
 
       {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
 
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 1000)
+      discover_and_wait(manager_pid)
 
       diagnostics = LifecycleManager.get_discovery_diagnostics(supervisor_name)
       assert Map.get(diagnostics, :restart_claim_ok, 0) >= 1
@@ -1383,19 +1433,17 @@ defmodule DurableServer.LifecycleTest do
       # Use the real supervisor's LifecycleManager for actual restart testing
       {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
 
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 3000)
+      discover_and_wait(manager_pid)
 
-      # Check if restart was attempted - after failure, metadata gets cleaned up
+      assert {restarted_pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+      assert restarted_pid != pid
+      assert GenServer.call(restarted_pid, :get_count) == original_count
+
       {:ok, final_data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
 
-      # Restart should have been attempted and failed (since TestServer interface mismatch)
-      # After failure, restart metadata is cleaned up, but state should be preserved
-      assert final_data.state["count"] == original_count,
-             "State was not preserved during restart attempt"
-
-      # Status should no longer be crashed since restart succeeded
-      refute final_data.meta.status == :crashed
+      assert final_data.state["count"] == original_count
+      assert final_data.meta.status == :running
+      assert final_data.meta.pid == restarted_pid
 
       GenServer.stop(manager_pid)
     end
@@ -1461,185 +1509,139 @@ defmodule DurableServer.LifecycleTest do
       # Use the real supervisor's LifecycleManager for actual restart testing
       {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
 
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 2000)
+      discover_and_wait(manager_pid)
 
-      # Verify restart was attempted (metadata cleaned up after failure) and state preserved
+      assert {restarted_pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+      assert restarted_pid != pid
+      assert GenServer.call(restarted_pid, :get_count) == 5
+
       {:ok, post_restart_data} =
         DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
 
-      # After restart failure, metadata is cleaned up but state should be preserved
-      assert post_restart_data.state["count"] == 5, "Should use updated state from storage"
-
-      refute post_restart_data.meta.status == :crashed,
-             "Status should change from crashed after successful restart"
+      assert post_restart_data.state["count"] == 5
+      assert post_restart_data.meta.status == :running
+      assert post_restart_data.meta.pid == restarted_pid
 
       GenServer.stop(manager_pid)
     end
   end
 
   describe "real-world restart scenarios" do
-    test "handles restart timing conflicts between multiple managers", %{
+    test "concurrent restart claims have exactly one winner and recover its state", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
-      config: config,
-      circuit_breaker: _circuit_breaker
+      config: config
     } do
       key = "timing-conflict-test-#{DurableServer.UUID.uuid4()}"
+      stored = seed_restartable_object(config, key, 3)
 
-      # Create crashed server state
-      meta_attrs = %{
-        status: :crashed,
-        node_str: "unreachable@test",
-        node_ref: "dead-ref",
-        pid: self(),
-        last_heartbeat_at: System.system_time(:millisecond),
-        module: TestServer
-      }
-
-      create_test_object(config.object_store, "#{prefix}#{key}", %{count: 3}, meta_attrs)
-
-      # Start two managers that will compete for restart (use spawn to avoid name conflicts)
-      {:ok, manager1} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          node_module: DurableServer.LifecycleTest.MockNodeModule
+      {:ok, backend} =
+        DurableServer.StorageBackend.init_backend(RestartClaimBarrierBackend,
+          store: config.object_store,
+          owner: self()
         )
 
-      {:ok, manager2} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          node_module: DurableServer.LifecycleTest.MockNodeModule
-        )
+      # Different manager timeouts make these distinct claims, not the identical
+      # same-owner write that ObjectStore intentionally treats as idempotent.
+      attempts =
+        for ttl <- [30_000, 60_000] do
+          Task.async(fn -> DurableServer.claim_restart_attempt(backend, stored, ttl: ttl) end)
+        end
 
-      # Trigger discovery on both simultaneously
-      send(manager1, :discover_and_restart)
-      send(manager2, :discover_and_restart)
+      # Both claimers must read the unclaimed object before either CAS
+      # proceeds. This exercises the losing write, not just a serialized lookup.
+      assert_receive {:restart_claim_ready, first}
+      assert_receive {:restart_claim_ready, second}
+      assert first != second
+      send(first, :release_restart_claim)
+      send(second, :release_restart_claim)
 
-      # Give time for both to process
-      Process.sleep(2000)
+      results = Enum.map(attempts, &Task.await/1)
+      assert [{:ok, claim}] = Enum.filter(results, &match?({:ok, _}, &1))
+      assert [{:error, :not_eligible}] = Enum.filter(results, &match?({:error, _}, &1))
 
-      # Check final state - should have atomic claim (only one winner)
-      {:ok, data} =
+      # Use the same preloaded startup path as LifecycleManager after a claim.
+      assert {:ok, {pid, _meta}} =
+               DurableServer.Supervisor.__start_child__(
+                 supervisor_name,
+                 {TestServer, [key: key, initial_state: %{}],
+                  %{
+                    preloaded: claim,
+                    restart_attempt_node: to_string(node()),
+                    is_sticky_local: false
+                  }}
+               )
+
+      assert {^pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+      assert GenServer.call(pid, :get_count) == 3
+
+      {:ok, recovered} =
         DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
 
-      restart_node = Map.get(data.meta, :restart_attempt_node)
-
-      # Should have exactly one restart attempt node or completion
-      if restart_node do
-        assert restart_node == to_string(Node.self())
-      else
-        # Or restart completed successfully with no remaining metadata
-        assert Map.get(data.meta, :restart_attempt_time) == nil
-      end
+      assert recovered.meta.status == :running
+      assert recovered.meta.pid == pid
+      assert recovered.meta.restart_attempt_node == nil
     end
 
     test "restart coordination across discovery cycles", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
-      config: config,
-      circuit_breaker: _circuit_breaker
+      config: config
     } do
       key = "coordination-test-#{DurableServer.UUID.uuid4()}"
+      seed_restartable_object(config, key, 7)
+      {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
 
-      meta_attrs = %{
-        status: :crashed,
-        # Use unreachable node
-        node_str: "unreachable@test",
-        node_ref: "dead-ref",
-        pid: self(),
-        last_heartbeat_at: System.system_time(:millisecond),
-        module: TestServer
-      }
+      recovered_pids =
+        for _ <- 1..3 do
+          discover_and_wait(manager_pid)
+          assert {pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+          assert GenServer.call(pid, :get_count) == 7
 
-      create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
+          {:ok, stored} =
+            DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
 
-      {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config,
-          node_module: DurableServer.LifecycleTest.MockNodeModule
-        )
-
-      # Multiple discovery cycles
-      for i <- 1..3 do
-        send(manager_pid, :discover_and_restart)
-        wait_for_discovery_completion(manager_pid, 1500)
-
-        # Check state after each cycle
-        {:ok, data} =
-          DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
-
-        case i do
-          1 ->
-            # First cycle should claim restart since node is unreachable
-            restart_attempt = Map.get(data.meta, :restart_attempt_node)
-
-            if restart_attempt == nil do
-              # If no restart attempt, server might have been restarted successfully
-              # or the discovery logic didn't find it as orphaned
-              # This is acceptable - just log for debugging
-              :ok
-            end
-
-          2 ->
-            # Second cycle - restart might be in progress or cleaned up
-            :ok
-
-          3 ->
-            # Final cycle should have completed or cleaned up
-            restart_time = Map.get(data.meta, :restart_attempt_time)
-
-            if restart_time do
-              # If still present, should be recent
-              assert System.system_time(:millisecond) - restart_time < 30_000
-            end
+          assert stored.meta.status == :running
+          assert stored.meta.pid == pid
+          assert stored.meta.restart_attempt_node == nil
+          pid
         end
-      end
 
-      GenServer.stop(manager_pid)
+      assert [_pid] = Enum.uniq(recovered_pids)
+      diagnostics = LifecycleManager.get_discovery_diagnostics(supervisor_name)
+      assert diagnostics.restart_claim_ok == 1
+      assert diagnostics.restart_start_ok == 1
     end
   end
 
   describe "complete error recovery testing" do
-    test "cleanup prevents future restart attempts after repeated failures", %{
+    test "state loading failures clear their claim so a later discovery can retry", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
-      config: config,
-      circuit_breaker: _circuit_breaker
+      config: config
     } do
       key = "repeated-failure-test-#{DurableServer.UUID.uuid4()}"
 
-      meta_attrs = %{
-        status: :crashed,
-        node_str: "dead_node@test",
-        node_ref: "dead-ref",
-        pid: self(),
-        last_heartbeat_at: System.system_time(:millisecond),
-        # This will always fail to restart
-        module: NonExistentModule
-      }
+      seed_restartable_object(config, key, 0, module: FailingLoadServer)
+      {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
 
-      create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
+      for attempt <- 1..3 do
+        discover_and_wait(manager_pid)
 
-      {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config)
+        diagnostics = LifecycleManager.get_discovery_diagnostics(supervisor_name)
+        assert diagnostics.restart_claim_ok == attempt
+        assert diagnostics.restart_start_error == attempt
+        assert DurableServer.Supervisor.lookup(supervisor_name, key) == nil
 
-      # Trigger multiple discovery rounds to simulate repeated failures
-      for _ <- 1..3 do
-        send(manager_pid, :discover_and_restart)
-        wait_for_discovery_completion(manager_pid, 1500)
+        {:ok, data} =
+          DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+
+        assert data.meta.restart_attempt_ttl == nil
+        assert data.meta.restart_attempt_node == nil
+        assert data.meta.restart_attempt_time == nil
+        assert data.meta.status == :crashed
+        assert data.state["count"] == 0
       end
-
-      # Check final state - should have cleanup after failure
-      {:ok, data} =
-        DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
-
-      # Should have no restart attempt metadata (cleaned up after failure)
-      assert Map.get(data.meta, :restart_attempt_ttl) == nil
-      assert Map.get(data.meta, :restart_attempt_node) == nil
-      assert Map.get(data.meta, :restart_attempt_time) == nil
-
-      # Status should remain crashed since restart failed
-      assert data.meta.status == :crashed
-
-      GenServer.stop(manager_pid)
     end
 
     test "recovery from corrupted restart attempt metadata", %{
@@ -1670,9 +1672,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      # Should handle corrupted metadata gracefully
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 1500)
+      discover_and_wait(manager_pid)
 
       # Manager should still be alive despite corrupted data
       assert_process_alive(manager_pid)
@@ -1689,87 +1689,52 @@ defmodule DurableServer.LifecycleTest do
     test "error recovery during discovery with mixed valid/invalid objects", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
-      config: config,
-      circuit_breaker: _circuit_breaker
+      config: config
     } do
-      # Create multiple objects with mixed validity
-      keys = for i <- 1..5, do: "mixed-test-#{i}-#{DurableServer.UUID.uuid4()}"
+      crashed = for count <- 1..2, do: {"crashed-#{DurableServer.UUID.uuid4()}", count}
+      invalid = for _ <- 1..2, do: "invalid-#{DurableServer.UUID.uuid4()}"
+      live_key = "live-#{DurableServer.UUID.uuid4()}"
+      live_pid = start_test_server(supervisor_name, live_key)
 
-      # Create mix of valid and invalid objects
-      for {key, i} <- Enum.with_index(keys, 1) do
-        case rem(i, 3) do
-          0 ->
-            # Valid crashed server
-            meta_attrs = %{
-              status: :crashed,
-              node_str: "dead_node@test",
-              node_ref: "dead-ref",
-              pid: self(),
-              last_heartbeat_at: System.system_time(:millisecond),
-              module: TestServer
-            }
-
-            create_test_object(config.object_store, "#{prefix}#{key}", %{count: i}, meta_attrs)
-
-          1 ->
-            # Corrupted metadata
-            corrupted_data = %{
-              vsn: 1,
-              state: %{count: i},
-              meta: "invalid_base64_#{i}"
-            }
-
-            ObjectStore.put_object(
-              config.object_store,
-              "#{prefix}#{key}",
-              JSON.encode!(corrupted_data)
-            )
-
-          2 ->
-            # Valid running server (should be ignored)
-            meta_attrs = %{
-              status: :running,
-              node_str: to_string(Node.self()),
-              node_ref: "current-ref",
-              pid: self(),
-              last_heartbeat_at: System.system_time(:millisecond),
-              module: TestServer
-            }
-
-            create_test_object(config.object_store, "#{prefix}#{key}", %{count: i}, meta_attrs)
-        end
+      for {key, count} <- crashed do
+        seed_restartable_object(config, key, count)
       end
 
-      {:ok, manager_pid} =
-        start_standalone_lifecycle_manager(supervisor_name, config)
-
-      # Should handle mixed object states gracefully
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 2000)
-
-      # Manager should survive processing mixed objects
-      assert_process_alive(manager_pid)
-
-      # Should have attempted restart only on valid crashed servers
-      # Every 3rd key (0-indexed)
-      valid_crashed_keys = Enum.take_every(keys, 3)
-
-      for key <- valid_crashed_keys do
-        case DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix}) do
-          {:ok, data} ->
-            # Should have restart attempt or completion
-            restart_attempt = Map.get(data.meta, :restart_attempt_node)
-
-            assert restart_attempt != nil or data.meta.status != :crashed,
-                   "Valid crashed server #{key} should have restart attempt or be recovered"
-
-          {:error, _} ->
-            # Object might have been cleaned up during restart - acceptable
-            :ok
-        end
+      for key <- invalid do
+        assert {:ok, _} =
+                 ObjectStore.put_object(
+                   config.object_store,
+                   prefix <> key,
+                   JSON.encode!(%{vsn: 1, state: %{}, meta: "invalid_base64"})
+                 )
       end
 
-      GenServer.stop(manager_pid)
+      {:ok, manager_pid} = get_supervisor_lifecycle_manager(supervisor_name)
+      discover_and_wait(manager_pid)
+
+      for {key, count} <- crashed do
+        assert {pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
+        assert GenServer.call(pid, :get_count) == count
+
+        assert {:ok, data} =
+                 DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+
+        assert data.meta.status == :running
+        assert data.meta.pid == pid
+      end
+
+      for key <- invalid do
+        assert DurableServer.Supervisor.lookup(supervisor_name, key) == nil
+
+        assert {:error, %ArgumentError{}} =
+                 DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})
+      end
+
+      assert {^live_pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, live_key)
+      assert GenServer.call(live_pid, :get_count) == 0
+      diagnostics = LifecycleManager.get_discovery_diagnostics(supervisor_name)
+      assert diagnostics.restart_claim_ok == length(crashed)
+      assert diagnostics.restart_start_ok == length(crashed)
     end
   end
 
@@ -1819,7 +1784,29 @@ defmodule DurableServer.LifecycleTest do
       meta: encoded_meta
     }
 
-    ObjectStore.put_object(store, key, JSON.encode!(test_data))
+    assert {:ok, object} = ObjectStore.put_object(store, key, JSON.encode!(test_data))
+    {:ok, object}
+  end
+
+  defp seed_restartable_object(config, key, count, overrides \\ []) do
+    %{object_store: store, prefix: prefix, name: supervisor_name} = config
+
+    meta = %{
+      status: :crashed,
+      permanent: true,
+      supervisor: supervisor_name,
+      key: key,
+      prefix: prefix,
+      node_str: "unreachable@test",
+      node_ref: "dead-ref",
+      pid: self(),
+      last_heartbeat_at: System.system_time(:millisecond),
+      module: TestServer
+    }
+
+    create_test_object(store, prefix <> key, %{count: count}, Map.merge(meta, Map.new(overrides)))
+    assert {:ok, stored} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
+    stored
   end
 
   defp encode_legacy_stored_state(%DurableServer.StoredState{
@@ -1918,20 +1905,6 @@ defmodule DurableServer.LifecycleTest do
     )
   end
 
-  # Helper function to wait for discovery task completion or manager crash
-  defp wait_for_discovery_completion(manager_pid, timeout) do
-    ref = Process.monitor(manager_pid)
-
-    receive do
-      {:DOWN, ^ref, :process, ^manager_pid, reason} ->
-        flunk("LifecycleManager crashed: #{inspect(reason)}")
-    after
-      timeout ->
-        Process.demonitor(ref, [:flush])
-        :ok
-    end
-  end
-
   @stale_heartbeat_age_ms 48 * 60 * 60 * 1000
 
   defp await_heartbeat_cycle(manager_pid) do
@@ -1979,24 +1952,6 @@ defmodule DurableServer.LifecycleTest do
       )
 
     store
-  end
-
-  defp assert_eventually(fun, timeout \\ 5_000, interval \\ 25) when is_function(fun, 0) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_assert_eventually(fun, deadline, interval)
-  end
-
-  defp do_assert_eventually(fun, deadline, interval) do
-    if fun.() do
-      :ok
-    else
-      if System.monotonic_time(:millisecond) >= deadline do
-        flunk("condition was not met within timeout")
-      else
-        Process.sleep(interval)
-        do_assert_eventually(fun, deadline, interval)
-      end
-    end
   end
 
   defp setup_restart_gate_tables(supervisor_name) do
@@ -2048,11 +2003,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      # Send a discovery message manually to trigger discovery
-      send(pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(pid, 500)
+      discover_and_wait(pid)
 
       assert_process_alive(pid)
       GenServer.stop(pid)
@@ -2292,10 +2243,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 500)
+      discover_and_wait(manager_pid)
 
       assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
@@ -2338,10 +2286,7 @@ defmodule DurableServer.LifecycleTest do
         create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
       end
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 500)
+      discover_and_wait(manager_pid)
 
       assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
@@ -2373,10 +2318,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2407,10 +2349,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2439,10 +2378,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2473,10 +2409,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2506,10 +2439,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2541,10 +2471,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2576,10 +2503,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2618,10 +2542,7 @@ defmodule DurableServer.LifecycleTest do
           node_module: DurableServer.LifecycleTest.MockNodeModule
         )
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
 
       # Should be able to claim since TTL expired
       {:ok, data} =
@@ -2667,10 +2588,7 @@ defmodule DurableServer.LifecycleTest do
 
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery to complete or manager to crash
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
       assert_process_alive(manager_pid)
 
       GenServer.stop(manager_pid)
@@ -2700,10 +2618,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      send(manager_pid, :discover_and_restart)
-
-      # Wait longer for restart attempt and cleanup to complete
-      wait_for_discovery_completion(manager_pid, 200)
+      discover_and_wait(manager_pid)
 
       # Check that restart attempt metadata was cleaned up after failure
       {:ok, data} =
@@ -2740,8 +2655,7 @@ defmodule DurableServer.LifecycleTest do
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
       # First discovery - should not be orphaned
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
 
       # Update object to be orphaned (old heartbeat)
       old_time = System.system_time(:millisecond) - 5 * 60 * 1000
@@ -2749,8 +2663,7 @@ defmodule DurableServer.LifecycleTest do
       create_test_object(config.object_store, "#{prefix}#{key}", %{count: 0}, meta_attrs)
 
       # Second discovery - should now be orphaned
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 100)
+      discover_and_wait(manager_pid)
 
       assert_process_alive(manager_pid)
       GenServer.stop(manager_pid)
@@ -2799,11 +2712,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      # Trigger discovery and wait for completion
-      send(manager_pid, :discover_and_restart)
-
-      # Wait for discovery task to complete
-      wait_for_discovery_completion(manager_pid, 200)
+      discover_and_wait(manager_pid)
 
       # Manager should still be alive and ready for next cycle
       assert_process_alive(manager_pid)
@@ -3172,9 +3081,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      # Trigger discovery
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 1000)
+      discover_and_wait(manager_pid)
 
       # Verify server was NOT restarted (should remain crashed)
       {:ok, data} =
@@ -3212,9 +3119,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      # Trigger discovery
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 1000)
+      discover_and_wait(manager_pid)
 
       # Verify server was NOT restarted (should remain permanently crashed)
       {:ok, data} =
@@ -3247,8 +3152,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config)
 
-      send(manager_pid, :discover_and_restart)
-      wait_for_discovery_completion(manager_pid, 1000)
+      discover_and_wait(manager_pid)
 
       {:ok, data} =
         DurableServer.fetch_stored_state(config.object_store, %{key: key, prefix: prefix})

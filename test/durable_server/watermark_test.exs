@@ -1,5 +1,5 @@
 defmodule DurableServer.WatermarkTest do
-  use ExUnit.Case, async: false
+  use DurableServer.LocalStackCase, async: false
   import DurableServer.TestHelper
   alias DurableServer
 
@@ -201,16 +201,27 @@ defmodule DurableServer.WatermarkTest do
                )
 
       # Terminate one
-      Process.monitor(pid1)
-      DurableServer.Supervisor.terminate_child(supervisor_name, pid1)
-      assert_receive {:DOWN, _ref, :process, ^pid1, :normal}
+      ref = Process.monitor(pid1)
+      assert :ok = DurableServer.Supervisor.terminate_child(supervisor_name, pid1)
+      assert_receive {:DOWN, ^ref, :process, ^pid1, :normal}
 
-      # Now third should succeed
+      # The reservation keeper processes its own DOWN asynchronously. Observing
+      # the child exit does not mean that keeper has released its capacity yet.
+      assert_eventually(fn ->
+        DurableServer.Supervisor.current_capacity(supervisor_name) ==
+          %{total: %{current: 1, limit: 2}}
+      end)
+
+      # Now the third child should fit locally, without remote placement fallback.
       assert {:ok, {_pid3, _}} =
                DurableServer.Supervisor.start_child(
                  supervisor_name,
-                 {WatermarkTestServer, key: "key3", initial_state: %{}}
+                 {WatermarkTestServer, key: "key3", initial_state: %{}},
+                 max_placement_retries: 0
                )
+
+      assert DurableServer.Supervisor.current_capacity(supervisor_name) ==
+               %{total: %{current: 2, limit: 2}}
     end
 
     test "enforces a map limit atomically across concurrent starts", %{

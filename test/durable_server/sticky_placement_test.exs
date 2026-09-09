@@ -1,5 +1,5 @@
 defmodule DurableServer.StickyPlacementTest do
-  use ExUnit.Case, async: false
+  use DurableServer.LocalStackCase, async: false
   import DurableServer.TestHelper
   alias DurableServer
 
@@ -33,6 +33,14 @@ defmodule DurableServer.StickyPlacementTest do
   end
 
   setup do
+    previous_env = Map.new(["FLY_MACHINE_ID", "FLY_REGION"], &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      for {name, value} <- previous_env do
+        if is_nil(value), do: System.delete_env(name), else: System.put_env(name, value)
+      end
+    end)
+
     supervisor_name = :"test_supervisor_#{:erlang.unique_integer([:positive])}"
     prefix = "sticky_placement_test_#{:erlang.unique_integer([:positive])}/"
 
@@ -265,10 +273,6 @@ defmodule DurableServer.StickyPlacementTest do
                %{env_var: "FLY_REGION", value: "ord"},
                %{env_var: :any, value: :any}
              ]
-
-      # Cleanup
-      System.delete_env("FLY_MACHINE_ID")
-      System.delete_env("FLY_REGION")
     end
 
     test "builds sticky_placement when starting a child", %{
@@ -312,10 +316,6 @@ defmodule DurableServer.StickyPlacementTest do
                %{env_var: "FLY_REGION", value: "sjc"},
                %{env_var: :any, value: :any}
              ]
-
-      # Cleanup
-      System.delete_env("FLY_MACHINE_ID")
-      System.delete_env("FLY_REGION")
     end
 
     test "handles nil env var values", %{supervisor_name: supervisor_name, prefix: prefix} do
@@ -354,16 +354,6 @@ defmodule DurableServer.StickyPlacementTest do
       supervisor_name: supervisor_name,
       prefix: prefix
     } do
-      previous_region = System.get_env("FLY_REGION")
-
-      on_exit(fn ->
-        if previous_region do
-          System.put_env("FLY_REGION", previous_region)
-        else
-          System.delete_env("FLY_REGION")
-        end
-      end)
-
       System.put_env("FLY_REGION", "ord")
 
       start_supervised!(
@@ -441,10 +431,6 @@ defmodule DurableServer.StickyPlacementTest do
         [] ->
           flunk("Expected heartbeat entry to exist")
       end
-
-      # Cleanup
-      System.delete_env("FLY_MACHINE_ID")
-      System.delete_env("FLY_REGION")
     end
 
     test "env_vars is empty map when no sticky placement", %{
@@ -635,8 +621,6 @@ defmodule DurableServer.StickyPlacementTest do
 
       # With no sticky config, augmented should be nil
       assert augmented == nil
-
-      System.delete_env("FLY_REGION")
     end
 
     test "sticky config with :any allows all nodes to match", %{
@@ -676,8 +660,6 @@ defmodule DurableServer.StickyPlacementTest do
       assert length(augmented) == 2
       assert Enum.any?(augmented, fn p -> p.env_var == "FLY_REGION" and p.value == "ord" end)
       assert Enum.any?(augmented, fn p -> p.env_var == :any and p.value == :any end)
-
-      System.delete_env("FLY_REGION")
     end
 
     test "sticky config WITHOUT :any does not include :any fallback", %{
@@ -715,8 +697,6 @@ defmodule DurableServer.StickyPlacementTest do
       assert length(augmented) == 1
       assert Enum.any?(augmented, fn p -> p.env_var == "FLY_REGION" and p.value == "ord" end)
       refute Enum.any?(augmented, fn p -> p.env_var == :any end)
-
-      System.delete_env("FLY_REGION")
     end
 
     test "non-matching node returns nil level when :any not configured", %{
@@ -782,8 +762,6 @@ defmodule DurableServer.StickyPlacementTest do
 
       # Non-matching node with no :any should get nil
       assert matching_level == nil
-
-      System.delete_env("FLY_REGION")
     end
 
     test "matching node returns level 0 for sticky placement", %{
@@ -836,8 +814,6 @@ defmodule DurableServer.StickyPlacementTest do
 
       # Matching node should get level 0
       assert matching_level == 0
-
-      System.delete_env("FLY_REGION")
     end
   end
 end

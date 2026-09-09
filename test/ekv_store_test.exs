@@ -58,7 +58,9 @@ defmodule DurableServer.EKVStoreTest do
       name: name,
       cas_retries: 2,
       backoff: {0, 0},
-      timeout: 50,
+      # These tests script retry outcomes, not elapsed time. Allow scheduler
+      # delays while other test modules are compiling/running concurrently.
+      timeout: 1_000,
       ekv_mod: FakeEKV,
       ekv_supervisor_mod: FakeEKVSupervisor
     ]
