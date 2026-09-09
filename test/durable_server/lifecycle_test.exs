@@ -1918,17 +1918,46 @@ defmodule DurableServer.LifecycleTest do
     )
   end
 
-  # Helper function to wait for discovery task completion or manager crash
+  # Callers send :discover_and_restart first. The following system-state request
+  # is ordered after that message, so an idle state cannot precede the trigger.
   defp wait_for_discovery_completion(manager_pid, timeout) do
-    ref = Process.monitor(manager_pid)
+    assert_eventually(
+      fn -> :sys.get_state(manager_pid).current_discovery_task == nil end,
+      timeout
+    )
+  end
 
-    receive do
-      {:DOWN, ^ref, :process, ^manager_pid, reason} ->
-        flunk("LifecycleManager crashed: #{inspect(reason)}")
-    after
-      timeout ->
-        Process.demonitor(ref, [:flush])
-        :ok
+  describe "discovery completion barrier" do
+    test "a live manager with unfinished discovery is not completion" do
+      manager = start_supervised!({Agent, fn -> %{current_discovery_task: :pending} end})
+
+      assert_raise ExUnit.AssertionError, ~r/condition was not met/, fn ->
+        wait_for_discovery_completion(manager, 10)
+      end
+
+      assert Process.alive?(manager)
+    end
+
+    test "returns after the outstanding task is cleared" do
+      manager = start_supervised!({Agent, fn -> %{current_discovery_task: :pending} end})
+      parent = self()
+
+      waiter =
+        Task.async(fn ->
+          send(parent, :waiting_for_discovery)
+          wait_for_discovery_completion(manager, 5_000)
+        end)
+
+      assert_receive :waiting_for_discovery
+      Agent.update(manager, &%{&1 | current_discovery_task: nil})
+      assert Task.await(waiter) == :ok
+    end
+
+    test "a stopped manager fails instead of satisfying the barrier" do
+      manager = start_supervised!({Agent, fn -> %{current_discovery_task: :pending} end})
+      Agent.stop(manager)
+
+      assert catch_exit(wait_for_discovery_completion(manager, 100))
     end
   end
 
