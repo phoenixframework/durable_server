@@ -49,6 +49,34 @@ defmodule DurableServer.EKVIntegrationTest do
      supervisor_name: supervisor_name, prefix: prefix, ekv_name: ekv_name, data_dir: data_dir}
   end
 
+  test "fixture shutdown persists dirty state before stopping EKV", %{
+    supervisor_name: supervisor_name,
+    prefix: prefix
+  } do
+    %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    key = "dirty-shutdown"
+
+    {:ok, {pid, _}} =
+      DurableServer.Supervisor.start_child(
+        supervisor_name,
+        {CounterServer, key: key, initial_state: %{count: 0}}
+      )
+
+    assert GenServer.call(pid, :increment) == 1
+
+    assert {:ok, %{body: %StoredState{state: %{count: 0}}}} =
+             StorageBackend.get_object(backend, prefix <> key, consistent: true)
+
+    monitor = Process.monitor(pid)
+    assert :ok = stop_supervised(supervisor_name)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+
+    assert {:ok, %{body: %StoredState{state: %{count: 1}, meta: meta}}} =
+             StorageBackend.get_object(backend, prefix <> key, consistent: true)
+
+    assert meta.status == :stopped_graceful
+  end
+
   test "uses EKV backend defaults for heartbeat tracking and intervals", %{
     supervisor_name: supervisor_name
   } do
@@ -563,23 +591,21 @@ defmodule DurableServer.EKVIntegrationTest do
                ]
              )
 
-    start_supervised!(%{
-      id: {DurableServer.Supervisor, supervisor_name},
-      start:
-        {DurableServer.Supervisor, :start_link,
-         [
-           [
-             name: supervisor_name,
-             prefix: prefix,
-             backend: {EKVStore, [name: ekv_name, start: false]},
-             discovery_interval_ms: 200,
-             heartbeat_interval_ms: 250,
-             heartbeat_reconcile_interval_ms: 10_000,
-             graceful_shutdown_timeout_ms: 500,
-             dead_node_threshold_ms: 5_000
-           ]
-         ]}
-    })
+    local_supervisor =
+      start_supervised!(
+        Supervisor.child_spec(
+          {DurableServer.Supervisor,
+           name: supervisor_name,
+           prefix: prefix,
+           backend: {EKVStore, [name: ekv_name, start: false]},
+           discovery_interval_ms: 200,
+           heartbeat_interval_ms: 250,
+           heartbeat_reconcile_interval_ms: 10_000,
+           graceful_shutdown_timeout_ms: 500,
+           dead_node_threshold_ms: 5_000},
+          id: {DurableServer.Supervisor, supervisor_name}
+        )
+      )
 
     assert {:ok, _} =
              :erpc.call(
@@ -674,6 +700,31 @@ defmodule DurableServer.EKVIntegrationTest do
 
     {restarted_pid, _meta} = DurableServer.Supervisor.lookup(supervisor_name, key)
     assert 7 == GenServer.call(restarted_pid, :get_count)
+    assert 8 == GenServer.call(restarted_pid, :increment)
+
+    # Drain both managers before stopping either durable supervisor. Keep the EKV
+    # peer/quorum alive until all final persistence has completed.
+    assert :ok = LifecycleManager.stop_discovery(supervisor_name)
+    assert :ok = :erpc.call(peer_node, LifecycleManager, :stop_discovery, [supervisor_name])
+    child_monitor = Process.monitor(restarted_pid)
+    supervisor_monitor = Process.monitor(local_supervisor)
+
+    assert :ok = stop_supervised({DurableServer.Supervisor, supervisor_name})
+    assert_receive {:DOWN, ^child_monitor, :process, ^restarted_pid, :normal}, 1_000
+    assert_receive {:DOWN, ^supervisor_monitor, :process, ^local_supervisor, :shutdown}, 1_000
+
+    assert {:ok, %{body: %StoredState{state: %{count: 8}, meta: final_meta}}} =
+             StorageBackend.get_object(storage_backend, prefix <> key, consistent: true)
+
+    assert final_meta.status == :stopped_graceful
+
+    assert :ok =
+             :erpc.call(peer_node, Supervisor, :terminate_child, [
+               DurableServer.AppSupervisor,
+               supervisor_name
+             ])
+
+    assert nil == :erpc.call(peer_node, Process, :whereis, [supervisor_name])
   end
 
   defp ekv_mod, do: :"Elixir.EKV"

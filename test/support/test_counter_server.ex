@@ -30,6 +30,11 @@ defmodule DurableServer.TestCounterServer do
     {:reply, count, state}
   end
 
+  def handle_call(:increment, _from, %{count: count} = state) do
+    new_state = %{state | count: count + 1}
+    {:reply, new_state.count, new_state}
+  end
+
   def handle_call(:increment_and_sync, _from, %{count: count} = state) do
     new_state = %{state | count: count + 1}
     {:reply, new_state.count, new_state, :sync}
