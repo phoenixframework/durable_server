@@ -1916,34 +1916,29 @@ defmodule DurableServerTest do
       %{pid: pid, key: key}
     end
 
-    test "explicit sync with :sync action", %{pid: pid} do
-      # Increment with sync
-      assert GenServer.call(pid, :increment_and_sync) == 1
+    for callback <- [:call, :cast, :info] do
+      test "#{callback} with :sync persists state before the next request", %{
+        pid: pid,
+        key: key,
+        prefix: prefix,
+        supervisor_name: supervisor_name
+      } do
+        case unquote(callback) do
+          :call -> assert GenServer.call(pid, :increment_and_sync) == 1
+          :cast -> GenServer.cast(pid, :increment_and_sync)
+          :info -> send(pid, :increment_and_sync)
+        end
 
-      # Verify state persisted by checking if we can start another server with same key
-      # This would require modifying the test to use a known key
-      assert GenServer.call(pid, :get_count) == 1
-    end
+        # Same-sender ordering makes this a callback barrier, not a timed wait.
+        assert GenServer.call(pid, :get_count) == 1
 
-    test "sync with cast and :sync action", %{pid: pid} do
-      GenServer.cast(pid, :increment_and_sync)
-      # Allow cast and sync to complete
-      :sys.get_state(pid)
-      assert GenServer.call(pid, :get_count) == 1
-    end
-
-    test "sync with info and :sync action", %{pid: pid} do
-      send(pid, :increment_and_sync)
-      # Allow info and sync to complete
-      :sys.get_state(pid)
-      assert GenServer.call(pid, :get_count) == 1
-    end
-
-    test "handles sync errors gracefully", %{pid: pid} do
-      # This test would require mocking ObjectStore to return errors
-      # For now, verify the server continues operating
-      assert GenServer.call(pid, :increment_and_sync) == 1
-      assert GenServer.call(pid, :get_count) == 1
+        assert {:ok, %StoredState{state: %{"count" => 1}, meta: %Meta{pid: ^pid}}} =
+                 DurableServer.fetch_stored_state(
+                   supervisor_name,
+                   %{key: key, prefix: prefix},
+                   consistent: true
+                 )
+      end
     end
   end
 
