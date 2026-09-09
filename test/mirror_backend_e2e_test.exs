@@ -1,5 +1,5 @@
 defmodule DurableServer.MirrorBackendE2ETest do
-  use ExUnit.Case, async: false
+  use DurableServer.LocalStackCase, async: false
 
   import DurableServer.TestHelper
 
@@ -8,7 +8,6 @@ defmodule DurableServer.MirrorBackendE2ETest do
   alias DurableServer.StorageBackend
   alias DurableServer.TestCounterServer, as: CounterServer
 
-  @moduletag :integration
   @moduletag :capture_log
 
   setup do

@@ -7,7 +7,7 @@ defmodule DurableServer.EKVIntegrationTest do
   alias DurableServer.TestCounterServer, as: CounterServer
   alias DurableServer.TestTemporalServer
 
-  @moduletag :integration
+  @moduletag :ekv
   @moduletag :capture_log
 
   setup do

@@ -14,18 +14,9 @@ case File.read(".env") do
     :noop
 end
 
-# Exclude integration tests by default (they require real credentials)
-ExUnit.configure(exclude: [:integration, :stress])
-
-alias DurableServer.ObjectStore
-import DurableServer.TestHelper
-
-# Clear object store (local stack) for this run
-store = test_object_store()
-:ok = ObjectStore.ensure_bucket_exists(store)
-
-for obj <- ObjectStore.list_all_objects_stream(store, "") do
-  :ok = ObjectStore.delete_object(store, obj.key)
-end
+# Allocate a namespace without contacting storage. Only LocalStackCase creates it.
+DurableServer.TestHelper.init_test_run()
+ExUnit.configure(exclude: [:localstack, :integration, :stress])
+ExUnit.after_suite(fn _ -> DurableServer.TestHelper.cleanup_test_run!() end)
 
 ExUnit.start()

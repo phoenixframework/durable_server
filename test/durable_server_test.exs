@@ -1,5 +1,5 @@
 defmodule DurableServerTest do
-  use ExUnit.Case, async: true
+  use DurableServer.LocalStackCase, async: true
   import ExUnit.CaptureLog
   import DurableServer.TestHelper
 
@@ -935,34 +935,8 @@ defmodule DurableServerTest do
   end
 
   setup do
-    # Create a test bucket
-    test_bucket_name =
-      "durable-test-durable-#{DurableServer.UUID.uuid4()}"
-
-    case ObjectStore.create_bucket_with_credentials(test_object_store(), test_bucket_name) do
-      {:ok, %ObjectStore{} = store} ->
-        on_exit(fn ->
-          # Clean up bucket on test completion
-          try do
-            ObjectStore.delete_bucket(store, test_bucket_name)
-          catch
-            _, _ -> :ok
-          end
-        end)
-
-        # Start a DurableServer.Supervisor for tests that need one
-        {supervisor_name, supervisor_pid, prefix} = start_test_supervisor()
-
-        {:ok,
-         test_bucket: test_bucket_name,
-         store: store,
-         supervisor_name: supervisor_name,
-         supervisor_pid: supervisor_pid,
-         prefix: prefix}
-
-      {:error, reason} ->
-        {:skip, "Failed to create test bucket: #{inspect(reason)}"}
-    end
+    {supervisor_name, supervisor_pid, prefix} = start_test_supervisor()
+    {:ok, supervisor_name: supervisor_name, supervisor_pid: supervisor_pid, prefix: prefix}
   end
 
   describe "init/1" do

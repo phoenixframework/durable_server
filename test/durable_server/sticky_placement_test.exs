@@ -1,5 +1,5 @@
 defmodule DurableServer.StickyPlacementTest do
-  use ExUnit.Case, async: false
+  use DurableServer.LocalStackCase, async: false
   import DurableServer.TestHelper
   alias DurableServer
 
