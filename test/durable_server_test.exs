@@ -408,15 +408,12 @@ defmodule DurableServerTest do
           [] ->
             case Keyword.fetch(opts, :etag) do
               {:ok, expected_etag} ->
-                case :ets.lookup(table, {:data, key}) do
-                  [{{:data, ^key}, %{etag: ^expected_etag}}] ->
-                    store_value(table, key, data)
+                object = new_object(data)
+                match_spec = conditional_match(key, expected_etag, [{{:"$1", {:const, object}}}])
 
-                  [{{:data, ^key}, _value}] ->
-                    {:error, :conflict}
-
-                  [] ->
-                    {:error, :not_found}
+                case :ets.select_replace(table, match_spec) do
+                  1 -> {:ok, object}
+                  0 -> conditional_failure(table, key)
                 end
 
               :error ->
@@ -439,13 +436,9 @@ defmodule DurableServerTest do
           response
 
         [] ->
-          case :ets.lookup(table, {:data, key}) do
-            [{{:data, ^key}, _value}] ->
-              :ets.delete(table, {:data, key})
-              :ok
-
-            [] ->
-              {:error, :not_found}
+          case :ets.take(table, {:data, key}) do
+            [_object] -> :ok
+            [] -> {:error, :not_found}
           end
       end
     end
@@ -466,16 +459,9 @@ defmodule DurableServerTest do
         [] ->
           case Keyword.fetch(opts, :etag) do
             {:ok, expected_etag} ->
-              case :ets.lookup(table, {:data, key}) do
-                [{{:data, ^key}, %{etag: ^expected_etag}}] ->
-                  :ets.delete(table, {:data, key})
-                  :ok
-
-                [{{:data, ^key}, _value}] ->
-                  {:error, :conflict}
-
-                [] ->
-                  {:error, :not_found}
+              case :ets.select_delete(table, conditional_match(key, expected_etag, [true])) do
+                1 -> :ok
+                0 -> conditional_failure(table, key)
               end
 
             :error ->
@@ -486,13 +472,12 @@ defmodule DurableServerTest do
 
     @impl true
     def try_claim(%{table: table}, key, body) do
-      case :ets.lookup(table, {:data, key}) do
-        [] ->
-          {:ok, %{etag: etag}} = store_value(table, key, body)
-          {:ok, {:claimed, etag}}
+      object = new_object(body)
 
-        [_existing] ->
-          {:error, :already_claimed}
+      if :ets.insert_new(table, {{:data, key}, object}) do
+        {:ok, {:claimed, object.etag}}
+      else
+        {:error, :already_claimed}
       end
     end
 
@@ -511,12 +496,29 @@ defmodule DurableServerTest do
     def decode(_state, data), do: {:ok, data}
 
     defp store_value(table, key, data) do
-      etag =
-        System.unique_integer([:positive, :monotonic])
-        |> Integer.to_string()
+      object = new_object(data)
+      :ets.insert(table, {{:data, key}, object})
+      {:ok, object}
+    end
 
-      :ets.insert(table, {{:data, key}, %{body: data, etag: etag}})
-      {:ok, %{body: data, etag: etag}}
+    defp new_object(data) do
+      %{body: data, etag: Integer.to_string(System.unique_integer([:positive, :monotonic]))}
+    end
+
+    # Comparison and mutation must be one ETS operation. Keep the key in the
+    # replacement and treat data/etags as literals, not match-spec expressions.
+    defp conditional_match(key, etag, body) do
+      [
+        {{:"$1", :"$2"},
+         [
+           {:"=:=", :"$1", {:const, {:data, key}}},
+           {:"=:=", {:map_get, :etag, :"$2"}, {:const, etag}}
+         ], body}
+      ]
+    end
+
+    defp conditional_failure(table, key) do
+      if :ets.member(table, {:data, key}), do: {:error, :conflict}, else: {:error, :not_found}
     end
 
     defp maybe_after_put(%{after_put: after_put} = state, key, data, opts, result)
@@ -963,6 +965,93 @@ defmodule DurableServerTest do
       {:error, reason} ->
         {:skip, "Failed to create test bucket: #{inspect(reason)}"}
     end
+  end
+
+  describe "ConsistencyProbeBackend atomic storage contract" do
+    test "concurrent creates have exactly one winner" do
+      {:ok, backend} = StorageBackend.init_backend(ConsistencyProbeBackend, [])
+
+      for trial <- 1..100 do
+        key = "claim-#{trial}"
+        results = race_backend_calls(fn _ -> StorageBackend.try_claim(backend, key, :claimed) end)
+        assert Enum.count(results, &match?({:ok, {:claimed, _}}, &1)) == 1
+        assert Enum.count(results, &(&1 == {:error, :already_claimed})) == 31
+      end
+    end
+
+    test "concurrent conditional writes consume an etag only once" do
+      {:ok, backend} = StorageBackend.init_backend(ConsistencyProbeBackend, [])
+
+      for trial <- 1..100 do
+        key = "write-#{trial}"
+        {:ok, original} = StorageBackend.put_object(backend, key, :original)
+
+        results =
+          race_backend_calls(fn _ ->
+            StorageBackend.put_object(backend, key, {:literal, :"$1"}, etag: original.etag)
+          end)
+
+        assert [winner] = Enum.filter(results, &match?({:ok, _}, &1))
+        assert Enum.count(results, &(&1 == {:error, :conflict})) == 31
+        assert StorageBackend.get_object(backend, key) == winner
+      end
+    end
+
+    test "a conditional delete and write cannot both consume the same etag" do
+      {:ok, backend} = StorageBackend.init_backend(ConsistencyProbeBackend, [])
+
+      for trial <- 1..100 do
+        key = "delete-#{trial}"
+        {:ok, original} = StorageBackend.put_object(backend, key, :original)
+
+        results =
+          race_backend_calls(fn index ->
+            if rem(index, 2) == 0 do
+              StorageBackend.delete_object(backend, key, etag: original.etag)
+            else
+              StorageBackend.put_object(backend, key, :replacement, etag: original.etag)
+            end
+          end)
+
+        assert Enum.count(results, &(&1 == :ok or match?({:ok, _}, &1))) == 1
+
+        if :ok in results do
+          assert StorageBackend.get_object(backend, key) == {:error, :not_found}
+        else
+          assert {:ok, %{body: :replacement}} = StorageBackend.get_object(backend, key)
+        end
+      end
+    end
+
+    test "stale tokens cannot mutate replacements or recreate missing objects" do
+      {:ok, backend} = StorageBackend.init_backend(ConsistencyProbeBackend, [])
+      {:ok, original} = StorageBackend.put_object(backend, "key", :original)
+      :ok = StorageBackend.delete_object(backend, "key", etag: original.etag)
+
+      assert {:error, :not_found} =
+               StorageBackend.put_object(backend, "key", :stale, etag: original.etag)
+
+      {:ok, replacement} = StorageBackend.put_object(backend, "key", :replacement)
+
+      assert {:error, :conflict} =
+               StorageBackend.delete_object(backend, "key", etag: original.etag)
+
+      assert {:ok, ^replacement} = StorageBackend.get_object(backend, "key")
+    end
+  end
+
+  defp race_backend_calls(fun) do
+    tasks =
+      for index <- 1..32 do
+        Task.async(fn ->
+          receive do
+            :go -> fun.(index)
+          end
+        end)
+      end
+
+    Enum.each(tasks, &send(&1.pid, :go))
+    Enum.map(tasks, &Task.await/1)
   end
 
   describe "init/1" do
