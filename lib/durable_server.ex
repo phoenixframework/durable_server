@@ -1953,6 +1953,9 @@ defmodule DurableServer do
     storage_key = stored_state.prefix <> stored_state.key
 
     cond do
+      LifecycleManager.discovery_degraded?(meta.supervisor) ->
+        {:error, :discovery_degraded}
+
       Meta.currently_restarting?(meta) ->
         {:error, :already_claimed}
 

@@ -659,7 +659,8 @@ defmodule DurableServer.Backends.EKVStore do
       :max_results,
       :continuation_token,
       :prefix,
-      :etag
+      :etag,
+      :retry_observer
     ])
   end
 
