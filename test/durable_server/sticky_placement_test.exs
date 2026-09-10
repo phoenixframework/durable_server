@@ -2,6 +2,7 @@ defmodule DurableServer.StickyPlacementTest do
   use ExUnit.Case, async: false
   import DurableServer.TestHelper
   alias DurableServer
+  alias DurableServer.{LifecycleManager, Meta, StoredState}
 
   defmodule StickyPlacementTestServer do
     use DurableServer, vsn: 1
@@ -840,4 +841,114 @@ defmodule DurableServer.StickyPlacementTest do
       System.delete_env("FLY_REGION")
     end
   end
+
+  describe "expired restart attempts" do
+    test "can be reclaimed before the matching fallback placement gate opens", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      machine_env = "TEST_EXPIRED_CLAIM_MACHINE"
+      region_env = "TEST_EXPIRED_CLAIM_REGION"
+      previous_machine = System.get_env(machine_env)
+      previous_region = System.get_env(region_env)
+
+      on_exit(fn ->
+        restore_env(machine_env, previous_machine)
+        restore_env(region_env, previous_region)
+      end)
+
+      System.put_env(machine_env, "replacement-machine")
+      System.put_env(region_env, "eu")
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         initial_discovery_delay_ms: 60_000,
+         discovery_interval_ms: 60_000,
+         sticky_placement: %{
+           StickyPlacementTestServer => [
+             TEST_EXPIRED_CLAIM_MACHINE: 60_000,
+             TEST_EXPIRED_CLAIM_REGION: 0
+           ]
+         }}
+      )
+
+      config = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "expired-claim-before-fallback-gate"
+      now = System.system_time(:millisecond)
+
+      stored_state = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: StickyPlacementTestServer,
+          permanent: true,
+          status: :running,
+          node_str: "dead-owner@test",
+          node_ref: System.unique_integer([:positive]),
+          pid: self(),
+          last_heartbeat_at: now - 1_000,
+          restart_attempt_node: "failed-claimer@test",
+          restart_attempt_time: now - 31_000,
+          restart_attempt_ttl: now - 1,
+          sticky_placement: [
+            %{env_var: machine_env, value: "dead-machine"},
+            %{env_var: region_env, value: "eu"}
+          ]
+        }
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 config.storage_backend,
+                 prefix <> key,
+                 stored_state
+               )
+
+      manager_pid =
+        supervisor_name
+        |> Supervisor.which_children()
+        |> Enum.find_value(fn
+          {LifecycleManager, pid, _type, _modules} -> pid
+          _child -> nil
+        end)
+
+      assert is_pid(manager_pid)
+      send(manager_pid, :discover_and_restart)
+
+      assert_eventually(fn ->
+        match?(
+          {pid, _meta} when is_pid(pid),
+          DurableServer.Supervisor.lookup(supervisor_name, key)
+        )
+      end)
+    end
+  end
+
+  defp assert_eventually(fun, timeout \\ 2_000) when is_function(fun, 0) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_assert_eventually(fun, deadline)
+  end
+
+  defp do_assert_eventually(fun, deadline) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("condition was not met within timeout")
+
+      true ->
+        Process.sleep(25)
+        do_assert_eventually(fun, deadline)
+    end
+  end
+
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
 end

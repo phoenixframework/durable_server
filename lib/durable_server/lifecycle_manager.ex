@@ -1903,7 +1903,6 @@ defmodule DurableServer.LifecycleManager do
 
               if restart_claim_node_eligible?(
                    meta,
-                   sticky_placement,
                    delays,
                    needs_restart,
                    node_unhealthy_or_full,
@@ -1928,7 +1927,6 @@ defmodule DurableServer.LifecycleManager do
 
   defp restart_claim_node_eligible?(
          %Meta{} = meta,
-         sticky_placement,
          delays,
          needs_restart,
          node_unhealthy_or_full,
@@ -1936,14 +1934,17 @@ defmodule DurableServer.LifecycleManager do
          candidate_health
        ) do
     cond do
+      # An expired restart claim must be reclaimable immediately by another node at
+      # an allowed sticky level. The prior claimant already passed placement gating;
+      # reapplying the time gate here can leave the server without a claim owner.
+      Meta.restart_attempt_expired?(meta) ->
+        matching_level != nil and
+          can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level)
+
       needs_restart ->
         matching_level != nil and
           can_claim_at_level?(meta, matching_level, delays) and
           can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level)
-
-      Meta.restart_attempt_expired?(meta) ->
-        can_node_accept_module?(candidate_health, meta.module, matching_level: matching_level) and
-          (sticky_placement in [nil, []] or matching_level != nil)
 
       node_unhealthy_or_full ->
         matching_level != nil and
@@ -2461,6 +2462,12 @@ defmodule DurableServer.LifecycleManager do
         (Meta.stopped_graceful?(meta) and meta.permanent)
 
     cond do
+      # A previous claimant that exceeded its TTL no longer owns the restart. Let
+      # another node at an allowed sticky level reclaim without waiting on the
+      # original placement gate again.
+      Meta.restart_attempt_expired?(meta) ->
+        my_matching_level != nil
+
       # Crashed or gracefully stopped permanent servers: claim if we match a sticky level (respecting timing)
       needs_restart && my_matching_level != nil ->
         # We match some level, check if enough time has passed for our level
@@ -2473,9 +2480,6 @@ defmodule DurableServer.LifecycleManager do
         # 3. We don't match any specific env var
         # Therefore, this node can NEVER claim this orphan.
         false
-
-      Meta.restart_attempt_expired?(meta) ->
-        true
 
       node_unhealthy_or_full ->
         # Node is unhealthy/full, check sticky placement
@@ -3314,6 +3318,8 @@ defmodule DurableServer.LifecycleManager do
 
   @doc """
   Finds nodes that can accept the given module, sorted by sticky placement preference and busyness.
+  For an existing server, fallback nodes are excluded until their cumulative sticky placement
+  time gate opens.
 
   Returns a list of node atoms that have capacity for the module, sorted by:
   1. Sticky placement preference (most specific match first)
@@ -3329,7 +3335,7 @@ defmodule DurableServer.LifecycleManager do
   ## Options
 
   - `:limit` - Maximum number of nodes to return (default: 3)
-  - `:key` - The server key, used to load augmented sticky placement preferences
+  - `:key` - The server key, used to load augmented sticky placement preferences and timing metadata
 
   ## Examples
 
@@ -3352,25 +3358,12 @@ defmodule DurableServer.LifecycleManager do
         key = Keyword.get(opts, :key)
         my_node = Node.self()
 
-        # Get sticky placement - prefer passed in opts (already augmented), otherwise load and augment
-        sticky_placement =
-          cond do
-            Keyword.has_key?(opts, :sticky_placement) ->
-              Keyword.get(opts, :sticky_placement)
+        # Get both the effective placement and its persisted metadata. Candidate
+        # selection needs the metadata heartbeat to enforce cumulative time gates.
+        {sticky_placement, sticky_meta} =
+          eligible_node_sticky_context(supervisor_name, module, key, opts)
 
-            key != nil ->
-              # Load and augment persisted sticky placement for existing servers
-              DurableServer.Supervisor.__get_augmented_sticky_placement__(
-                supervisor_name,
-                module,
-                key
-              )
-
-            true ->
-              # No key means this is for a new server - sticky placement doesn't apply yet
-              # since we don't know what env vars it will have until it starts
-              nil
-          end
+        delays = get_sticky_placement_delays(supervisor_name, module)
 
         now = System.system_time(:millisecond)
         future_skew_tolerance_ms = configured_future_skew_tolerance_ms(supervisor_name)
@@ -3418,7 +3411,12 @@ defmodule DurableServer.LifecycleManager do
         |> Enum.filter(fn {node, health, matching_level, _timestamp} ->
           node != my_node and
             can_node_accept_module?(health, module, matching_level: matching_level) and
-            (sticky_placement in [nil, []] or matching_level != nil)
+            sticky_candidate_gate_open?(
+              sticky_placement,
+              sticky_meta,
+              matching_level,
+              delays
+            )
         end)
         |> Enum.sort_by(fn {_node, health, matching_level, timestamp} ->
           level_priority = if matching_level == nil, do: 999, else: matching_level
@@ -3429,6 +3427,63 @@ defmodule DurableServer.LifecycleManager do
         |> Enum.take(limit)
         |> Enum.map(fn {node, _health, _matching_level, _timestamp} -> node end)
     end
+  end
+
+  defp eligible_node_sticky_context(supervisor_name, module, key, opts) do
+    cond do
+      Keyword.has_key?(opts, :sticky_placement) ->
+        {Keyword.get(opts, :sticky_placement), Keyword.get(opts, :sticky_meta)}
+
+      key != nil ->
+        config = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+        case DurableServer.fetch_stored_state(
+               config.storage_backend,
+               %{key: key, prefix: config.prefix},
+               consistent: false
+             ) do
+          {:ok, %StoredState{meta: %Meta{} = meta}} ->
+            meta = %{meta | key: key, prefix: config.prefix, supervisor: supervisor_name}
+
+            sticky_placement =
+              DurableServer.Supervisor.__augment_sticky_placement__(
+                supervisor_name,
+                module,
+                meta.sticky_placement
+              )
+
+            {sticky_placement, meta}
+
+          {:error, _reason} ->
+            {nil, nil}
+        end
+
+      true ->
+        # No key means this is for a new server. Sticky placement is captured
+        # only after the server starts.
+        {nil, nil}
+    end
+  end
+
+  defp sticky_candidate_gate_open?(sticky_placement, _meta, _matching_level, _delays)
+       when sticky_placement in [nil, []],
+       do: true
+
+  defp sticky_candidate_gate_open?(_sticky_placement, _meta, nil, _delays), do: false
+
+  # Exact placement is immediate and needs no timing context. Fail closed for
+  # fallback levels if a caller supplies placement without persisted metadata.
+  defp sticky_candidate_gate_open?(_sticky_placement, nil, matching_level, _delays),
+    do: matching_level == 0
+
+  defp sticky_candidate_gate_open?(
+         _sticky_placement,
+         %Meta{} = meta,
+         matching_level,
+         delays
+       ) do
+    Meta.restart_attempt_expired?(meta) ||
+      can_claim_at_level?(meta, matching_level, delays)
   end
 
   # Merge heartbeat data from S3 ETS cache and Group PG members.

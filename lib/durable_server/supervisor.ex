@@ -1626,13 +1626,16 @@ defmodule DurableServer.Supervisor do
        ) do
     key = Keyword.fetch!(init_arg, :key)
 
-    sticky_placement =
+    {sticky_placement, sticky_meta} =
       case boot_info_preloaded_object(boot_info) do
         %{body: body} ->
-          __get_augmented_sticky_placement__(supervisor, module, key, body)
+          {
+            __get_augmented_sticky_placement__(supervisor, module, key, body),
+            extract_meta_from_body(key, supervisor, body)
+          }
 
         nil ->
-          nil
+          {nil, nil}
       end
 
     candidate_limit =
@@ -1642,7 +1645,8 @@ defmodule DurableServer.Supervisor do
       LifecycleManager.find_eligible_nodes(supervisor, module,
         limit: candidate_limit,
         key: key,
-        sticky_placement: sticky_placement
+        sticky_placement: sticky_placement,
+        sticky_meta: sticky_meta
       )
       |> prioritize_placement_nodes(supervisor, max_retries)
 
@@ -1659,6 +1663,7 @@ defmodule DurableServer.Supervisor do
         try_nodes(supervisor, child_spec, nodes,
           key: key,
           sticky_placement: sticky_placement,
+          sticky_meta: sticky_meta,
           deadline: deadline
         )
     end
@@ -1933,7 +1938,8 @@ defmodule DurableServer.Supervisor do
           LifecycleManager.find_eligible_nodes(supervisor, module,
             limit: 3,
             key: Keyword.get(placement_opts, :key),
-            sticky_placement: Keyword.get(placement_opts, :sticky_placement)
+            sticky_placement: Keyword.get(placement_opts, :sticky_placement),
+            sticky_meta: Keyword.get(placement_opts, :sticky_meta)
           )
           |> prioritize_placement_nodes(supervisor, 3)
 

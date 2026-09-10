@@ -2,6 +2,7 @@ defmodule DurableServer.RemotePlacementTest do
   use ExUnit.Case, async: false
   import DurableServer.TestHelper
   alias DurableServer
+  alias DurableServer.{LifecycleManager, Meta, StoredState}
 
   @moduletag :capture_log
 
@@ -126,6 +127,96 @@ defmodule DurableServer.RemotePlacementTest do
 
       # Empty since no remote nodes available in test
       assert length(nodes) <= 1
+    end
+
+    test "does not return a fallback node before its sticky placement gate opens", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         sticky_placement: %{
+           RemotePlacementTestServer => [
+             TEST_STICKY_MACHINE: 60_000,
+             TEST_STICKY_REGION: 0
+           ]
+         }}
+      )
+
+      config = DurableServer.Supervisor.__get_config__(supervisor_name)
+      key = "time-gated-remote-fallback"
+      now = System.system_time(:millisecond)
+
+      stored_state = %StoredState{
+        vsn: 1,
+        state: %{},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: RemotePlacementTestServer,
+          permanent: true,
+          status: :running,
+          node_str: "preferred@test",
+          node_ref: System.unique_integer([:positive]),
+          pid: self(),
+          last_heartbeat_at: now - 1_000,
+          sticky_placement: [
+            %{env_var: "TEST_STICKY_MACHINE", value: "preferred-machine"},
+            %{env_var: "TEST_STICKY_REGION", value: "eu"}
+          ]
+        }
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 config.storage_backend,
+                 prefix <> key,
+                 stored_state
+               )
+
+      fallback_node = :fallback@test
+      heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
+
+      :ets.insert(
+        heartbeat_table,
+        {to_string(fallback_node), System.unique_integer([:positive]), now, nil, nil,
+         %{
+           "TEST_STICKY_MACHINE" => "fallback-machine",
+           "TEST_STICKY_REGION" => "eu"
+         }, nil}
+      )
+
+      assert [] =
+               LifecycleManager.find_eligible_nodes(
+                 supervisor_name,
+                 RemotePlacementTestServer,
+                 key: key,
+                 limit: 3
+               )
+
+      unlocked_state = %{
+        stored_state
+        | meta: %{stored_state.meta | last_heartbeat_at: now - 61_000}
+      }
+
+      assert {:ok, _} =
+               DurableServer.StorageBackend.put_object(
+                 config.storage_backend,
+                 prefix <> key,
+                 unlocked_state
+               )
+
+      assert [^fallback_node] =
+               LifecycleManager.find_eligible_nodes(
+                 supervisor_name,
+                 RemotePlacementTestServer,
+                 key: key,
+                 limit: 3
+               )
     end
   end
 
