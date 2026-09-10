@@ -1837,13 +1837,19 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp try_nodes(supervisor, child_spec, nodes, placement_opts \\ [])
+  defp try_nodes(supervisor, child_spec, nodes, placement_opts \\ []) do
+    if LifecycleManager.discovery_degraded?(supervisor) do
+      {:error, {:capacity_limit, :discovery_degraded}}
+    else
+      do_try_nodes(supervisor, child_spec, nodes, placement_opts)
+    end
+  end
 
-  defp try_nodes(_supervisor, _child_spec, [], _placement_opts) do
+  defp do_try_nodes(_supervisor, _child_spec, [], _placement_opts) do
     {:error, {:capacity_limit, :all_placement_attempts_failed}}
   end
 
-  defp try_nodes(
+  defp do_try_nodes(
          supervisor,
          {module, _init_arg, _boot_info} = child_spec,
          [node | rest],

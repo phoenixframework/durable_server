@@ -43,7 +43,7 @@ defmodule DurableServer.LifecycleManager do
   - `:crashed` - Server crashed or failed, always restart
 
   ### Discovery Process
-  1. Write node heartbeat and refresh heartbeat cache
+  1. Write node heartbeats and independently reconcile the heartbeat cache
   2. List all DurableServer objects from ObjectStore (paginated with continuation tokens)
   3. Check health using check_server_health/2 (uses group + heartbeat cache)
   4. Apply consistent hashing to determine which servers this node should handle
@@ -94,6 +94,8 @@ defmodule DurableServer.LifecycleManager do
   - Discovery continues if individual object reads fail (logged but skipped)
   - List operations retried at the GenServer level
   - Atomic claim failures are treated as "already claimed" rather than errors
+  - Partial heartbeat reconciliation retains the last complete cache snapshot and
+    disables takeovers and remote placement until a complete refresh succeeds
   """
 
   use GenServer
@@ -115,6 +117,7 @@ defmodule DurableServer.LifecycleManager do
             node_module: nil,
             current_discovery_task: nil,
             current_heartbeat_task: nil,
+            current_heartbeat_reconcile_task: nil,
             heartbeat_table: nil,
             discovery_interval_ms: nil,
             initial_discovery_delay_ms: nil,
@@ -133,6 +136,7 @@ defmodule DurableServer.LifecycleManager do
             discovery_skip_table: nil,
             restart_gate_table: nil,
             discovery_stopped: false,
+            discovery_degraded: false,
             discovery_burst_remaining: 0,
             discovery_shuffle_batch_size: nil,
             parallel_restart_batch_size: nil,
@@ -187,6 +191,7 @@ defmodule DurableServer.LifecycleManager do
   Returns a map with:
   - `:last_heartbeat_timing` - The timing from the last successful heartbeat (put_ms, cache_ms, total_ms)
   - `:last_successful_heartbeat_at` - Timestamp of last successful heartbeat
+  - `:discovery_degraded` - Whether an incomplete heartbeat snapshot is gating discovery
   - `:node` - This node's name
 
   This is used by the admin dashboard to monitor heartbeat health across the cluster.
@@ -410,6 +415,7 @@ defmodule DurableServer.LifecycleManager do
       node_module: Keyword.get(opts, :node_module, Node),
       current_discovery_task: nil,
       current_heartbeat_task: nil,
+      current_heartbeat_reconcile_task: nil,
       heartbeat_table: hearbeat_tab,
       discovery_interval_ms: config.discovery_interval_ms,
       initial_discovery_delay_ms: config.initial_discovery_delay_ms,
@@ -431,6 +437,10 @@ defmodule DurableServer.LifecycleManager do
       restart_claim_gate_expand_after_ms: config.restart_claim_gate_expand_after_ms,
       restart_claim_gate_disable_after_ms: config.restart_claim_gate_disable_after_ms
     }
+
+    # Fail closed while the initial heartbeat snapshot is being established.
+    # A complete reconciliation below clears this shared gate before init returns.
+    set_discovery_degraded_marker(state, true)
 
     :ok =
       :pg.join(
@@ -458,14 +468,17 @@ defmodule DurableServer.LifecycleManager do
 
     state = maybe_start_heartbeat_subscription(state)
 
-    if state.heartbeat_tracking_mode == :subscribe do
-      Process.send_after(self(), :heartbeat_reconcile, state.heartbeat_reconcile_interval_ms)
-    end
+    Process.send_after(self(), :heartbeat_reconcile, heartbeat_reconcile_delay_ms(state))
 
     # we MUST start with a populated node heartbeat cache
-    # perform_heartbeat writes our heartbeat and refreshes the node health cache
-    {timing, heartbeat_entry, heartbeat_monotonic_at} =
-      perform_heartbeat(state, refresh_cache?: true)
+    {timing, heartbeat_entry, heartbeat_monotonic_at} = perform_heartbeat(state)
+    {cache_duration, cache_status} = refresh_heartbeat_cache_with_timing(state)
+
+    timing = %{
+      timing
+      | cache_ms: cache_duration,
+        total_ms: timing.total_ms + cache_duration
+    }
 
     # Join Group with heartbeat data so other nodes see us instantly via peer_connect.
     # S3 is the source of truth for liveness; Group is the fast path for discovery.
@@ -479,13 +492,16 @@ defmodule DurableServer.LifecycleManager do
         heartbeat_hard_deadline_ms(state)
       )
 
-    {:ok,
-     %{
-       state
-       | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
-         last_successful_heartbeat_monotonic_at: heartbeat_monotonic_at,
-         last_heartbeat_timing: timing
-     }}
+    state =
+      %{
+        state
+        | last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
+          last_successful_heartbeat_monotonic_at: heartbeat_monotonic_at,
+          last_heartbeat_timing: timing
+      }
+      |> apply_heartbeat_cache_status(cache_status)
+
+    {:ok, state}
   end
 
   @impl true
@@ -508,9 +524,9 @@ defmodule DurableServer.LifecycleManager do
       task =
         Task.Supervisor.async(state.task_sup, fn ->
           :ok = HeartbeatWatchdog.track_heartbeat_task(heartbeat_watchdog, owner, self())
-          {timing, heartbeat_entry, heartbeat_monotonic_at} = perform_heartbeat(state)
 
-          HeartbeatWatchdog.renew(heartbeat_watchdog, owner, heartbeat_monotonic_at)
+          {timing, heartbeat_entry, heartbeat_monotonic_at} =
+            perform_heartbeat(state, watchdog_owner: owner)
 
           {:heartbeat, {timing, heartbeat_entry, heartbeat_monotonic_at}}
         end)
@@ -557,25 +573,20 @@ defmodule DurableServer.LifecycleManager do
 
   def handle_info(
         :heartbeat_reconcile,
-        %LifecycleManager{heartbeat_tracking_mode: :subscribe} = state
+        %LifecycleManager{current_heartbeat_reconcile_task: nil} = state
       ) do
-    Task.Supervisor.start_child(state.task_sup, fn ->
-      case refresh_node_heartbeat_cache(state) do
-        {:ok, _count, _cleaned_count, error_count} when error_count > 0 ->
-          log(state, :warning, fn ->
-            "Heartbeat reconcile observed #{error_count} heartbeat fetch error(s)"
-          end)
+    task =
+      Task.Supervisor.async_nolink(state.task_sup, fn ->
+        {_cache_duration, cache_status} = refresh_heartbeat_cache_with_timing(state)
+        {:heartbeat_reconcile, cache_status}
+      end)
 
-        {:ok, _count, _cleaned_count, _error_count} ->
-          :ok
-      end
-    end)
-
-    Process.send_after(self(), :heartbeat_reconcile, state.heartbeat_reconcile_interval_ms)
-    {:noreply, state}
+    Process.send_after(self(), :heartbeat_reconcile, heartbeat_reconcile_delay_ms(state))
+    {:noreply, %{state | current_heartbeat_reconcile_task: task}}
   end
 
   def handle_info(:heartbeat_reconcile, %LifecycleManager{} = state) do
+    Process.send_after(self(), :heartbeat_reconcile, heartbeat_reconcile_delay_ms(state))
     {:noreply, state}
   end
 
@@ -586,6 +597,11 @@ defmodule DurableServer.LifecycleManager do
   end
 
   def handle_info(:discover_and_restart, %LifecycleManager{discovery_stopped: true} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info(:discover_and_restart, %LifecycleManager{discovery_degraded: true} = state) do
+    Process.send_after(self(), :discover_and_restart, state.discovery_interval_ms)
     {:noreply, state}
   end
 
@@ -647,14 +663,30 @@ defmodule DurableServer.LifecycleManager do
       end)
     end
 
-    {:noreply,
-     %{
-       state
-       | current_heartbeat_task: nil,
-         last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
-         last_successful_heartbeat_monotonic_at: heartbeat_monotonic_at,
-         last_heartbeat_timing: timing
-     }}
+    state = %{
+      state
+      | current_heartbeat_task: nil,
+        last_successful_heartbeat_at: heartbeat_entry_timestamp(heartbeat_entry),
+        last_successful_heartbeat_monotonic_at: heartbeat_monotonic_at,
+        last_heartbeat_timing: timing
+    }
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {ref, {:heartbeat_reconcile, cache_status}},
+        %LifecycleManager{current_heartbeat_reconcile_task: %Task{ref: ref}} = state
+      ) do
+    Process.demonitor(ref, [:flush])
+
+    state =
+      apply_heartbeat_cache_status(
+        %{state | current_heartbeat_reconcile_task: nil},
+        cache_status
+      )
+
+    {:noreply, state}
   end
 
   def handle_info(
@@ -684,6 +716,23 @@ defmodule DurableServer.LifecycleManager do
     end)
 
     {:stop, {:heartbeat_failed, reason}, state}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, reason},
+        %LifecycleManager{current_heartbeat_reconcile_task: %Task{ref: ref}} = state
+      ) do
+    log(state, :error, fn ->
+      "heartbeat cache reconciliation task failed: #{inspect(reason)}"
+    end)
+
+    state =
+      apply_heartbeat_cache_status(
+        %{state | current_heartbeat_reconcile_task: nil},
+        {:partial, 1}
+      )
+
+    {:noreply, state}
   end
 
   @impl true
@@ -750,7 +799,8 @@ defmodule DurableServer.LifecycleManager do
       deadline_ms: heartbeat_hard_deadline_ms(state),
       resources: resources,
       capacity: capacity,
-      heartbeat_meta: heartbeat_meta
+      heartbeat_meta: heartbeat_meta,
+      discovery_degraded: state.discovery_degraded or discovery_degraded?(state.supervisor_name)
     }
 
     {:reply, metrics, state}
@@ -765,8 +815,8 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp perform_heartbeat(%LifecycleManager{} = state, opts \\ []) do
-    opts = Keyword.validate!(opts, [:refresh_cache?])
-    refresh_cache? = Keyword.get(opts, :refresh_cache?, state.heartbeat_tracking_mode == :poll)
+    opts = Keyword.validate!(opts, [:watchdog_owner])
+    watchdog_owner = Keyword.get(opts, :watchdog_owner)
     start_time = System.monotonic_time(:millisecond)
 
     # Do the critical heartbeat PUT inline
@@ -775,6 +825,8 @@ defmodule DurableServer.LifecycleManager do
     {heartbeat_entry, heartbeat_monotonic_at} =
       case write_node_heartbeat(state) do
         {:ok, {entry, monotonic_at}} ->
+          renew_heartbeat_watchdog(state, watchdog_owner, monotonic_at)
+
           log(state, :debug, fn ->
             put_duration = System.monotonic_time(:millisecond) - put_start
             "Node heartbeat written successfully in #{put_duration}ms"
@@ -793,49 +845,65 @@ defmodule DurableServer.LifecycleManager do
 
     put_duration = System.monotonic_time(:millisecond) - put_start
 
-    cache_duration =
-      if refresh_cache? do
-        refresh_heartbeat_cache_with_timing!(state)
-      else
-        0
-      end
-
     :ok = CircuitBreaker.prune_stale_entries(state.circuit_breaker)
 
     total_duration = System.monotonic_time(:millisecond) - start_time
 
     {
-      %{put_ms: put_duration, cache_ms: cache_duration, total_ms: total_duration},
+      %{put_ms: put_duration, cache_ms: 0, total_ms: total_duration},
       heartbeat_entry,
       heartbeat_monotonic_at
     }
   end
 
-  defp refresh_heartbeat_cache_with_timing!(%LifecycleManager{} = state) do
+  defp renew_heartbeat_watchdog(%LifecycleManager{} = state, owner, heartbeat_monotonic_at)
+       when is_pid(owner) do
+    # Cache reconciliation is not part of our liveness contract, so renewing the
+    # watchdog must not wait for the cluster read to finish.
+    HeartbeatWatchdog.renew(
+      state.heartbeat_watchdog,
+      owner,
+      heartbeat_monotonic_at
+    )
+  end
+
+  defp renew_heartbeat_watchdog(
+         %LifecycleManager{},
+         _owner,
+         _heartbeat_monotonic_at
+       ),
+       do: :ok
+
+  defp refresh_heartbeat_cache_with_timing(%LifecycleManager{} = state) do
     cache_start = System.monotonic_time(:millisecond)
     cache_result = refresh_node_heartbeat_cache(state)
     cache_duration = System.monotonic_time(:millisecond) - cache_start
 
     case cache_result do
-      {:ok, _count, _cleaned_count, error_count} when error_count > 0 ->
-        # A partial view of the cluster is dangerous - we could incorrectly treat
-        # healthy nodes as expired and steal their locks
-        raise RuntimeError,
-              "failed to refresh heartbeat cache: #{error_count} heartbeat fetch errors"
+      {:partial, count, _cleaned_count, error_count} ->
+        # Close the shared takeover/placement gate from the reconciliation task
+        # before its result waits in the lifecycle manager mailbox.
+        set_discovery_degraded_marker(state, true)
+
+        log(state, :warning, fn ->
+          "Heartbeat cache reconciliation was partial (#{error_count} error(s), #{count} node(s) read); retaining the last complete snapshot"
+        end)
+
+        {cache_duration, {:partial, error_count}}
 
       {:ok, count, cleaned_count, _error_count} when cleaned_count > 0 ->
         log(state, :debug, fn ->
           "Refreshed heartbeat cache with #{count} nodes, cleaned up #{cleaned_count} dead nodes in #{cache_duration}ms"
         end)
 
-        cache_duration
+        {cache_duration, :complete}
 
       {:ok, count, _cleaned_count, _error_count} ->
         log(state, :debug, fn ->
           "Refreshed heartbeat cache with #{count} nodes in #{cache_duration}ms"
         end)
 
-        cache_duration
+        {cache_duration, :complete}
     end
   end
 
@@ -1139,6 +1207,83 @@ defmodule DurableServer.LifecycleManager do
     _ -> false
   end
 
+  defp heartbeat_reconcile_delay_ms(
+         %LifecycleManager{heartbeat_tracking_mode: :subscribe} = state
+       ),
+       do: state.heartbeat_reconcile_interval_ms
+
+  defp heartbeat_reconcile_delay_ms(%LifecycleManager{} = state),
+    do: state.heartbeat_interval_ms
+
+  defp apply_heartbeat_cache_status(
+         %LifecycleManager{discovery_degraded: true} = state,
+         :complete
+       ) do
+    set_discovery_degraded_marker(state, false)
+
+    log(state, :info, fn ->
+      "Heartbeat cache reconciliation recovered; resuming discovery and remote placement"
+    end)
+
+    %{state | discovery_degraded: false}
+  end
+
+  defp apply_heartbeat_cache_status(%LifecycleManager{} = state, :complete) do
+    set_discovery_degraded_marker(state, false)
+    state
+  end
+
+  defp apply_heartbeat_cache_status(
+         %LifecycleManager{discovery_degraded: true} = state,
+         {:partial, _error_count}
+       ),
+       do: state
+
+  defp apply_heartbeat_cache_status(
+         %LifecycleManager{} = state,
+         {:partial, error_count}
+       ) do
+    # Publish the gate before the GenServer state transition. Discovery runs in a
+    # separate task, and placement/lock checks can run in arbitrary callers.
+    set_discovery_degraded_marker(state, true)
+    :ets.delete_all_objects(state.restart_gate_table)
+
+    log(state, :warning, fn ->
+      "Entering discovery_degraded after #{error_count} heartbeat cache reconciliation error(s); " <>
+        "orphan detection, lock stealing, and remote placement are disabled"
+    end)
+
+    %{state | discovery_degraded: true}
+  end
+
+  defp set_discovery_degraded_marker(%LifecycleManager{} = state, value)
+       when is_boolean(value) do
+    table_name =
+      case state.config do
+        %{ets_table: table_name} -> table_name
+        _ -> DurableServer.Supervisor.__ets_table_name__(state.supervisor_name)
+      end
+
+    :ets.insert(table_name, {:discovery_degraded, value})
+    :ok
+  end
+
+  @doc false
+  def discovery_degraded?(supervisor_name) when is_atom(supervisor_name) do
+    table_name = DurableServer.Supervisor.__ets_table_name__(supervisor_name)
+    match?([{:discovery_degraded, true}], :ets.lookup(table_name, :discovery_degraded))
+  rescue
+    # If the supervisor's coordination table is unavailable, no caller has a
+    # complete heartbeat view from which it can safely take over a lock.
+    ArgumentError -> true
+  end
+
+  defp discovery_takeovers_allowed?(%LifecycleManager{discovery_degraded: true}), do: false
+
+  defp discovery_takeovers_allowed?(%LifecycleManager{} = state) do
+    not discovery_degraded?(state.supervisor_name)
+  end
+
   # this gets run async inside a task
   defp refresh_node_heartbeat_cache(%LifecycleManager{} = state) do
     dead_node_threshold_ms = state.config.dead_node_threshold_ms
@@ -1228,8 +1373,9 @@ defmodule DurableServer.LifecycleManager do
       end)
     end
 
-    error_count = length(errors)
-    listing_complete? = errors == [] and :counters.get(warnings_counter, 1) == 0
+    listing_error_count = :counters.get(warnings_counter, 1)
+    error_count = length(errors) + listing_error_count
+    listing_complete? = error_count == 0
 
     # extract heartbeat data for alive nodes
     live_heartbeats =
@@ -1238,37 +1384,46 @@ defmodule DurableServer.LifecycleManager do
         {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
       end)
 
-    # attempt to clean up dead nodes (race conditions are OK, delete might fail)
-    cleaned_count =
-      dead_nodes
-      |> Enum.map(fn {:dead, key, node, _node_ref, _timestamp} ->
-        :ets.delete(state.heartbeat_table, node)
-
-        case StorageBackend.delete_object(state.heartbeat_store, key) do
-          :ok ->
-            log(state, :info, fn -> "Cleaned up dead node heartbeat: #{node}" end)
-            1
-
-          {:error, reason} ->
-            # race condition or other error - another node might have cleaned it up
-            log(state, :info, fn ->
-              "Failed to clean up dead node heartbeat #{inspect(node)}: #{inspect(reason)}"
-            end)
-
-            0
-        end
-      end)
-      |> Enum.sum()
-
-    :ets.insert(state.heartbeat_table, live_heartbeats)
-
-    # The listing must be complete, otherwise nodes missing from
-    # `live_heartbeats` would look prunable
     if listing_complete? do
+      # Do not mutate the cache until every listed heartbeat has been read.
+      # This makes the existing ETS contents the last complete snapshot.
+      cleaned_count = cleanup_dead_node_heartbeats(state, dead_nodes)
+      :ets.insert(state.heartbeat_table, live_heartbeats)
       prune_orphaned_heartbeat_entries(state, seen_nodes, current_time, dead_node_threshold_ms)
-    end
 
-    {:ok, length(live_heartbeats), cleaned_count, error_count}
+      {:ok, length(live_heartbeats), cleaned_count, 0}
+    else
+      {:partial, length(live_heartbeats), 0, error_count}
+    end
+  end
+
+  defp cleanup_dead_node_heartbeats(%LifecycleManager{} = state, dead_nodes) do
+    dead_nodes
+    |> Enum.map(fn {:dead, key, node, _node_ref, _timestamp} ->
+      :ets.delete(state.heartbeat_table, node)
+
+      delete_result =
+        try do
+          StorageBackend.delete_object(state.heartbeat_store, key)
+        catch
+          kind, reason -> {:error, {kind, reason}}
+        end
+
+      case delete_result do
+        :ok ->
+          log(state, :info, fn -> "Cleaned up dead node heartbeat: #{node}" end)
+          1
+
+        {:error, reason} ->
+          # race condition or other error - another node might have cleaned it up
+          log(state, :info, fn ->
+            "Failed to clean up dead node heartbeat #{inspect(node)}: #{inspect(reason)}"
+          end)
+
+          0
+      end
+    end)
+    |> Enum.sum()
   end
 
   defp process_heartbeat_list_entry(
@@ -2028,6 +2183,18 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp discover_and_restart_servers(%LifecycleManager{} = state) do
+    if discovery_takeovers_allowed?(state) do
+      do_discover_and_restart_servers(state)
+    else
+      log(state, :debug, fn ->
+        "Skipping discovery while heartbeat cache reconciliation is degraded"
+      end)
+
+      :ok
+    end
+  end
+
+  defp do_discover_and_restart_servers(%LifecycleManager{} = state) do
     diagnostics_before = discovery_diag_snapshot(state)
     restart_gate_config = restart_claim_gate_config(state)
     skip_count = :ets.info(state.discovery_skip_table, :size)
@@ -2403,19 +2570,23 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp appears_restartable?(%LifecycleManager{} = state, %Meta{} = meta) do
-    case check_server_health(state, meta) do
-      :healthy ->
-        false
+    if discovery_takeovers_allowed?(state) do
+      case check_server_health(state, meta) do
+        :healthy ->
+          false
 
-      {:orphaned, claim_context} ->
-        # server is orphaned, check if this node should handle it
-        if orphan_claimable?(meta), do: {:restartable, claim_context}, else: false
+        {:orphaned, claim_context} ->
+          # server is orphaned, check if this node should handle it
+          if orphan_claimable?(meta), do: {:restartable, claim_context}, else: false
 
-      :orphaned ->
-        if orphan_claimable?(meta), do: {:restartable, :check_lock}, else: false
+        :orphaned ->
+          if orphan_claimable?(meta), do: {:restartable, :check_lock}, else: false
 
-      :transient ->
-        :transient
+        :transient ->
+          :transient
+      end
+    else
+      :transient
     end
   end
 
@@ -2631,6 +2802,20 @@ defmodule DurableServer.LifecycleManager do
          %StoredState{meta: %Meta{} = meta} = stored_state,
          claim_context
        ) do
+    if discovery_takeovers_allowed?(state) do
+      do_attempt_restart(state, meta, stored_state, claim_context)
+    else
+      report_diagnostic(state.supervisor_name, :restart_claim_discovery_degraded)
+      :ok
+    end
+  end
+
+  defp do_attempt_restart(
+         %LifecycleManager{} = state,
+         %Meta{} = meta,
+         %StoredState{} = stored_state,
+         claim_context
+       ) do
     claim_opts = [ttl: restart_claim_ttl_ms(state)]
 
     claim_result =
@@ -2818,6 +3003,14 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp fetch_orphaned_slow_path(%Meta{} = meta) do
+    if discovery_degraded?(meta.supervisor) do
+      :transient
+    else
+      do_fetch_orphaned_slow_path(meta)
+    end
+  end
+
+  defp do_fetch_orphaned_slow_path(%Meta{} = meta) do
     report_diagnostic(meta.supervisor, :slow_path_lock_checks)
     node_health = lookup_node_health(meta)
     lock_result = DurableServer.check_lock_status(meta)
@@ -2854,6 +3047,7 @@ defmodule DurableServer.LifecycleManager do
   defp transient_lock_check_error?({:error, reason}), do: conflict_consistent_read_error?(reason)
   defp transient_lock_check_error?(_), do: false
 
+  defp conflict_consistent_read_error?(:discovery_degraded), do: true
   defp conflict_consistent_read_error?(:conflict), do: true
   defp conflict_consistent_read_error?(":conflict"), do: true
 
@@ -3341,6 +3535,14 @@ defmodule DurableServer.LifecycleManager do
 
   """
   def find_eligible_nodes(supervisor_name, module, opts \\ []) when is_atom(supervisor_name) do
+    if discovery_degraded?(supervisor_name) do
+      []
+    else
+      find_eligible_nodes_from_cache(supervisor_name, module, opts)
+    end
+  end
+
+  defp find_eligible_nodes_from_cache(supervisor_name, module, opts) do
     heartbeat_table = heartbeat_table_name(supervisor_name)
     # Handle case where table doesn't exist yet during startup
     case :ets.whereis(heartbeat_table) do

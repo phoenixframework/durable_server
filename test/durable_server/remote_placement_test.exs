@@ -127,6 +127,42 @@ defmodule DurableServer.RemotePlacementTest do
       # Empty since no remote nodes available in test
       assert length(nodes) <= 1
     end
+
+    test "returns no candidates while discovery is degraded", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{:total => 100}}
+      )
+
+      config = DurableServer.Supervisor.__get_config__(supervisor_name)
+      heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
+      remote_node = :"remote_#{:erlang.unique_integer([:positive])}@host"
+
+      :ets.insert(
+        heartbeat_table,
+        {to_string(remote_node), 1, System.system_time(:millisecond), nil, nil, %{}, nil}
+      )
+
+      assert [remote_node] ==
+               DurableServer.LifecycleManager.find_eligible_nodes(
+                 supervisor_name,
+                 RemotePlacementTestServer
+               )
+
+      :ets.insert(config.ets_table, {:discovery_degraded, true})
+
+      assert [] ==
+               DurableServer.LifecycleManager.find_eligible_nodes(
+                 supervisor_name,
+                 RemotePlacementTestServer
+               )
+    end
   end
 
   describe "start_child with max_placement_retries" do

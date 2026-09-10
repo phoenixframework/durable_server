@@ -250,28 +250,55 @@ defmodule DurableServer.LifecycleTest do
     def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
 
     @impl true
-    def get_object(%{delegate: delegate}, key, opts),
-      do: StorageBackend.get_object(delegate, key, opts)
+    def get_object(%{delegate: delegate} = state, key, opts) do
+      if current_mode(state) == :fetch_error and key == state.inject_key do
+        {:error, :simulated_fetch_failure}
+      else
+        StorageBackend.get_object(delegate, key, opts)
+      end
+    end
 
     @impl true
     def list_all_objects_stream(%{delegate: delegate} = state, prefix, opts) do
       stream = StorageBackend.list_all_objects_stream(delegate, prefix, opts)
 
       if prefix == state.heartbeat_prefix do
-        inject_list_fault(stream, state, opts)
+        inject_list_fault(stream, current_mode(state), state, opts)
       else
         stream
       end
     end
 
-    defp inject_list_fault(stream, %{mode: :truncate}, opts) do
+    defp inject_list_fault(stream, :truncate, _state, opts) do
       error_handler = Keyword.get(opts, :error_handler, fn _reason -> :continue end)
       Stream.concat(stream, reported_error_stream(error_handler, :simulated_page_failure))
     end
 
-    defp inject_list_fault(stream, %{mode: :inject_key} = state, _opts) do
+    defp inject_list_fault(stream, :inject_key, state, _opts) do
       Stream.concat(stream, [%{key: state.inject_key}])
     end
+
+    defp inject_list_fault(stream, :fetch_error, state, _opts) do
+      Stream.concat(stream, [%{key: state.inject_key}])
+    end
+
+    defp inject_list_fault(stream, {:block, notify_pid}, _state, _opts) do
+      send(notify_pid, {:heartbeat_cache_refresh_blocked, self()})
+
+      receive do
+        :continue_heartbeat_cache_refresh -> stream
+      after
+        5_000 -> raise "timed out waiting to continue heartbeat cache refresh"
+      end
+    end
+
+    defp inject_list_fault(stream, :ok, _state, _opts), do: stream
+
+    defp current_mode(%{mode: {:controlled, table}}) do
+      :ets.lookup_element(table, :mode, 2)
+    end
+
+    defp current_mode(%{mode: mode}), do: mode
 
     defp reported_error_stream(error_handler, reason) do
       Stream.flat_map([reason], fn reason ->
@@ -1945,6 +1972,18 @@ defmodule DurableServer.LifecycleTest do
     end)
   end
 
+  defp await_heartbeat_reconciliation(manager_pid) do
+    send(manager_pid, :heartbeat_reconcile)
+
+    # This call reaches the manager after the reconciliation message, proving
+    # that the task was either started or completed.
+    _ = :sys.get_state(manager_pid)
+
+    assert_eventually(fn ->
+      :sys.get_state(manager_pid).current_heartbeat_reconcile_task == nil
+    end)
+  end
+
   defp seed_peer_heartbeat(config, prefix, node, current_time) do
     ObjectStore.put_object(
       config.object_store,
@@ -2844,6 +2883,85 @@ defmodule DurableServer.LifecycleTest do
       GenServer.stop(manager_pid)
     end
 
+    test "continues heartbeat PUTs while cache reconciliation is blocked", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      config: config
+    } do
+      control = :ets.new(__MODULE__.HeartbeatListBackend, [:set, :public])
+      :ets.insert(control, {:mode, :ok})
+
+      heartbeat_store =
+        heartbeat_list_store(config, prefix,
+          mode: {:controlled, control},
+          inject_key: "#{prefix}__nodes/injected@test"
+        )
+
+      {:ok, manager_pid} =
+        start_standalone_lifecycle_manager(supervisor_name, config,
+          heartbeat_store: heartbeat_store
+        )
+
+      manager_state = :sys.get_state(manager_pid)
+      watchdog = manager_state.heartbeat_watchdog
+      previous_watchdog_heartbeat = :sys.get_state(watchdog).last_heartbeat_at
+
+      :ets.insert(control, {:mode, {:block, self()}})
+      send(manager_pid, :heartbeat_reconcile)
+
+      assert_receive {:heartbeat_cache_refresh_blocked, reconcile_task_pid}, 1_000
+      reconcile_task = :sys.get_state(manager_pid).current_heartbeat_reconcile_task
+      assert reconcile_task.pid == reconcile_task_pid
+
+      Process.sleep(2)
+      await_heartbeat_cycle(manager_pid)
+
+      first_heartbeat = :sys.get_state(manager_pid).last_successful_heartbeat_monotonic_at
+      assert :sys.get_state(watchdog).last_heartbeat_at > previous_watchdog_heartbeat
+      assert :sys.get_state(manager_pid).current_heartbeat_reconcile_task == reconcile_task
+
+      Process.sleep(2)
+      await_heartbeat_cycle(manager_pid)
+
+      assert :sys.get_state(manager_pid).last_successful_heartbeat_monotonic_at >
+               first_heartbeat
+
+      assert :sys.get_state(manager_pid).current_heartbeat_reconcile_task == reconcile_task
+
+      send(reconcile_task_pid, :continue_heartbeat_cache_refresh)
+
+      assert_eventually(fn ->
+        :sys.get_state(manager_pid).current_heartbeat_reconcile_task == nil
+      end)
+
+      GenServer.stop(manager_pid)
+    end
+
+    test "starts in degraded mode when the initial heartbeat snapshot is partial", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix,
+      config: config
+    } do
+      heartbeat_store =
+        heartbeat_list_store(config, prefix,
+          mode: :fetch_error,
+          inject_key: "#{prefix}__nodes/failed-peer@test"
+        )
+
+      assert {:ok, manager_pid} =
+               start_standalone_lifecycle_manager(supervisor_name, config,
+                 heartbeat_store: heartbeat_store
+               )
+
+      manager_state = :sys.get_state(manager_pid)
+      assert manager_state.discovery_degraded
+      assert is_integer(manager_state.last_successful_heartbeat_monotonic_at)
+      assert LifecycleManager.discovery_degraded?(manager_state.supervisor_name)
+      assert Process.alive?(manager_pid)
+
+      GenServer.stop(manager_pid)
+    end
+
     test "retries retryable heartbeat write failures until success within deadline", %{
       supervisor_name: supervisor_name,
       config: config
@@ -3043,11 +3161,7 @@ defmodule DurableServer.LifecycleTest do
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, test_config)
 
-      # Trigger heartbeat cycle which should clean up dead nodes
-      send(manager_pid, :heartbeat)
-
-      # Give some time for the heartbeat task to complete
-      Process.sleep(200)
+      await_heartbeat_reconciliation(manager_pid)
 
       # Verify alive node still exists
       {:ok, _} = ObjectStore.get_object(config.object_store, "#{prefix}__nodes/#{alive_node}")
@@ -3077,7 +3191,7 @@ defmodule DurableServer.LifecycleTest do
       heartbeat_table = :sys.get_state(manager_pid).heartbeat_table
       insert_stale_heartbeat(heartbeat_table, orphan_node, current_time)
 
-      await_heartbeat_cycle(manager_pid)
+      await_heartbeat_reconciliation(manager_pid)
 
       assert :ets.lookup(heartbeat_table, orphan_node) == []
       assert :ets.lookup(heartbeat_table, peer_node) != []
@@ -3085,7 +3199,7 @@ defmodule DurableServer.LifecycleTest do
       GenServer.stop(manager_pid)
     end
 
-    test "does not prune cached heartbeat entries when the listing was truncated by an error", %{
+    test "retains the last complete heartbeat snapshot when a listing is truncated", %{
       supervisor_name: supervisor_name,
       prefix: prefix,
       config: config
@@ -3095,19 +3209,110 @@ defmodule DurableServer.LifecycleTest do
       orphan_node = "orphan-truncated@test"
 
       seed_peer_heartbeat(config, prefix, peer_node, current_time)
+      control = :ets.new(__MODULE__.HeartbeatListBackend, [:set, :public])
+      :ets.insert(control, {:mode, :ok})
 
       {:ok, manager_pid} =
         start_standalone_lifecycle_manager(supervisor_name, config,
-          heartbeat_store: heartbeat_list_store(config, prefix, mode: :truncate)
+          heartbeat_store:
+            heartbeat_list_store(config, prefix,
+              mode: {:controlled, control},
+              inject_key: "#{prefix}__nodes/injected@test"
+            )
         )
 
       heartbeat_table = :sys.get_state(manager_pid).heartbeat_table
+      assert :ets.lookup(heartbeat_table, peer_node) != []
       insert_stale_heartbeat(heartbeat_table, orphan_node, current_time)
 
-      await_heartbeat_cycle(manager_pid)
+      :ets.insert(control, {:mode, :truncate})
+      await_heartbeat_reconciliation(manager_pid)
 
       assert :ets.lookup(heartbeat_table, peer_node) != []
       assert :ets.lookup(heartbeat_table, orphan_node) != []
+      assert :sys.get_state(manager_pid).discovery_degraded
+      assert LifecycleManager.discovery_degraded?(:sys.get_state(manager_pid).supervisor_name)
+
+      GenServer.stop(manager_pid)
+    end
+
+    test "a heartbeat GET failure degrades discovery without changing the snapshot, then recovers",
+         %{
+           supervisor_name: supervisor_name,
+           prefix: prefix,
+           config: config
+         } do
+      current_time = System.system_time(:millisecond)
+      known_node = "known-peer@test"
+      new_node = "new-peer@test"
+      failed_node = "failed-peer@test"
+
+      seed_peer_heartbeat(config, prefix, known_node, current_time)
+
+      control = :ets.new(__MODULE__.HeartbeatListBackend, [:set, :public])
+      :ets.insert(control, {:mode, :ok})
+
+      heartbeat_store =
+        heartbeat_list_store(config, prefix,
+          mode: {:controlled, control},
+          inject_key: "#{prefix}__nodes/#{failed_node}"
+        )
+
+      {:ok, manager_pid} =
+        start_standalone_lifecycle_manager(supervisor_name, config,
+          heartbeat_store: heartbeat_store
+        )
+
+      initial_state = :sys.get_state(manager_pid)
+      heartbeat_table = initial_state.heartbeat_table
+      manager_supervisor = initial_state.supervisor_name
+      known_snapshot = :ets.lookup(heartbeat_table, known_node)
+      assert known_snapshot != []
+
+      seed_peer_heartbeat(config, prefix, new_node, System.system_time(:millisecond))
+      :ets.insert(control, {:mode, :fetch_error})
+
+      await_heartbeat_reconciliation(manager_pid)
+
+      degraded_state = :sys.get_state(manager_pid)
+      assert Process.alive?(manager_pid)
+      assert degraded_state.discovery_degraded
+      assert LifecycleManager.discovery_degraded?(manager_supervisor)
+      assert :ets.lookup(heartbeat_table, known_node) == known_snapshot
+      assert :ets.lookup(heartbeat_table, new_node) == []
+
+      # All takeover and outbound placement decisions fail closed while the
+      # previous complete snapshot remains available for diagnostics.
+      assert {:error, :discovery_degraded} =
+               DurableServer.check_lock_status(%Meta{supervisor: manager_supervisor})
+
+      assert LifecycleManager.find_eligible_nodes(manager_supervisor, TestServer) == []
+
+      send(manager_pid, :discover_and_restart)
+      Process.sleep(25)
+      assert :sys.get_state(manager_pid).current_discovery_task == nil
+
+      # Degraded discovery does not stop this node from renewing its own
+      # heartbeat or retrying the failed reconciliation.
+      Process.sleep(2)
+      await_heartbeat_cycle(manager_pid)
+      await_heartbeat_reconciliation(manager_pid)
+      still_degraded_state = :sys.get_state(manager_pid)
+      assert still_degraded_state.discovery_degraded
+
+      assert still_degraded_state.last_successful_heartbeat_monotonic_at >
+               degraded_state.last_successful_heartbeat_monotonic_at
+
+      assert :ets.lookup(heartbeat_table, known_node) == known_snapshot
+      assert :ets.lookup(heartbeat_table, new_node) == []
+
+      :ets.insert(control, {:mode, :ok})
+      await_heartbeat_reconciliation(manager_pid)
+
+      recovered_state = :sys.get_state(manager_pid)
+      refute recovered_state.discovery_degraded
+      refute LifecycleManager.discovery_degraded?(manager_supervisor)
+      assert :ets.lookup(heartbeat_table, new_node) != []
 
       GenServer.stop(manager_pid)
     end
@@ -3137,7 +3342,7 @@ defmodule DurableServer.LifecycleTest do
       heartbeat_table = :sys.get_state(manager_pid).heartbeat_table
       insert_stale_heartbeat(heartbeat_table, orphan_node, current_time)
 
-      await_heartbeat_cycle(manager_pid)
+      await_heartbeat_reconciliation(manager_pid)
 
       assert :ets.lookup(heartbeat_table, peer_node) != []
       assert :ets.lookup(heartbeat_table, orphan_node) != []
