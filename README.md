@@ -99,6 +99,32 @@ passes it through `dump_state/1`, the configured backend's encode/decode path,
 and then `load_state/2` before `init/1` or `init/2`. The dumped initial state
 must therefore be encodable by your configured backend.
 
+## Heartbeat Observability
+
+`DurableServer.LifecycleManager.get_heartbeat_metrics/1` returns a node-local
+snapshot that includes:
+
+- attempt totals grouped by bounded result, HTTP status, and transport class
+- consecutive failed attempts
+- monotonic age of the last successful heartbeat write
+- remaining watchdog budget
+- whether the heartbeat cache is degraded and how long it has been degraded
+
+DurableServer also emits these telemetry events:
+
+| Event | Measurements | Bounded metadata |
+|---|---|---|
+| `[:durable_server, :heartbeat, :attempt]` | `count`, `total_attempts`, `consecutive_failures`, `recovered_after_failures`, `last_success_age_ms`, `remaining_watchdog_budget_ms`, `cache_degraded_duration_ms` | `supervisor`, `result`, `http_status`, `transport_class`, `error_class`, `retryable`, `cache_degraded`, `has_last_success` |
+| `[:durable_server, :heartbeat, :cache]` | `count`, `error_count`, `refresh_duration_ms`, `degraded_duration_ms` | `supervisor`, `status`, `transition` |
+| `[:durable_server, :heartbeat, :watchdog, :termination]` | `count`, `watchdog_terminations`, `children_fenced`, `consecutive_failures`, `last_success_age_ms`, `remaining_watchdog_budget_ms`, `cache_degraded_duration_ms` | `supervisor`, `child_count_status`, `cache_degraded` |
+
+Attempt metadata never includes a raw error, request URL, or object key.
+`http_status` is limited to valid HTTP statuses plus `:none`/`:other`, and
+`transport_class` uses a fixed set of categories. Aggregate the telemetry
+`count` and `children_fenced` measurements outside the DurableServer
+supervision tree; unlike the telemetry stream, the node-local snapshot resets
+when its lifecycle manager restarts.
+
 ## Administrative Cordon
 
 Use `terminate_and_cordon_child/3` when you need to stop a DurableServer and
