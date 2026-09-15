@@ -1,5 +1,5 @@
 defmodule DurableServer.MirrorBackendE2ETest do
-  use ExUnit.Case, async: false
+  use DurableServer.LocalStackCase, async: false
 
   import DurableServer.TestHelper
 
@@ -8,16 +8,13 @@ defmodule DurableServer.MirrorBackendE2ETest do
   alias DurableServer.StorageBackend
   alias DurableServer.TestCounterServer, as: CounterServer
 
-  @moduletag :integration
   @moduletag :capture_log
 
   setup do
     unique_id = System.unique_integer([:positive, :monotonic])
     prefix = "mirror_e2e/#{unique_id}/"
     ekv_name = :"durable_mirror_e2e_#{unique_id}"
-    data_dir = Path.join(System.tmp_dir!(), "durable_server_mirror_e2e_#{unique_id}")
-
-    File.rm_rf(data_dir)
+    data_dir = test_data_dir("mirror_e2e")
 
     object_store = test_object_store()
 
@@ -36,10 +33,6 @@ defmodule DurableServer.MirrorBackendE2ETest do
     {:ok, secondary_backend} = StorageBackend.init_backend(EKVStore, name: ekv_name)
     :ok = StorageBackend.ensure_ready(primary_backend)
     :ok = StorageBackend.ensure_ready(secondary_backend)
-
-    on_exit(fn ->
-      File.rm_rf(data_dir)
-    end)
 
     {:ok,
      prefix: prefix,
@@ -108,9 +101,7 @@ defmodule DurableServer.MirrorBackendE2ETest do
     supervisor_name = unique_supervisor_name("shadow_write_fail")
     prefix = "mirror_e2e/write_fail/#{unique_id}/"
     key = "shadow-write-fail"
-    data_dir = Path.join(System.tmp_dir!(), "durable_server_mirror_write_fail_#{unique_id}")
-
-    File.rm_rf(data_dir)
+    data_dir = test_data_dir("mirror_write_fail")
 
     ekv_pid =
       start_supervised!(%{
@@ -128,10 +119,6 @@ defmodule DurableServer.MirrorBackendE2ETest do
              ]
            ]}
       })
-
-    on_exit(fn ->
-      File.rm_rf(data_dir)
-    end)
 
     _supervisor =
       start_durable_supervisor!(
@@ -452,23 +439,4 @@ defmodule DurableServer.MirrorBackendE2ETest do
   end
 
   defp ekv_mod, do: :"Elixir.EKV"
-
-  defp assert_eventually(fun, timeout \\ 5_000, interval \\ 25)
-       when is_function(fun, 0) and is_integer(timeout) and timeout > 0 do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_assert_eventually(fun, deadline, interval)
-  end
-
-  defp do_assert_eventually(fun, deadline, interval) do
-    if fun.() do
-      :ok
-    else
-      if System.monotonic_time(:millisecond) >= deadline do
-        flunk("eventual assertion timed out")
-      else
-        Process.sleep(interval)
-        do_assert_eventually(fun, deadline, interval)
-      end
-    end
-  end
 end
