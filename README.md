@@ -315,6 +315,46 @@ Run the tests:
 mix test
 ```
 
+### Generated correctness models (StreamData)
+
+```bash
+mix test --only property --seed 12345
+DURABLE_PROPERTY_RUNS=1000 mix test --only property --seed 12345 --timeout 300000
+```
+
+The `property` tests also run in the default suite. Each property runs 100
+generated sequences by default; `DURABLE_PROPERTY_RUNS` increases that budget.
+Keep the ExUnit seed, dependency lockfile, and minimized inputs from a failure to
+reproduce it. StreamData shrinks command lists and values, not BEAM scheduling.
+
+Two independent reference models exercise real, single-node EKV storage:
+
+- **Object generations:** claims, reads, conditional writes/deletes, and
+  delete/recreate sequences across three keys. Historical ETags are opaque
+  handles; the model decides whether they are valid using its own logical
+  generations. Every command checks all modeled keys.
+- **Acknowledged durability:** unsynced updates, all three strict sync callback
+  forms, process kills, explicit restarts, and graceful termination through
+  `DurableServer.Supervisor.terminate_child/2`. The model tracks in-memory and
+  durable values separately. Automatic and periodic sync are disabled, so an
+  unsynced update can be deterministically lost on a kill. A call timeout fails
+  this fault-free write scenario; it is never interpreted as proof of no commit.
+
+Every generated input and shrink attempt starts a fresh supervision tree and
+storage directory. Teardown stops DurableServer before EKV, then removes that
+sample's data, even after assertion failures. A focused test checks isolation
+after a deliberately failed sample. Fixed process names are reused only within
+these synchronous properties to avoid allocating atoms per generated input.
+
+The properties themselves need neither cloud credentials nor LocalStack.
+Until the fixture-isolation change is merged, the global test helper still
+requires LocalStack even when selecting only properties.
+
+This is sequential, per-key verification—not cross-key transactions, distributed
+linearizability, external-side-effect fencing, or deterministic fault simulation.
+Cordon/uncordon, lease boundaries, lost responses after commit, eventual discovery,
+resource bounds, and mirror migration phases need separate models/fault controls.
+
 ### Integration Tests (with Tigris)
 
 Set the required environment variables:
