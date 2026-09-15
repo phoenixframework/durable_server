@@ -3258,4 +3258,143 @@ defmodule DurableServer.LifecycleTest do
       GenServer.stop(manager_pid)
     end
   end
+
+  defmodule PauseOnFetchBackend do
+    @behaviour DurableServer.StorageBackend
+
+    alias DurableServer.StorageBackend
+
+    @impl true
+    def init_backend(opts) do
+      delegate = Keyword.fetch!(opts, :delegate)
+
+      {:ok,
+       %{
+         state: %{
+           delegate: delegate,
+           notify_pid: Keyword.fetch!(opts, :notify_pid),
+           pause_key: Keyword.fetch!(opts, :pause_key)
+         },
+         defaults: StorageBackend.defaults(delegate),
+         features: StorageBackend.features(delegate)
+       }}
+    end
+
+    @impl true
+    def ensure_ready(%{delegate: delegate}), do: StorageBackend.ensure_ready(delegate)
+
+    @impl true
+    def get_object(%{delegate: delegate, notify_pid: notify_pid, pause_key: pause_key}, key, opts) do
+      if String.ends_with?(key, pause_key) do
+        send(notify_pid, {:paused_in_discovery_worker, self()})
+
+        receive do
+          :continue -> :ok
+        after
+          10_000 -> :ok
+        end
+      end
+
+      StorageBackend.get_object(delegate, key, opts)
+    end
+
+    @impl true
+    def list_all_objects_stream(%{delegate: delegate}, prefix, opts),
+      do: StorageBackend.list_all_objects_stream(delegate, prefix, opts)
+
+    @impl true
+    def put_object(%{delegate: delegate}, key, data, opts),
+      do: StorageBackend.put_object(delegate, key, data, opts)
+
+    @impl true
+    def delete_object(%{delegate: delegate}, key), do: StorageBackend.delete_object(delegate, key)
+
+    @impl true
+    def try_claim(%{delegate: delegate}, key, body),
+      do: StorageBackend.try_claim(delegate, key, body)
+
+    @impl true
+    def update_object(%{delegate: delegate}, key, update_fn, opts),
+      do: StorageBackend.update_object(delegate, key, update_fn, opts)
+
+    @impl true
+    def encode(%{delegate: delegate}, data), do: StorageBackend.encode(delegate, data)
+
+    @impl true
+    def decode(%{delegate: delegate}, data), do: StorageBackend.decode(delegate, data)
+  end
+
+  describe "discovery shutdown race" do
+    test "orphaned discovery task writes to a dead skip table when the manager stops mid-round",
+         %{supervisor_name: supervisor_name, prefix: prefix, config: config} do
+      key = "skip-race-#{DurableServer.UUID.uuid4()}"
+      delegate = DurableServer.Supervisor.__get_config__(supervisor_name).storage_backend
+
+      stored_state = %DurableServer.StoredState{
+        vsn: 1,
+        state: %{"count" => 1},
+        meta: %Meta{
+          key: key,
+          prefix: prefix,
+          supervisor: supervisor_name,
+          module: TestServer,
+          permanent: false,
+          status: :running,
+          node_str: "unreachable@test",
+          node_ref: System.unique_integer([:positive]),
+          pid: self(),
+          last_heartbeat_at: System.system_time(:millisecond) - 60_000
+        }
+      }
+
+      assert {:ok, %{etag: _}} =
+               DurableServer.StorageBackend.put_object(delegate, "#{prefix}#{key}", stored_state)
+
+      {:ok, storage_backend} =
+        DurableServer.StorageBackend.init_backend(PauseOnFetchBackend,
+          delegate: delegate,
+          notify_pid: self(),
+          pause_key: key
+        )
+
+      test_config =
+        config
+        |> Map.put(:object_store, storage_backend)
+        |> Map.put(:storage_backend, storage_backend)
+        |> Map.put(:initial_discovery_delay_ms, 60_000)
+        |> Map.put(:discovery_interval_ms, 60_000)
+
+      {:ok, manager_pid} = start_standalone_lifecycle_manager(supervisor_name, test_config)
+
+      send(manager_pid, :discover_and_restart)
+
+      assert_receive {:paused_in_discovery_worker, worker_pid}, 10_000
+      worker_ref = Process.monitor(worker_pid)
+
+      manager_state = :sys.get_state(manager_pid)
+      skip_table = manager_state.discovery_skip_table
+      %Task{pid: discovery_pid} = manager_state.current_discovery_task
+
+      # the skip table is owned by the manager, so it dies with the manager
+      assert :ets.info(skip_table, :owner) == manager_pid
+
+      # async_nolink means the discovery task is not linked to the manager
+      {:links, discovery_links} = Process.info(discovery_pid, :links)
+      refute manager_pid in discovery_links
+
+      Process.exit(manager_pid, :kill)
+      assert_eventually(fn -> :ets.whereis(skip_table) == :undefined end)
+
+      # the discovery task and its worker outlive the manager
+      assert Process.alive?(discovery_pid)
+      assert Process.alive?(worker_pid)
+
+      send(worker_pid, :continue)
+
+      # without the skip-table guard this exits {:badarg, [{:ets, :insert, [skip_table, ...]}]}
+      # from lib/durable_server/lifecycle_manager.ex:2079
+      assert_receive {:DOWN, ^worker_ref, :process, ^worker_pid, :normal}, 10_000
+      assert :ets.whereis(skip_table) == :undefined
+    end
+  end
 end
