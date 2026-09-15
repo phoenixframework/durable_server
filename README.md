@@ -315,6 +315,22 @@ Run the tests:
 mix test
 ```
 
+### Distributed ownership tests (local BEAM nodes)
+
+```bash
+mix test --only distributed
+```
+
+This opt-in lane starts three disposable BEAM VMs with a shared EKV quorum.
+It checks concurrent starts, acknowledged writes across owner VM loss, minority
+write rejection, recovery after a distribution partition, and stale ETag fencing
+after healing. Partitions affect only the test nodes; the controller uses stdio
+and does not change host networking. Each case uses isolated names and data
+directories and stops its peers on exit.
+
+These are focused failure scenarios, not a general linearizability checker or
+deterministic scheduler. Run them separately from the fast default suite.
+
 ### Integration Tests (with Tigris)
 
 Set the required environment variables:
