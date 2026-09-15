@@ -3600,7 +3600,7 @@ defmodule DurableServerTest do
 
       ref = Process.monitor(pid)
       assert GenServer.call(pid, :stop_abnormal) == :ok
-      assert_receive {:DOWN, ^ref, :process, ^pid, {:error, :abnormal_reason}}
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:error, :abnormal_reason}}, 1_000
 
       store = test_object_store()
       {:ok, data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
@@ -3623,7 +3623,7 @@ defmodule DurableServerTest do
 
       ref = Process.monitor(pid)
       GenServer.cast(pid, :crash)
-      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
 
       store = test_object_store()
       {:ok, data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
@@ -3646,7 +3646,7 @@ defmodule DurableServerTest do
 
       ref = Process.monitor(pid)
       send(pid, :crash)
-      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
 
       store = test_object_store()
       {:ok, data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})

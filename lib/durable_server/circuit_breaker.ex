@@ -226,15 +226,7 @@ defmodule DurableServer.CircuitBreaker do
   end
 
   defp inc(table, key, current_time) do
-    # Use atomic update_counter to avoid race conditions.
-    try do
-      :ets.update_counter(table, key, {2, 1})
-    catch
-      :error, :badarg ->
-        # Key doesn't exist, insert initial entry and try again.
-        :ets.insert(table, {key, 0, current_time, 0})
-        :ets.update_counter(table, key, {2, 1})
-    end
+    :ets.update_counter(table, key, {2, 1}, {key, 0, current_time, 0})
 
     :ok
   end

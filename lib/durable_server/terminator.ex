@@ -203,8 +203,8 @@ defmodule DurableServer.Terminator do
       |> DynamicSupervisor.which_children()
       |> Enum.filter(fn
         # Filter out non-DurableServer children (LifecycleManager, Terminator, TaskSupervisor)
-        {_id, pid, _type, [DurableServer]} when is_pid(pid) ->
-          true
+        {_id, pid, _type, modules} when is_pid(pid) and is_list(modules) ->
+          DurableServer in modules
 
         _ ->
           false

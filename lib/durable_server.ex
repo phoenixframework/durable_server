@@ -982,13 +982,16 @@ defmodule DurableServer do
     end
   end
 
-  def child_spec(init_arg) do
+  def child_spec(%{module: module} = init_arg) when is_atom(module) do
     %{
       id: __MODULE__,
       start: {__MODULE__, :start_link, [init_arg]},
       type: :worker,
       restart: :temporary,
-      shutdown: 30_000
+      shutdown: 30_000,
+      # release_handler selects processes for code_change/3 from this list.
+      # The wrapper delegates that callback to the user's server module.
+      modules: [__MODULE__, module]
     }
   end
 

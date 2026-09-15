@@ -2,6 +2,7 @@
 
 - Enforce cumulative sticky-placement gates during request-driven remote placement so an existing server cannot move to a fallback node before that level unlocks.
 - Allow an expired restart attempt to be reclaimed immediately by another node at an allowed sticky-placement level, while preserving strict placement when no level matches.
+- Advertise both `DurableServer` and the user callback module in child specifications so OTP release upgrades can discover running durable processes and invoke their delegated `code_change/3` callbacks.
 
 ## 0.1.5 (2026-08-27)
 - Treat explicit `:sync`, `{:sync, metadata}`, and `sync: true` callback returns as strict durability boundaries. Built-in backends first exhaust their bounded transient retry policy; if the write still fails, the DurableServer exits with a structured `{:sync_failed, reason}` fatal-exit reason before acknowledging the callback. Automatic and periodic sync remain best effort for transient failures, while storage conflicts remain fatal.
