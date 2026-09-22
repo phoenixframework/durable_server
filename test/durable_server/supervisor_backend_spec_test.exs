@@ -6,108 +6,10 @@ defmodule DurableServer.SupervisorBackendSpecTest do
   alias DurableServer.LifecycleManager
   alias DurableServer.Backends.EKVStore
   alias DurableServer.Backends.MirrorStore
-  alias DurableServer.StorageBackend
+  alias DurableServer.TestInMemoryBackend, as: InMemoryBackend
 
   def throw_not_ready do
     throw({:error, :not_ready})
-  end
-
-  defmodule InMemoryBackend do
-    @behaviour StorageBackend
-
-    @impl true
-    def init_backend(raw_opts) do
-      opts =
-        case raw_opts do
-          %{} = map -> map
-          opts when is_list(opts) -> Map.new(opts)
-          other -> %{raw_opts: other}
-        end
-
-      {:ok,
-       %{
-         state: %{
-           table: :ets.new(__MODULE__, [:set, :public]),
-           name: Map.get(opts, :name)
-         },
-         defaults: %{
-           heartbeat_tracking_mode: :poll,
-           discovery_interval_ms: 60_000,
-           heartbeat_interval_ms: 10_000,
-           heartbeat_reconcile_interval_ms: 10_000
-         }
-       }}
-    end
-
-    @impl true
-    def ensure_ready(_state), do: :ok
-
-    @impl true
-    def get_object(%{table: table}, key, _opts) do
-      case :ets.lookup(table, key) do
-        [{^key, %{body: body, etag: etag}}] -> {:ok, %{body: body, etag: etag}}
-        [] -> {:error, :not_found}
-      end
-    end
-
-    @impl true
-    def list_all_objects_stream(%{table: table}, prefix, _opts) do
-      table
-      |> :ets.tab2list()
-      |> Stream.filter(fn {key, _value} -> String.starts_with?(key, prefix) end)
-      |> Stream.map(fn {key, %{etag: etag}} -> %{key: key, etag: etag} end)
-    end
-
-    @impl true
-    def put_object(%{table: table}, key, data, _opts) do
-      etag = next_etag()
-      :ets.insert(table, {key, %{body: data, etag: etag}})
-      {:ok, %{body: data, etag: etag}}
-    end
-
-    @impl true
-    def delete_object(%{table: table}, key) do
-      case :ets.lookup(table, key) do
-        [{^key, _value}] ->
-          :ets.delete(table, key)
-          :ok
-
-        [] ->
-          {:error, :not_found}
-      end
-    end
-
-    @impl true
-    def try_claim(%{table: table}, key, body) do
-      case :ets.lookup(table, key) do
-        [] ->
-          etag = next_etag()
-          :ets.insert(table, {key, %{body: body, etag: etag}})
-          {:ok, {:claimed, etag}}
-
-        [_existing] ->
-          {:error, :taken}
-      end
-    end
-
-    @impl true
-    def update_object(%{table: table} = state, key, update_fn, _opts) do
-      with {:ok, %{body: body, etag: etag}} <- get_object(state, key, []),
-           {:ok, new_body} <- update_fn.(%{body: body, etag: etag}) do
-        put_object(%{table: table}, key, new_body, [])
-      end
-    end
-
-    @impl true
-    def encode(_state, data), do: {:ok, data}
-
-    @impl true
-    def decode(_state, data), do: {:ok, data}
-
-    defp next_etag do
-      System.unique_integer([:positive, :monotonic])
-      |> Integer.to_string()
-    end
   end
 
   test "rejects heartbeats beyond the configured future clock-skew tolerance" do

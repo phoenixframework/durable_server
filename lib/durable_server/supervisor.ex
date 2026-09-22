@@ -252,6 +252,7 @@ defmodule DurableServer.Supervisor do
   @placement_candidate_pool_multiplier 4
   @placement_candidate_pool_min 10
   @placement_node_timeout_cooldown_ms :timer.seconds(15)
+  @placement_erpc_response_headroom_ms 1_000
   @placement_erpc_timeout_same_region_ms 3_000
   @placement_erpc_timeout_cross_region_ms 8_000
   @restart_claim_race_poll_ms 100
@@ -770,6 +771,10 @@ defmodule DurableServer.Supervisor do
     complete, including internal retries. Returns `{:error, :timeout}` on expiration.
     Set to `:infinity` to disable. Default: `#{@default_start_child_timeout}`ms.
 
+  Remote placement reserves part of each RPC budget for the reply, so a child
+  startup timeout can return without treating the reachable node as a transport
+  failure. Timing out a caller's wait does not cancel an already-supervised bootstrap.
+
   ## Examples
 
       # Start with init args
@@ -902,8 +907,14 @@ defmodule DurableServer.Supervisor do
       # When max_placement_retries is 0, this is a remote placement call from another node.
       # Wait for the supervisor tree to be ready before touching ETS/Group-backed state.
       if max_placement_retries == 0 do
+        ready_timeout =
+          case remaining_timeout_ms(caller_deadline_ms) do
+            :infinity -> @remote_placement_ready_timeout
+            remaining_ms -> min(@remote_placement_ready_timeout, remaining_ms)
+          end
+
         case wait_until_ready(supervisor,
-               timeout: @remote_placement_ready_timeout,
+               timeout: ready_timeout,
                poll_interval: 50
              ) do
           :ok ->
@@ -911,7 +922,7 @@ defmodule DurableServer.Supervisor do
 
           {:error, :timeout} ->
             Logger.warning(
-              "DurableServer.Supervisor #{inspect(supervisor)} not ready after #{@remote_placement_ready_timeout}ms on remote placement"
+              "DurableServer.Supervisor #{inspect(supervisor)} not ready after #{ready_timeout}ms on remote placement"
             )
 
             throw({:error, :not_ready})
@@ -1854,19 +1865,31 @@ defmodule DurableServer.Supervisor do
          [node | rest],
          placement_opts
        ) do
-    Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
-    report_placement_diagnostic(supervisor, :remote_placement_erpc_attempt)
     shutdown_retries = Keyword.get(placement_opts, :shutdown_retries, 0)
     deadline = Keyword.get(placement_opts, :deadline)
     erpc_timeout_ms = __placement_erpc_timeout_ms__(supervisor, node, deadline)
     {remote_child_spec, remote_opts} = remote_start_child_args(child_spec)
-    remote_opts = Keyword.put(remote_opts, :timeout, erpc_timeout_ms)
+
+    # Let a slow bootstrap return its ordinary timeout before the enclosing RPC
+    # expires and penalizes every key on this node with a transport cooldown.
+    # The outer timer starts before remote execution, so reserve time for transit
+    # in both directions and scheduling, not just the reply. One second is a
+    # conservative allowance, not a measured latency bound; cap it at half a
+    # short budget rounded up. If no startup budget remains, do not dispatch.
+    response_headroom_ms =
+      min(@placement_erpc_response_headroom_ms, div(erpc_timeout_ms + 1, 2))
+
+    remote_timeout_ms = erpc_timeout_ms - response_headroom_ms
+    remote_opts = Keyword.put(remote_opts, :timeout, remote_timeout_ms)
 
     # NOTE: we MUST pass max_placement_retries: 0 to prevent recursive retry on the other side
     try do
-      if erpc_timeout_ms == 0 do
+      if remote_timeout_ms == 0 do
         throw({:error, :placement_deadline_expired})
       end
+
+      Logger.info("Attempting to place #{inspect(module)} on remote node #{inspect(node)}")
+      report_placement_diagnostic(supervisor, :remote_placement_erpc_attempt)
 
       result =
         safe_erpc_call(

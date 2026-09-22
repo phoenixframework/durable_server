@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Reserve up to one second (half the budget for short calls) inside remote placement RPC deadlines and bound readiness waits by the remaining startup budget. Slow child bootstrap can return an ordinary timeout without unnecessarily cooling down the entire reachable node; genuine transport failures still trigger cooldown.
 - Enforce cumulative sticky-placement gates during request-driven remote placement so an existing server cannot move to a fallback node before that level unlocks.
 - Allow an expired restart attempt to be reclaimed immediately by another node at an allowed sticky-placement level, while preserving strict placement when no level matches.
 
