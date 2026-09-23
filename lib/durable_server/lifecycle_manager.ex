@@ -103,7 +103,7 @@ defmodule DurableServer.LifecycleManager do
 
   alias DurableServer.LifecycleManager
   alias DurableServer
-  alias DurableServer.{StoredState, Meta, CircuitBreaker, HeartbeatWatchdog}
+  alias DurableServer.{StoredState, Meta, CircuitBreaker, HeartbeatMetrics, HeartbeatWatchdog}
   alias DurableServer.ObjectStore
   alias DurableServer.StorageBackend
 
@@ -130,6 +130,7 @@ defmodule DurableServer.LifecycleManager do
             last_successful_heartbeat_at: nil,
             last_successful_heartbeat_monotonic_at: nil,
             heartbeat_watchdog: nil,
+            heartbeat_metrics: nil,
             # Last successful heartbeat timing for diagnostics
             last_heartbeat_timing: nil,
             discovery_diag_table: nil,
@@ -192,6 +193,11 @@ defmodule DurableServer.LifecycleManager do
   - `:last_heartbeat_timing` - The timing from the last successful heartbeat (put_ms, cache_ms, total_ms)
   - `:last_successful_heartbeat_at` - Timestamp of last successful heartbeat
   - `:discovery_degraded` - Whether an incomplete heartbeat snapshot is gating discovery
+  - `:attempts` - Bounded attempt counts by result, HTTP status, and transport class
+  - `:consecutive_failures` - Current run of failed heartbeat attempts
+  - `:last_success_age_ms` - Monotonic age of the last successful heartbeat write
+  - `:remaining_watchdog_budget_ms` - Time remaining before the local watchdog fences the tree
+  - `:cache_degraded_duration_ms` - How long the heartbeat cache has been incomplete
   - `:node` - This node's name
 
   This is used by the admin dashboard to monitor heartbeat health across the cluster.
@@ -404,6 +410,8 @@ defmodule DurableServer.LifecycleManager do
       write_concurrency: true
     ])
 
+    heartbeat_metrics = HeartbeatMetrics.new(supervisor_name)
+
     state = %LifecycleManager{
       supervisor_name: supervisor_name,
       task_sup: task_supervisor,
@@ -425,6 +433,7 @@ defmodule DurableServer.LifecycleManager do
       capacity_limits: capacity_limits,
       heartbeat_meta: heartbeat_meta,
       heartbeat_watchdog: heartbeat_watchdog,
+      heartbeat_metrics: heartbeat_metrics,
       discovery_diag_table: diagnostics_tab,
       discovery_skip_table: skip_tab,
       restart_gate_table: restart_gate_tab,
@@ -489,7 +498,14 @@ defmodule DurableServer.LifecycleManager do
         state.heartbeat_watchdog,
         self(),
         heartbeat_monotonic_at,
-        heartbeat_hard_deadline_ms(state)
+        heartbeat_hard_deadline_ms(state),
+        state.heartbeat_metrics
+      )
+
+    :ok =
+      HeartbeatMetrics.mark_watchdog_renewal(
+        state.heartbeat_metrics,
+        heartbeat_monotonic_at
       )
 
     state =
@@ -726,6 +742,8 @@ defmodule DurableServer.LifecycleManager do
       "heartbeat cache reconciliation task failed: #{inspect(reason)}"
     end)
 
+    HeartbeatMetrics.record_cache_refresh(state.heartbeat_metrics, false, 1, 0)
+
     state =
       apply_heartbeat_cache_status(
         %{state | current_heartbeat_reconcile_task: nil},
@@ -766,6 +784,11 @@ defmodule DurableServer.LifecycleManager do
             heartbeat_monotonic_at
           )
 
+          HeartbeatMetrics.mark_watchdog_renewal(
+            state.heartbeat_metrics,
+            heartbeat_monotonic_at
+          )
+
           join_group_heartbeat(state, heartbeat_entry)
 
           %{
@@ -790,18 +813,23 @@ defmodule DurableServer.LifecycleManager do
     capacity = DurableServer.Supervisor.current_capacity(state.supervisor_name)
     heartbeat_meta = resolve_heartbeat_meta(state.heartbeat_meta)
 
-    metrics = %{
-      node: Node.self(),
-      last_heartbeat_timing: state.last_heartbeat_timing,
-      last_successful_heartbeat_at: state.last_successful_heartbeat_at,
-      heartbeat_interval_ms: state.heartbeat_interval_ms,
-      heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms(state),
-      deadline_ms: heartbeat_hard_deadline_ms(state),
-      resources: resources,
-      capacity: capacity,
-      heartbeat_meta: heartbeat_meta,
-      discovery_degraded: state.discovery_degraded or discovery_degraded?(state.supervisor_name)
-    }
+    heartbeat_metrics =
+      HeartbeatMetrics.snapshot(state.heartbeat_metrics, heartbeat_hard_deadline_ms(state))
+
+    metrics =
+      %{
+        node: Node.self(),
+        last_heartbeat_timing: state.last_heartbeat_timing,
+        last_successful_heartbeat_at: state.last_successful_heartbeat_at,
+        heartbeat_interval_ms: state.heartbeat_interval_ms,
+        heartbeat_staleness_threshold_ms: heartbeat_staleness_threshold_ms(state),
+        deadline_ms: heartbeat_hard_deadline_ms(state),
+        resources: resources,
+        capacity: capacity,
+        heartbeat_meta: heartbeat_meta,
+        discovery_degraded: state.discovery_degraded or discovery_degraded?(state.supervisor_name)
+      }
+      |> Map.merge(heartbeat_metrics)
 
     {:reply, metrics, state}
   end
@@ -863,6 +891,11 @@ defmodule DurableServer.LifecycleManager do
     HeartbeatWatchdog.renew(
       state.heartbeat_watchdog,
       owner,
+      heartbeat_monotonic_at
+    )
+
+    HeartbeatMetrics.mark_watchdog_renewal(
+      state.heartbeat_metrics,
       heartbeat_monotonic_at
     )
   end
@@ -1073,6 +1106,12 @@ defmodule DurableServer.LifecycleManager do
 
     case put_heartbeat_until_deadline(state, key, heartbeat_data, deadline_at) do
       {:ok, _} ->
+        :ok =
+          HeartbeatMetrics.mark_heartbeat_success(
+            state.heartbeat_metrics,
+            current_monotonic_time
+          )
+
         # update local ets cache with full capacity info
         :ets.insert(state.heartbeat_table, entry)
 
@@ -1102,9 +1141,7 @@ defmodule DurableServer.LifecycleManager do
       # Let Req retry transient HTTP and transport failures itself. The timeout keeps
       # those retries inside the heartbeat budget; the outer loop remains for retryable
       # errors from non-HTTP backends.
-      put_opts = [max_retries: @heartbeat_req_max_retries, timeout: remaining_ms]
-
-      case StorageBackend.put_object(state.heartbeat_store, key, heartbeat_data, put_opts) do
+      case put_heartbeat_once(state, key, heartbeat_data, deadline_at, remaining_ms) do
         {:ok, _} = ok ->
           ok
 
@@ -1124,6 +1161,90 @@ defmodule DurableServer.LifecycleManager do
     end
   end
 
+  defp put_heartbeat_once(
+         %LifecycleManager{} = state,
+         key,
+         heartbeat_data,
+         deadline_at,
+         remaining_ms
+       ) do
+    observations = :counters.new(2, [])
+
+    retry_observer = fn _request, response_or_error, retryable? ->
+      :counters.add(observations, 1, 1)
+
+      unless HeartbeatMetrics.successful_attempt?(response_or_error) do
+        :counters.add(observations, 2, 1)
+      end
+
+      HeartbeatMetrics.record_attempt(
+        state.heartbeat_metrics,
+        response_or_error,
+        retryable?,
+        deadline_at
+      )
+    end
+
+    put_opts = [
+      max_retries: @heartbeat_req_max_retries,
+      timeout: remaining_ms,
+      retry_observer: retry_observer
+    ]
+
+    try do
+      result =
+        StorageBackend.put_object(
+          state.heartbeat_store,
+          key,
+          heartbeat_data,
+          put_opts
+        )
+
+      maybe_record_backend_attempt(state, result, observations, deadline_at)
+      result
+    catch
+      kind, reason ->
+        if :counters.get(observations, 2) == 0 do
+          HeartbeatMetrics.record_attempt(
+            state.heartbeat_metrics,
+            {:raised, kind, reason},
+            false,
+            deadline_at
+          )
+        end
+
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp maybe_record_backend_attempt(
+         %LifecycleManager{} = state,
+         result,
+         observations,
+         deadline_at
+       ) do
+    observed_attempts = :counters.get(observations, 1)
+    observed_failures = :counters.get(observations, 2)
+
+    if observed_attempts == 0 or
+         (not HeartbeatMetrics.successful_attempt?(result) and observed_failures == 0) do
+      retryable? =
+        case result do
+          {:error, reason} -> heartbeat_write_retryable?(reason)
+          _ -> false
+        end
+
+      HeartbeatMetrics.record_attempt(
+        state.heartbeat_metrics,
+        result,
+        retryable?,
+        deadline_at
+      )
+    end
+
+    :ok
+  end
+
   defp heartbeat_deadline_at(%LifecycleManager{} = state, nil),
     do: System.monotonic_time(:millisecond) + heartbeat_hard_deadline_ms(state)
 
@@ -1141,6 +1262,15 @@ defmodule DurableServer.LifecycleManager do
 
   defp heartbeat_write_retryable?({:mirror_failed, reason}),
     do: heartbeat_write_retryable?(reason)
+
+  defp heartbeat_write_retryable?(%Req.TransportError{}), do: true
+
+  defp heartbeat_write_retryable?(%Req.Response{status: status})
+       when status in [408, 429, 500, 502, 503, 504],
+       do: true
+
+  defp heartbeat_write_retryable?(%Req.HTTPError{protocol: :http2, reason: :unprocessed}),
+    do: true
 
   defp heartbeat_write_retryable?(reason) do
     reason in [
@@ -1286,6 +1416,7 @@ defmodule DurableServer.LifecycleManager do
 
   # this gets run async inside a task
   defp refresh_node_heartbeat_cache(%LifecycleManager{} = state) do
+    cache_refresh_started_at = System.monotonic_time(:millisecond)
     dead_node_threshold_ms = state.config.dead_node_threshold_ms
     current_time = System.system_time(:millisecond)
     heartbeat_prefix = "#{state.prefix}__nodes/"
@@ -1384,17 +1515,30 @@ defmodule DurableServer.LifecycleManager do
         {node, node_ref, timestamp, capacity, resources, env_vars, heartbeat_meta}
       end)
 
-    if listing_complete? do
-      # Do not mutate the cache until every listed heartbeat has been read.
-      # This makes the existing ETS contents the last complete snapshot.
-      cleaned_count = cleanup_dead_node_heartbeats(state, dead_nodes)
-      :ets.insert(state.heartbeat_table, live_heartbeats)
-      prune_orphaned_heartbeat_entries(state, seen_nodes, current_time, dead_node_threshold_ms)
+    result =
+      if listing_complete? do
+        # Do not mutate the cache until every listed heartbeat has been read.
+        # This makes the existing ETS contents the last complete snapshot.
+        cleaned_count = cleanup_dead_node_heartbeats(state, dead_nodes)
+        :ets.insert(state.heartbeat_table, live_heartbeats)
+        prune_orphaned_heartbeat_entries(state, seen_nodes, current_time, dead_node_threshold_ms)
 
-      {:ok, length(live_heartbeats), cleaned_count, 0}
-    else
-      {:partial, length(live_heartbeats), 0, error_count}
-    end
+        {:ok, length(live_heartbeats), cleaned_count, 0}
+      else
+        {:partial, length(live_heartbeats), 0, error_count}
+      end
+
+    cache_refresh_duration_ms =
+      System.monotonic_time(:millisecond) - cache_refresh_started_at
+
+    HeartbeatMetrics.record_cache_refresh(
+      state.heartbeat_metrics,
+      listing_complete?,
+      error_count,
+      cache_refresh_duration_ms
+    )
+
+    result
   end
 
   defp cleanup_dead_node_heartbeats(%LifecycleManager{} = state, dead_nodes) do

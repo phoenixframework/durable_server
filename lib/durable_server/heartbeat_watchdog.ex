@@ -4,12 +4,15 @@ defmodule DurableServer.HeartbeatWatchdog do
   use GenServer
   require Logger
 
+  alias DurableServer.HeartbeatMetrics
+
   defstruct supervisor_name: nil,
             owner: nil,
             owner_monitor: nil,
             deadline_ms: nil,
             last_heartbeat_at: nil,
             heartbeat_task_pid: nil,
+            heartbeat_metrics: nil,
             timer_ref: nil,
             timer_token: nil
 
@@ -23,7 +26,16 @@ defmodule DurableServer.HeartbeatWatchdog do
   def arm(name, owner, last_heartbeat_at, deadline_ms)
       when is_pid(owner) and is_integer(last_heartbeat_at) and is_integer(deadline_ms) and
              deadline_ms > 0 do
-    GenServer.call(name, {:arm, owner, last_heartbeat_at, deadline_ms})
+    arm(name, owner, last_heartbeat_at, deadline_ms, nil)
+  end
+
+  def arm(name, owner, last_heartbeat_at, deadline_ms, heartbeat_metrics)
+      when is_pid(owner) and is_integer(last_heartbeat_at) and is_integer(deadline_ms) and
+             deadline_ms > 0 do
+    GenServer.call(
+      name,
+      {:arm, owner, last_heartbeat_at, deadline_ms, heartbeat_metrics}
+    )
   end
 
   def renew(name, owner, heartbeat_at)
@@ -47,7 +59,7 @@ defmodule DurableServer.HeartbeatWatchdog do
 
   @impl true
   def handle_call(
-        {:arm, owner, last_heartbeat_at, deadline_ms},
+        {:arm, owner, last_heartbeat_at, deadline_ms, heartbeat_metrics},
         _from,
         %__MODULE__{} = state
       ) do
@@ -65,7 +77,8 @@ defmodule DurableServer.HeartbeatWatchdog do
           owner_monitor: owner_monitor,
           deadline_ms: deadline_ms,
           last_heartbeat_at: last_heartbeat_at,
-          heartbeat_task_pid: nil
+          heartbeat_task_pid: nil,
+          heartbeat_metrics: heartbeat_metrics
       }
       |> schedule_deadline()
 
@@ -123,11 +136,35 @@ defmodule DurableServer.HeartbeatWatchdog do
         %__MODULE__{timer_token: timer_token} = state
       ) do
     elapsed_since_last = System.monotonic_time(:millisecond) - state.last_heartbeat_at
+    {children_fenced, child_count_status} = count_fenced_children(state.supervisor_name)
+    metrics = heartbeat_snapshot(state, elapsed_since_last)
+
+    :ok =
+      HeartbeatMetrics.watchdog_termination(
+        state.supervisor_name,
+        %{
+          children_fenced: children_fenced,
+          consecutive_failures: metrics.consecutive_failures,
+          last_success_age_ms: metrics.last_success_age_ms,
+          remaining_watchdog_budget_ms: 0,
+          cache_degraded_duration_ms: metrics.cache_degraded_duration_ms,
+          watchdog_terminations: 1
+        },
+        %{
+          child_count_status: child_count_status,
+          cache_degraded: metrics.cache_degraded?
+        }
+      )
 
     Logger.error(fn ->
       "#{inspect(state.supervisor_name)}: heartbeat watchdog deadline exceeded " <>
-        "(#{elapsed_since_last}ms since last success, deadline #{state.deadline_ms}ms), " <>
-        "terminating lifecycle manager to prevent orphan conflicts"
+        "(#{elapsed_since_last}ms since last watchdog renewal, " <>
+        "#{metrics.last_success_age_ms}ms since last successful write, " <>
+        "deadline #{state.deadline_ms}ms, remaining budget 0ms, " <>
+        "consecutive failures #{metrics.consecutive_failures}, " <>
+        "cache degraded for #{metrics.cache_degraded_duration_ms}ms), " <>
+        "terminating lifecycle manager to prevent orphan conflicts; " <>
+        "children_fenced=#{format_child_count(children_fenced, child_count_status)}"
     end)
 
     if is_pid(state.heartbeat_task_pid) do
@@ -166,6 +203,7 @@ defmodule DurableServer.HeartbeatWatchdog do
       deadline_ms: nil,
       last_heartbeat_at: nil,
       heartbeat_task_pid: nil,
+      heartbeat_metrics: nil,
       timer_ref: nil,
       timer_token: nil
     })
@@ -185,4 +223,56 @@ defmodule DurableServer.HeartbeatWatchdog do
   end
 
   defp clear_owner_monitor(%__MODULE__{} = state), do: state
+
+  defp heartbeat_snapshot(
+         %__MODULE__{heartbeat_metrics: %HeartbeatMetrics{} = metrics, deadline_ms: deadline_ms},
+         elapsed_since_last
+       ) do
+    snapshot = HeartbeatMetrics.snapshot(metrics, deadline_ms)
+
+    %{
+      consecutive_failures: snapshot.consecutive_failures,
+      last_success_age_ms: snapshot.last_success_age_ms || elapsed_since_last,
+      cache_degraded?: snapshot.cache_degraded?,
+      cache_degraded_duration_ms: snapshot.cache_degraded_duration_ms
+    }
+  end
+
+  defp heartbeat_snapshot(%__MODULE__{}, elapsed_since_last) do
+    %{
+      consecutive_failures: 0,
+      last_success_age_ms: elapsed_since_last,
+      cache_degraded?: false,
+      cache_degraded_duration_ms: 0
+    }
+  end
+
+  # Querying DynamicSupervisor would be a blocking GenServer call on the process
+  # responsible for enforcing the hard deadline. Its direct links are the
+  # supervised children plus its parent, so this gives us a non-blocking count.
+  defp count_fenced_children(supervisor_name) do
+    dynamic_supervisor = DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name)
+
+    with pid when is_pid(pid) <- Process.whereis(dynamic_supervisor),
+         [links: links, dictionary: dictionary] <-
+           Process.info(pid, [:links, :dictionary]) do
+      ancestors =
+        dictionary
+        |> Keyword.get(:"$ancestors", [])
+        |> Enum.filter(&is_pid/1)
+        |> MapSet.new()
+
+      children_fenced =
+        Enum.count(links, fn linked_pid ->
+          not MapSet.member?(ancestors, linked_pid)
+        end)
+
+      {children_fenced, :known}
+    else
+      _ -> {0, :unavailable}
+    end
+  end
+
+  defp format_child_count(children_fenced, :known), do: children_fenced
+  defp format_child_count(_children_fenced, :unavailable), do: "unknown"
 end
