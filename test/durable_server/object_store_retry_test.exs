@@ -3,7 +3,9 @@ defmodule DurableServer.ObjectStoreRetryTest do
 
   alias DurableServer.ObjectStore
 
-  test "put retries transient Req failures within its deadline" do
+  # Retry outcomes are scripted, so these cases don't impose a wall-clock
+  # deadline while other test modules compile. Deadline behavior is covered below.
+  test "put retries transient Req failures" do
     adapter =
       adapter([
         %Req.Response{status: 503},
@@ -14,7 +16,7 @@ defmodule DurableServer.ObjectStoreRetryTest do
     assert {:ok, %{etag: "retry-etag", body: "heartbeat"}} =
              ObjectStore.put_object(store(adapter), "__nodes/test@localhost", "heartbeat",
                max_retries: 10,
-               timeout: 1_000
+               timeout: :infinity
              )
   end
 
@@ -45,7 +47,7 @@ defmodule DurableServer.ObjectStoreRetryTest do
     assert {:ok, %{etag: "retry-etag"}} =
              ObjectStore.put_object(store(adapter), "__nodes/test@localhost", "heartbeat",
                max_retries: 1,
-               timeout: 1_000
+               timeout: :infinity
              )
 
     for _attempt <- 1..2 do
@@ -66,7 +68,7 @@ defmodule DurableServer.ObjectStoreRetryTest do
                "__nodes/test@localhost",
                "heartbeat",
                max_retries: 10,
-               timeout: 1_000
+               timeout: :infinity
              )
 
     assert Process.get(responses_key) == [:unexpected_retry]
@@ -87,10 +89,32 @@ defmodule DurableServer.ObjectStoreRetryTest do
                "__nodes/test@localhost",
                "heartbeat",
                max_retries: 1,
-               timeout: 1_000
+               timeout: :infinity
              )
 
     assert Process.get(responses_key) == [:unexpected_retry]
+  end
+
+  test "an expired operation deadline prevents otherwise retryable failures from retrying" do
+    for failure <- [
+          %Req.Response{status: 503},
+          %Req.TransportError{reason: :timeout},
+          %Req.HTTPError{protocol: :http2, reason: :unprocessed}
+        ] do
+      responses_key = make_ref()
+      Process.put(responses_key, [failure, :unexpected_retry])
+
+      assert {:error, ^failure} =
+               ObjectStore.put_object(
+                 store(adapter(responses_key)),
+                 "__nodes/test@localhost",
+                 "heartbeat",
+                 max_retries: 10,
+                 timeout: 0
+               )
+
+      assert Process.get(responses_key) == [:unexpected_retry]
+    end
   end
 
   test "finite operation deadlines cap each HTTP receive attempt" do
