@@ -4358,8 +4358,10 @@ defmodule DurableServer.Supervisor do
     end
   end
 
+  # function_exported?/3 is false for a module that is not loaded yet, which
+  # would silently drop its setting on a first start, so load it first.
   defp module_hibernate_after(module) do
-    if function_exported?(module, :__durable_server_config__, 0),
+    if Code.ensure_loaded?(module) and function_exported?(module, :__durable_server_config__, 0),
       do: Map.get(module.__durable_server_config__(), :hibernate_after),
       else: nil
   end

@@ -1845,6 +1845,30 @@ defmodule DurableServerTest do
       refute hibernating?(pid)
     end
 
+    @tag :tmp_dir
+    test "a module's setting is found even before the module is loaded", %{tmp_dir: dir} do
+      [{module, beam}] =
+        Code.compile_string("""
+        defmodule DurableServerTest.OnDiskHibernating do
+          use DurableServer, vsn: 1, hibernate_after: 70
+
+          def dump_state(state), do: state
+          def load_state(_old_vsn, state), do: state
+        end
+        """)
+
+      File.write!(Path.join(dir, "#{module}.beam"), beam)
+      true = :code.add_patha(to_charlist(dir))
+      on_exit(fn -> :code.del_path(to_charlist(dir)) end)
+
+      :code.purge(module)
+      :code.delete(module)
+      refute :erlang.module_loaded(module)
+
+      # As on a node's first start of this server type: the module loads on demand.
+      assert DurableServer.Supervisor.hibernate_after_for(%{hibernate_after: nil}, module) == 70
+    end
+
     test "an invalid module setting fails at compile time" do
       assert_raise ArgumentError, ~r/hibernate_after must be a positive integer or false/, fn ->
         Code.compile_string("""
