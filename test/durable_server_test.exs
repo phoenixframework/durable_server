@@ -1742,6 +1742,109 @@ defmodule DurableServerTest do
     end
   end
 
+  defmodule IdleServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: Map.take(state, [:key])
+    def load_state(_old_vsn, persisted_state), do: DurableServerTest.atomify_keys(persisted_state)
+    def init(state, info), do: {:ok, Map.put(state, :key, info.key)}
+  end
+
+  defmodule OtherIdleServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state), do: Map.take(state, [:key])
+    def load_state(_old_vsn, persisted_state), do: DurableServerTest.atomify_keys(persisted_state)
+    def init(state, info), do: {:ok, Map.put(state, :key, info.key)}
+  end
+
+  describe "hibernate_after" do
+    defp start_hibernate_sup(hibernate_after) do
+      name = :"hibernate_sup_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        prefix: "hibernate-#{DurableServer.UUID.uuid4()}/",
+        object_store: test_object_store_opts(),
+        hibernate_after: hibernate_after
+      ]
+
+      start_supervised!(%{
+        id: {DurableServer.Supervisor, name},
+        start: {DurableServer.Supervisor, :start_link, [opts]},
+        type: :supervisor
+      })
+
+      name
+    end
+
+    defp start_idle(sup, module) do
+      key = "hibernate-#{DurableServer.UUID.uuid4()}"
+
+      {:ok, {pid, _meta}} =
+        DurableServer.Supervisor.start_child(sup, {module, key: key, initial_state: %{}})
+
+      pid
+    end
+
+    # OTP 28 hibernates a gen_server in place; older releases use erlang:hibernate/3.
+    defp hibernating?(pid) do
+      case Process.info(pid, :current_function) do
+        {:current_function, {:gen_server, :loop_hibernate, _arity}} -> true
+        {:current_function, {:erlang, :hibernate, 3}} -> true
+        _other -> false
+      end
+    end
+
+    defp eventually(fun, attempts \\ 50) do
+      cond do
+        fun.() -> true
+        attempts == 0 -> false
+        true -> Process.sleep(20) && eventually(fun, attempts - 1)
+      end
+    end
+
+    test "a per-module setting hibernates only the listed modules" do
+      sup = start_hibernate_sup(%{IdleServer => 50})
+      listed = start_idle(sup, IdleServer)
+      unlisted = start_idle(sup, OtherIdleServer)
+
+      assert eventually(fn -> hibernating?(listed) end)
+      Process.sleep(300)
+      refute hibernating?(unlisted)
+
+      # A hibernated server still serves calls.
+      assert %{key: "hibernate-" <> _} = :sys.get_state(listed).user_state
+    end
+
+    test "an integer setting applies to every module" do
+      sup = start_hibernate_sup(50)
+      pid = start_idle(sup, OtherIdleServer)
+      assert eventually(fn -> hibernating?(pid) end)
+    end
+
+    test "without the option servers never hibernate" do
+      sup = start_hibernate_sup(nil)
+      pid = start_idle(sup, IdleServer)
+      Process.sleep(300)
+      refute hibernating?(pid)
+    end
+
+    test "invalid settings are rejected when the supervisor starts" do
+      Process.flag(:trap_exit, true)
+
+      for invalid <- [0, -5, "15000", %{IdleServer => 0}, %{"IdleServer" => 100}] do
+        assert {:error, _reason} =
+                 DurableServer.Supervisor.start_link(
+                   name: :"hibernate_bad_#{System.unique_integer([:positive])}",
+                   prefix: "hibernate-bad/",
+                   object_store: test_object_store_opts(),
+                   hibernate_after: invalid
+                 )
+      end
+    end
+  end
+
   describe "basic GenServer behavior" do
     setup %{supervisor_name: supervisor_name, prefix: _prefix} do
       key = "basic-server-#{DurableServer.UUID.uuid4()}"

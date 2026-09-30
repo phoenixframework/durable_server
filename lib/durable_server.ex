@@ -1000,10 +1000,17 @@ defmodule DurableServer do
           init_arg: _init_arg,
           boot_info: _boot_info,
           supervisor_name: _supervisor_name,
-          config: _config
+          config: config
         } = info
       ) do
-    GenServer.start_link(__MODULE__, info)
+    GenServer.start_link(__MODULE__, info, start_opts(info.module, config))
+  end
+
+  defp start_opts(module, config) do
+    case DurableServer.Supervisor.hibernate_after_for(config, module) do
+      nil -> []
+      ms -> [hibernate_after: ms]
+    end
   end
 
   @impl true
