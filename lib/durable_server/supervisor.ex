@@ -65,6 +65,12 @@ defmodule DurableServer.Supervisor do
   - `:name` - Required. Registered name for this supervisor instance
   - `:prefix` - Required. Object storage prefix for scoping (should end with "/")
   - `:max_children` - Maximum concurrent DurableServer processes (default: :infinity)
+  - `:hibernate_after` - Milliseconds without a message after which a
+    DurableServer process hibernates, compacting its heap to live data. Either a
+    positive integer for every module, or a map of `Module => ms`, like
+    `:max_children`, where a `:default` key covers modules not listed. Applies
+    wherever this supervisor starts a child, including restarts and rehoming.
+    Default: `nil` (never hibernate).
   - `:discovery_interval_ms` - How often to scan for orphaned servers (default: 60_000)
   - `:initial_discovery_delay_ms` - Initial delay before the first discovery sweep.
     Accepts either a fixed integer delay or a `{min_ms, max_ms}` jitter tuple
@@ -647,6 +653,12 @@ defmodule DurableServer.Supervisor do
   - `:name` - Required. The registered name for this supervisor
   - `:prefix` - Required. Object storage prefix (should end with "/")
   - `:max_children` - Maximum concurrent children (default: :infinity)
+  - `:hibernate_after` - Milliseconds without a message after which a
+    DurableServer process hibernates, compacting its heap to live data. Either a
+    positive integer for every module, or a map of `Module => ms`, like
+    `:max_children`, where a `:default` key covers modules not listed. Applies
+    wherever this supervisor starts a child, including restarts and rehoming.
+    Default: `nil` (never hibernate).
   - `:discovery_interval_ms` - Lifecycle discovery interval (default: 60_000)
   - `:initial_discovery_delay_ms` - Initial discovery delay as a fixed integer or
     `{min_ms, max_ms}` jitter tuple (default: `{1_000, 6_000}`)
@@ -3347,7 +3359,8 @@ defmodule DurableServer.Supervisor do
         :placement_region,
         :placement_erpc_timeout_same_region_ms,
         :placement_erpc_timeout_cross_region_ms,
-        :max_singleflight_waiters_per_key_module
+        :max_singleflight_waiters_per_key_module,
+        :hibernate_after
       ])
 
     name = Keyword.fetch!(opts, :name)
@@ -3509,6 +3522,8 @@ defmodule DurableServer.Supervisor do
     max_singleflight_waiters_per_key_module =
       extract_max_singleflight_waiters_per_key_module_config(opts)
 
+    hibernate_after = extract_hibernate_after_config(opts)
+
     if placement_erpc_timeout_same_region_ms > placement_erpc_timeout_cross_region_ms do
       Logger.warning(
         "placement_erpc_timeout_same_region_ms (#{placement_erpc_timeout_same_region_ms}) is greater than " <>
@@ -3595,6 +3610,7 @@ defmodule DurableServer.Supervisor do
       placement_erpc_timeout_same_region_ms: placement_erpc_timeout_same_region_ms,
       placement_erpc_timeout_cross_region_ms: placement_erpc_timeout_cross_region_ms,
       max_singleflight_waiters_per_key_module: max_singleflight_waiters_per_key_module,
+      hibernate_after: hibernate_after,
       circuit_breaker: circuit_breaker,
       ets_table: table_name
     }
@@ -4318,6 +4334,41 @@ defmodule DurableServer.Supervisor do
 
     {same_region_timeout_ms, cross_region_timeout_ms}
   end
+
+  defp extract_hibernate_after_config(opts) do
+    case Keyword.get(opts, :hibernate_after) do
+      nil ->
+        nil
+
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      %{} = per_module ->
+        Enum.each(per_module, fn
+          {key, ms} when is_atom(key) and is_integer(ms) and ms > 0 ->
+            :ok
+
+          entry ->
+            raise ArgumentError,
+                  "hibernate_after map entries must be Module (or :default) => positive integer, got: #{inspect(entry)}"
+        end)
+
+        per_module
+
+      other ->
+        raise ArgumentError,
+              "hibernate_after must be a positive integer or a map of Module => positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  @doc false
+  # The hibernate_after a supervisor's config gives `module`, or nil.
+  def hibernate_after_for(%{hibernate_after: ms}, _module) when is_integer(ms), do: ms
+
+  def hibernate_after_for(%{hibernate_after: %{} = per_module}, module),
+    do: Map.get(per_module, module, Map.get(per_module, :default))
+
+  def hibernate_after_for(_config, _module), do: nil
 
   defp extract_max_singleflight_waiters_per_key_module_config(opts) do
     case Keyword.fetch(opts, :max_singleflight_waiters_per_key_module) do
