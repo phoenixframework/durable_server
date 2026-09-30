@@ -65,11 +65,12 @@ defmodule DurableServer.Supervisor do
   - `:name` - Required. Registered name for this supervisor instance
   - `:prefix` - Required. Object storage prefix for scoping (should end with "/")
   - `:max_children` - Maximum concurrent DurableServer processes (default: :infinity)
-  - `:hibernate_after` - Default milliseconds without a message after which a
-    DurableServer process hibernates, compacting its heap to live data. A module
-    overrides it with `use DurableServer, hibernate_after: ms`, or opts out with
-    `hibernate_after: false`. Applies wherever this supervisor starts a child,
-    including restarts and rehoming. Default: `nil` (never hibernate).
+  - `:hibernate_after` - Milliseconds without a message after which a
+    DurableServer process hibernates, compacting its heap to live data. Either a
+    positive integer for every module, or a map of `Module => ms`, like
+    `:max_children`, where a `:default` key covers modules not listed. Applies
+    wherever this supervisor starts a child, including restarts and rehoming.
+    Default: `nil` (never hibernate).
   - `:discovery_interval_ms` - How often to scan for orphaned servers (default: 60_000)
   - `:initial_discovery_delay_ms` - Initial delay before the first discovery sweep.
     Accepts either a fixed integer delay or a `{min_ms, max_ms}` jitter tuple
@@ -652,11 +653,12 @@ defmodule DurableServer.Supervisor do
   - `:name` - Required. The registered name for this supervisor
   - `:prefix` - Required. Object storage prefix (should end with "/")
   - `:max_children` - Maximum concurrent children (default: :infinity)
-  - `:hibernate_after` - Default milliseconds without a message after which a
-    DurableServer process hibernates, compacting its heap to live data. A module
-    overrides it with `use DurableServer, hibernate_after: ms`, or opts out with
-    `hibernate_after: false`. Applies wherever this supervisor starts a child,
-    including restarts and rehoming. Default: `nil` (never hibernate).
+  - `:hibernate_after` - Milliseconds without a message after which a
+    DurableServer process hibernates, compacting its heap to live data. Either a
+    positive integer for every module, or a map of `Module => ms`, like
+    `:max_children`, where a `:default` key covers modules not listed. Applies
+    wherever this supervisor starts a child, including restarts and rehoming.
+    Default: `nil` (never hibernate).
   - `:discovery_interval_ms` - Lifecycle discovery interval (default: 60_000)
   - `:initial_discovery_delay_ms` - Initial discovery delay as a fixed integer or
     `{min_ms, max_ms}` jitter tuple (default: `{1_000, 6_000}`)
@@ -4341,30 +4343,32 @@ defmodule DurableServer.Supervisor do
       ms when is_integer(ms) and ms > 0 ->
         ms
 
+      %{} = per_module ->
+        Enum.each(per_module, fn
+          {key, ms} when is_atom(key) and is_integer(ms) and ms > 0 ->
+            :ok
+
+          entry ->
+            raise ArgumentError,
+                  "hibernate_after map entries must be Module (or :default) => positive integer, got: #{inspect(entry)}"
+        end)
+
+        per_module
+
       other ->
         raise ArgumentError,
-              "hibernate_after must be a positive integer, got: #{inspect(other)}"
+              "hibernate_after must be a positive integer or a map of Module => positive integer, got: #{inspect(other)}"
     end
   end
 
   @doc false
-  # A module's own `use DurableServer, hibernate_after: ...` wins; `false` opts
-  # out; otherwise the supervisor's default applies.
-  def hibernate_after_for(config, module) do
-    case module_hibernate_after(module) do
-      ms when is_integer(ms) -> ms
-      false -> nil
-      nil -> Map.get(config, :hibernate_after)
-    end
-  end
+  # The hibernate_after a supervisor's config gives `module`, or nil.
+  def hibernate_after_for(%{hibernate_after: ms}, _module) when is_integer(ms), do: ms
 
-  # function_exported?/3 is false for a module that is not loaded yet, which
-  # would silently drop its setting on a first start, so load it first.
-  defp module_hibernate_after(module) do
-    if Code.ensure_loaded?(module) and function_exported?(module, :__durable_server_config__, 0),
-      do: Map.get(module.__durable_server_config__(), :hibernate_after),
-      else: nil
-  end
+  def hibernate_after_for(%{hibernate_after: %{} = per_module}, module),
+    do: Map.get(per_module, module, Map.get(per_module, :default))
+
+  def hibernate_after_for(_config, _module), do: nil
 
   defp extract_max_singleflight_waiters_per_key_module_config(opts) do
     case Keyword.fetch(opts, :max_singleflight_waiters_per_key_module) do

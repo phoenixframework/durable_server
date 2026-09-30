@@ -93,16 +93,6 @@ defmodule DurableServer do
         ]
       end
 
-  ## `use DurableServer` Options
-
-  - `:vsn` - Required. The current persisted state version, passed to
-    `load_state/2` for migrations.
-  - `:hibernate_after` - Milliseconds without a message after which the server
-    hibernates, compacting its heap to live data. `false` never hibernates, even
-    when the supervisor sets a default. Unset uses the supervisor's
-    `:hibernate_after` default. Because it is part of the module, it applies
-    however the supervisor starts the server, including restarts and rehoming.
-
   ## Advanced Example: Session Manager
 
       defmodule UserSessionServer do
@@ -921,22 +911,6 @@ defmodule DurableServer do
                 "the current :vsn must be provided:, ie: `use DurableServer, vsn: 1`"
       end
 
-    hibernate_after =
-      case Keyword.get(opts, :hibernate_after) do
-        nil ->
-          nil
-
-        false ->
-          false
-
-        ms when is_integer(ms) and ms > 0 ->
-          ms
-
-        other ->
-          raise ArgumentError,
-                "hibernate_after must be a positive integer or false, got: #{inspect(other)}"
-      end
-
     quote do
       @behaviour DurableServer
       @vsn unquote(vsn)
@@ -944,8 +918,7 @@ defmodule DurableServer do
 
       def __durable_server_config__() do
         %{
-          vsn: @vsn,
-          hibernate_after: unquote(hibernate_after)
+          vsn: @vsn
         }
       end
 

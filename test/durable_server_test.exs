@@ -1750,16 +1750,8 @@ defmodule DurableServerTest do
     def init(state, info), do: {:ok, Map.put(state, :key, info.key)}
   end
 
-  defmodule SelfHibernatingServer do
-    use DurableServer, vsn: 1, hibernate_after: 50
-
-    def dump_state(state), do: Map.take(state, [:key])
-    def load_state(_old_vsn, persisted_state), do: DurableServerTest.atomify_keys(persisted_state)
-    def init(state, info), do: {:ok, Map.put(state, :key, info.key)}
-  end
-
-  defmodule NeverHibernatingServer do
-    use DurableServer, vsn: 1, hibernate_after: false
+  defmodule OtherIdleServer do
+    use DurableServer, vsn: 1
 
     def dump_state(state), do: Map.take(state, [:key])
     def load_state(_old_vsn, persisted_state), do: DurableServerTest.atomify_keys(persisted_state)
@@ -1812,77 +1804,45 @@ defmodule DurableServerTest do
       end
     end
 
-    test "a module's own setting applies without a supervisor default" do
-      sup = start_hibernate_sup(nil)
-      own = start_idle(sup, SelfHibernatingServer)
-      default = start_idle(sup, IdleServer)
+    test "a per-module setting hibernates only the listed modules" do
+      sup = start_hibernate_sup(%{IdleServer => 50})
+      listed = start_idle(sup, IdleServer)
+      unlisted = start_idle(sup, OtherIdleServer)
 
-      assert eventually(fn -> hibernating?(own) end)
+      assert eventually(fn -> hibernating?(listed) end)
       Process.sleep(300)
-      refute hibernating?(default)
+      refute hibernating?(unlisted)
 
       # A hibernated server still serves calls.
-      assert %{key: "hibernate-" <> _} = :sys.get_state(own).user_state
+      assert %{key: "hibernate-" <> _} = :sys.get_state(listed).user_state
     end
 
-    test "the supervisor default applies to modules that set nothing" do
+    test "a :default entry covers modules the map does not list" do
+      sup = start_hibernate_sup(%{IdleServer => 60_000, default: 50})
+      listed = start_idle(sup, IdleServer)
+      other = start_idle(sup, OtherIdleServer)
+
+      assert eventually(fn -> hibernating?(other) end)
+      refute hibernating?(listed)
+    end
+
+    test "an integer setting applies to every module" do
       sup = start_hibernate_sup(50)
-      pid = start_idle(sup, IdleServer)
+      pid = start_idle(sup, OtherIdleServer)
       assert eventually(fn -> hibernating?(pid) end)
     end
 
-    test "a module can opt out of the supervisor default" do
-      sup = start_hibernate_sup(50)
-      opted_out = start_idle(sup, NeverHibernatingServer)
-      Process.sleep(300)
-      refute hibernating?(opted_out)
-    end
-
-    test "without any setting servers never hibernate" do
+    test "without the option servers never hibernate" do
       sup = start_hibernate_sup(nil)
       pid = start_idle(sup, IdleServer)
       Process.sleep(300)
       refute hibernating?(pid)
     end
 
-    @tag :tmp_dir
-    test "a module's setting is found even before the module is loaded", %{tmp_dir: dir} do
-      [{module, beam}] =
-        Code.compile_string("""
-        defmodule DurableServerTest.OnDiskHibernating do
-          use DurableServer, vsn: 1, hibernate_after: 70
-
-          def dump_state(state), do: state
-          def load_state(_old_vsn, state), do: state
-        end
-        """)
-
-      File.write!(Path.join(dir, "#{module}.beam"), beam)
-      true = :code.add_patha(to_charlist(dir))
-      on_exit(fn -> :code.del_path(to_charlist(dir)) end)
-
-      :code.purge(module)
-      :code.delete(module)
-      refute :erlang.module_loaded(module)
-
-      # As on a node's first start of this server type: the module loads on demand.
-      assert DurableServer.Supervisor.hibernate_after_for(%{hibernate_after: nil}, module) == 70
-    end
-
-    test "an invalid module setting fails at compile time" do
-      assert_raise ArgumentError, ~r/hibernate_after must be a positive integer or false/, fn ->
-        Code.compile_string("""
-        defmodule DurableServerTest.BadHibernate do
-          use DurableServer, vsn: 1, hibernate_after: 0
-        end
-        """)
-      end
-    end
-
     test "invalid settings are rejected when the supervisor starts" do
       Process.flag(:trap_exit, true)
 
-      for invalid <- [0, -5, "15000", %{IdleServer => 100}] do
+      for invalid <- [0, -5, "15000", %{IdleServer => 0}, %{"IdleServer" => 100}, %{default: -1}] do
         assert {:error, _reason} =
                  DurableServer.Supervisor.start_link(
                    name: :"hibernate_bad_#{System.unique_integer([:positive])}",
