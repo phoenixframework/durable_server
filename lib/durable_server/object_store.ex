@@ -753,7 +753,9 @@ defmodule DurableServer.ObjectStore do
            method: :put,
            url: key,
            body: body,
-           retry: false
+           retry: :transient,
+           max_retries: 2,
+           receive_timeout: @default_retry_attempt_timeout
          ) do
       {:ok, %{status: status, headers: headers}}
       when status >= 200 and status < 300 ->

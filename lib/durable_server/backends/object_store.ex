@@ -84,36 +84,35 @@ defmodule DurableServer.Backends.ObjectStore do
   defp resolve_ambiguous_conditional_put(
          %ObjectStore{} = store,
          key,
-         %StoredState{meta: %Meta{} = attempted_meta} = data,
+         data,
          encoded,
          opts
        ) do
-    if Keyword.has_key?(opts, :etag) do
-      case ObjectStore.get_object(store, key, consistent: true) do
-        {:ok, %{body: ^encoded, etag: etag}} ->
-          with {:ok, %StoredState{meta: %Meta{} = persisted_meta}} <- decode_body(encoded),
-               true <- same_boot_owner?(attempted_meta, persisted_meta) do
-            {:ok, %{body: data, etag: etag}}
-          else
-            _other -> {:error, :conflict}
-          end
-
-        _other ->
-          {:error, :conflict}
-      end
+    with true <- Keyword.has_key?(opts, :etag),
+         {:ok, etag} <- read_matching_owned_state(store, key, data, encoded) do
+      {:ok, %{body: data, etag: etag}}
     else
-      {:error, :conflict}
+      _other -> {:error, :conflict}
     end
   end
 
-  defp resolve_ambiguous_conditional_put(
-         %ObjectStore{},
-         _key,
-         _data,
-         _encoded,
-         _opts
-       ),
-       do: {:error, :conflict}
+  defp read_matching_owned_state(
+         store,
+         key,
+         %StoredState{meta: %Meta{} = attempted_meta},
+         encoded
+       ) do
+    with {:ok, %{body: ^encoded, etag: etag}} <-
+           ObjectStore.get_object(store, key, consistent: true),
+         {:ok, %StoredState{meta: %Meta{} = persisted_meta}} <- decode_body(encoded),
+         true <- same_boot_owner?(attempted_meta, persisted_meta) do
+      {:ok, etag}
+    else
+      _other -> :error
+    end
+  end
+
+  defp read_matching_owned_state(_store, _key, _data, _encoded), do: :error
 
   defp same_boot_owner?(
          %Meta{pid: pid, node_ref: node_ref, node_str: node_str},
@@ -137,7 +136,24 @@ defmodule DurableServer.Backends.ObjectStore do
   @impl true
   def try_claim(%ObjectStore{} = store, key, body) do
     with {:ok, encoded} <- encode_body(body) do
-      ObjectStore.try_claim(store, key, encoded)
+      case ObjectStore.try_claim(store, key, encoded) do
+        {:error, :already_claimed} ->
+          resolve_ambiguous_claim(store, key, body, encoded, :already_claimed)
+
+        {:error, %Req.TransportError{} = reason} ->
+          resolve_ambiguous_claim(store, key, body, encoded, reason)
+
+        result ->
+          result
+      end
+    end
+  end
+
+  # A lost claim response is recoverable only for this boot's exact stored state.
+  defp resolve_ambiguous_claim(store, key, body, encoded, reason) do
+    case read_matching_owned_state(store, key, body, encoded) do
+      {:ok, etag} -> {:ok, {:claimed, etag}}
+      :error -> {:error, reason}
     end
   end
 
