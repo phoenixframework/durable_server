@@ -46,6 +46,7 @@ defmodule DurableServer.MixProject do
       {:finch, "~> 0.18"},
       {:sweet_xml, "~> 0.7"},
       {:ex_doc, "~> 0.30", only: :dev, runtime: false},
+      {:stream_data, "~> 1.2", only: :test},
       {:ekv, "~> 0.4.0", optional: true}
     ]
   end
