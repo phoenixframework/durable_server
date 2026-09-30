@@ -2116,7 +2116,7 @@ defmodule DurableServer.LifecycleManager do
           :skip ->
             # permanently non-restartable — cache without meta
             now = System.monotonic_time(:millisecond)
-            :ets.insert(state.discovery_skip_table, {key, etag, :skip, now})
+            skip_cache_put(state, {key, etag, :skip, now})
             clear_restart_gate_state(state, key)
             :noop
 
@@ -2125,7 +2125,7 @@ defmodule DurableServer.LifecycleManager do
             # health check) — cache trimmed meta for re-evaluation next round
             now = System.monotonic_time(:millisecond)
             trimmed = trim_meta_for_cache(meta)
-            :ets.insert(state.discovery_skip_table, {key, etag, trimmed, now})
+            skip_cache_put(state, {key, etag, trimmed, now})
             clear_restart_gate_state(state, key)
             :noop
 
@@ -2163,6 +2163,15 @@ defmodule DurableServer.LifecycleManager do
 
     log_discovery_diagnostics_delta(state, diagnostics_before)
     :ok
+  end
+
+  defp skip_cache_put(%LifecycleManager{} = state, entry) do
+    case :ets.whereis(state.discovery_skip_table) do
+      :undefined -> :ok
+      _ -> :ets.insert(state.discovery_skip_table, entry)
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   defp discovery_diag_snapshot(%LifecycleManager{} = state) do
@@ -2562,38 +2571,46 @@ defmodule DurableServer.LifecycleManager do
   end
 
   defp discovery_skip?(%LifecycleManager{} = state, key, etag) do
-    case :ets.lookup(state.discovery_skip_table, key) do
-      [{^key, ^etag, :skip, _ts}] ->
-        true
-
-      [{^key, ^etag, %Meta{} = meta, _ts}] ->
-        # Etag unchanged so stored state is identical, but time-dependent checks
-        # (placement gates, circuit breaker, node health) may have changed.
-        case CircuitBreaker.check_module_circuit_breaker(state.circuit_breaker, meta.module) do
-          {:circuit_open, _} ->
-            true
-
-          :ok ->
-            case appears_restartable?(state, meta) do
-              {:restartable, _claim_context} ->
-                # Now restartable — remove from cache, let async task do fresh GET
-                :ets.delete(state.discovery_skip_table, key)
-                false
-
-              :transient ->
-                # Heartbeat/read uncertainty is not a stable "non-restartable" state.
-                # Drop the cache entry so the next async pass does a fresh read.
-                :ets.delete(state.discovery_skip_table, key)
-                false
-
-              false ->
-                true
-            end
-        end
+    case :ets.whereis(state.discovery_skip_table) do
+      :undefined ->
+        false
 
       _ ->
-        false
+        case :ets.lookup(state.discovery_skip_table, key) do
+          [{^key, ^etag, :skip, _ts}] ->
+            true
+
+          [{^key, ^etag, %Meta{} = meta, _ts}] ->
+            # Etag unchanged so stored state is identical, but time-dependent checks
+            # (placement gates, circuit breaker, node health) may have changed.
+            case CircuitBreaker.check_module_circuit_breaker(state.circuit_breaker, meta.module) do
+              {:circuit_open, _} ->
+                true
+
+              :ok ->
+                case appears_restartable?(state, meta) do
+                  {:restartable, _claim_context} ->
+                    # Now restartable — remove from cache, let async task do fresh GET
+                    :ets.delete(state.discovery_skip_table, key)
+                    false
+
+                  :transient ->
+                    # Heartbeat/read uncertainty is not a stable "non-restartable" state.
+                    # Drop the cache entry so the next async pass does a fresh read.
+                    :ets.delete(state.discovery_skip_table, key)
+                    false
+
+                  false ->
+                    true
+                end
+            end
+
+          _ ->
+            false
+        end
     end
+  rescue
+    ArgumentError -> false
   end
 
   # Strip fields not needed for re-evaluation to reduce ETS memory.
