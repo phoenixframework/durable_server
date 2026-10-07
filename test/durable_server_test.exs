@@ -187,6 +187,41 @@ defmodule DurableServerTest do
     {:shutdown, {:durable, {:fatal_exit, {:sync_failed, reason}}}}
   end
 
+  defp start_dirty_tracking_server(auto_sync \\ false) do
+    test_pid = self()
+
+    after_put = fn _state, key, _data, _opts, result ->
+      send(test_pid, {:dirty_tracking_put, key, result})
+    end
+
+    {supervisor_name, _supervisor_pid, prefix} =
+      start_test_supervisor(
+        backend: {DurableServerTest.ConsistencyProbeBackend, after_put: after_put},
+        init_info: %{probe_pid: test_pid, auto_sync: auto_sync}
+      )
+
+    key = "dirty-tracking-#{DurableServer.UUID.uuid4()}"
+
+    {:ok, {pid, _meta}} =
+      DurableServer.Supervisor.start_child(
+        supervisor_name,
+        {DurableServerTest.DirtyTrackingServer, key: key, initial_state: %{count: 0}}
+      )
+
+    %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(supervisor_name)
+    storage_key = prefix <> key
+
+    assert_receive {:dirty_tracking_dump, ^pid, 0}
+    assert_receive {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+
+    %{pid: pid, backend: backend, storage_key: storage_key, table: backend_table(backend)}
+  end
+
+  defp periodic_sync(pid) do
+    send(pid, {:durable, :sync})
+    :sys.get_state(pid)
+  end
+
   defp assert_call_sync_failure(pid, request, reason) do
     monitor_ref = Process.monitor(pid)
     expected_exit = fatal_sync_exit(reason)
@@ -822,6 +857,50 @@ defmodule DurableServerTest do
     def handle_call(:get_state, _from, state) do
       {:reply, state, state}
     end
+  end
+
+  defmodule DirtyTrackingServer do
+    use DurableServer, vsn: 1
+
+    def dump_state(state) do
+      if probe_pid = state[:probe_pid] do
+        send(probe_pid, {:dirty_tracking_dump, self(), state.count})
+      end
+
+      Map.take(state, [:count])
+    end
+
+    def load_state(_old_vsn, state), do: state
+
+    def init(state, info) do
+      {:ok, Map.merge(state, %{probe_pid: info.probe_pid, transient: 0, after_sync: nil}),
+       auto_sync: info.auto_sync}
+    end
+
+    def handle_call(:get_state, _from, state), do: {:reply, state, state}
+    def handle_call(:sync_same, _from, state), do: {:reply, :ok, state, :sync}
+
+    def handle_call({:set, key, value}, _from, state) do
+      {:reply, :ok, Map.put(state, key, value)}
+    end
+
+    def handle_call({:continue_count, count}, _from, state) do
+      {:reply, :ok, state, {:continue, {:set_count, count}}}
+    end
+
+    def handle_cast({:set_count, count}, state), do: {:noreply, %{state | count: count}}
+    def handle_info({:set_count, count}, state), do: {:noreply, %{state | count: count}}
+    def handle_continue({:set_count, count}, state), do: {:noreply, %{state | count: count}}
+
+    def handle_sync(_info, _old_state, %{after_sync: :durable} = state) do
+      {:ok, %{state | count: state.count + 1, after_sync: nil}}
+    end
+
+    def handle_sync(_info, _old_state, %{after_sync: :transient} = state) do
+      {:ok, %{state | transient: state.transient + 1, after_sync: nil}}
+    end
+
+    def handle_sync(_info, _old_state, state), do: {:ok, state}
   end
 
   defmodule PeriodicSyncServer do
@@ -2460,6 +2539,209 @@ defmodule DurableServerTest do
       store = test_object_store()
       {:ok, persisted_data} = DurableServer.fetch_stored_state(store, %{key: key, prefix: prefix})
       assert %{state: %{"count" => 0}} = persisted_data
+    end
+  end
+
+  describe "dirty tracking" do
+    @describetag :dirty_tracking
+
+    test "idle ticks and unchanged callbacks skip dumping and storage writes" do
+      %{pid: pid, storage_key: storage_key} = start_dirty_tracking_server()
+
+      for _ <- 1..3 do
+        assert %{count: 0} = GenServer.call(pid, :get_state)
+        assert :ok = GenServer.call(pid, {:set, :count, 0})
+        GenServer.cast(pid, {:set_count, 0})
+        send(pid, {:set_count, 0})
+        assert :ok = GenServer.call(pid, {:continue_count, 0})
+        periodic_sync(pid)
+      end
+
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+    end
+
+    test "unchanged callbacks preserve pending changes from every callback type" do
+      %{pid: pid, backend: backend, storage_key: storage_key} = start_dirty_tracking_server()
+
+      updates = [
+        fn -> GenServer.call(pid, {:set, :count, 1}) end,
+        fn -> GenServer.cast(pid, {:set_count, 2}) end,
+        fn -> send(pid, {:set_count, 3}) end,
+        fn -> GenServer.call(pid, {:continue_count, 4}) end
+      ]
+
+      for {update, count} <- Enum.with_index(updates, 1) do
+        update.()
+        assert %{count: ^count} = GenServer.call(pid, :get_state)
+        periodic_sync(pid)
+
+        assert_received {:dirty_tracking_dump, ^pid, ^count}
+        assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+
+        assert {:ok, %{body: %StoredState{state: %{count: ^count}}}} =
+                 StorageBackend.get_object(backend, storage_key)
+
+        periodic_sync(pid)
+        refute_received {:dirty_tracking_dump, ^pid, _count}
+        refute_received {:dirty_tracking_put, ^storage_key, _result}
+      end
+    end
+
+    test "transient changes and reverted durable changes need only one check" do
+      %{pid: pid, storage_key: storage_key} = start_dirty_tracking_server()
+
+      assert :ok = GenServer.call(pid, {:set, :transient, 1})
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 0}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+
+      periodic_sync(pid)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+
+      assert :ok = GenServer.call(pid, {:set, :count, 1})
+      assert :ok = GenServer.call(pid, {:set, :count, 0})
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 0}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+
+      periodic_sync(pid)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+    end
+
+    test "state comparison distinguishes integers from floats" do
+      %{pid: pid, backend: backend, storage_key: storage_key} = start_dirty_tracking_server()
+      float_count = 0.0
+
+      assert :ok = GenServer.call(pid, {:set, :count, float_count})
+      periodic_sync(pid)
+
+      assert_received {:dirty_tracking_dump, ^pid, ^float_count}
+      assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+
+      assert {:ok, %{body: %StoredState{state: %{count: ^float_count}}}} =
+               StorageBackend.get_object(backend, storage_key)
+    end
+
+    test "automatic sync skips unchanged callbacks after checking changes" do
+      %{pid: pid, storage_key: storage_key} = start_dirty_tracking_server(true)
+
+      assert %{count: 0} = GenServer.call(pid, :get_state)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+
+      assert :ok = GenServer.call(pid, {:set, :transient, 1})
+      assert_received {:dirty_tracking_dump, ^pid, 0}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+
+      assert :ok = GenServer.call(pid, {:set, :count, 1})
+      assert_received {:dirty_tracking_dump, ^pid, 1}
+      assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+
+      assert %{count: 1} = GenServer.call(pid, :get_state)
+      periodic_sync(pid)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+    end
+
+    test "failed writes remain pending across unchanged callbacks" do
+      %{pid: pid, backend: backend, storage_key: storage_key, table: table} =
+        start_dirty_tracking_server()
+
+      put_backend_write_override(table, storage_key, {:error, :unavailable})
+      assert :ok = GenServer.call(pid, {:set, :count, 1})
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 1}
+      assert_received {:dirty_tracking_put, ^storage_key, {:error, :unavailable}}
+
+      assert {:ok, %{body: %StoredState{state: %{count: 0}}}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      assert %{count: 1} = GenServer.call(pid, :get_state)
+      clear_backend_write_override(table, storage_key)
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 1}
+      assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+
+      assert {:ok, %{body: %StoredState{state: %{count: 1}}}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      periodic_sync(pid)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+    end
+
+    test "durable changes returned by handle_sync remain pending for another write" do
+      %{pid: pid, backend: backend, storage_key: storage_key} = start_dirty_tracking_server()
+
+      assert :ok = GenServer.call(pid, {:set, :after_sync, :durable})
+      assert :ok = GenServer.call(pid, {:set, :count, 1})
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 1}
+      assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+      assert %{count: 2} = GenServer.call(pid, :get_state)
+
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 2}
+      assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+
+      assert {:ok, %{body: %StoredState{state: %{count: 2}}}} =
+               StorageBackend.get_object(backend, storage_key)
+
+      periodic_sync(pid)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+    end
+
+    test "transient changes returned by handle_sync clear after one noop check" do
+      %{pid: pid, storage_key: storage_key} = start_dirty_tracking_server()
+
+      assert :ok = GenServer.call(pid, {:set, :after_sync, :transient})
+      assert :ok = GenServer.call(pid, {:set, :count, 1})
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 1}
+      assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+      assert %{count: 1, transient: 1} = GenServer.call(pid, :get_state)
+
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 1}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+
+      periodic_sync(pid)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
+    end
+
+    test "explicit sync and final status writes still evaluate clean state" do
+      %{pid: pid, backend: backend, storage_key: storage_key} = start_dirty_tracking_server()
+
+      assert :ok = GenServer.call(pid, :sync_same)
+      assert_received {:dirty_tracking_dump, ^pid, 0}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+
+      assert :ok = GenServer.stop(pid, :shutdown)
+      assert_received {:dirty_tracking_dump, ^pid, 0}
+      assert_received {:dirty_tracking_put, ^storage_key, {:ok, _object}}
+
+      assert {:ok, %{body: %StoredState{meta: %Meta{status: :stopped_graceful}}}} =
+               StorageBackend.get_object(backend, storage_key)
+    end
+
+    test "code upgrades invalidate the check even when user state is unchanged" do
+      %{pid: pid, storage_key: storage_key} = start_dirty_tracking_server()
+
+      :ok = :sys.suspend(pid)
+      :ok = :sys.change_code(pid, DurableServer, 1, :noop)
+      :ok = :sys.resume(pid)
+      assert %{count: 0} = GenServer.call(pid, :get_state)
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 0}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+
+      # Exercise lazy version migration on a tick without a user callback.
+      :sys.replace_state(pid, &%{&1 | vsn: 0})
+      periodic_sync(pid)
+      assert_received {:dirty_tracking_dump, ^pid, 0}
+      refute_received {:dirty_tracking_put, ^storage_key, _result}
+
+      periodic_sync(pid)
+      refute_received {:dirty_tracking_dump, ^pid, _count}
     end
   end
 

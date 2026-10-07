@@ -139,7 +139,7 @@ defmodule DurableServer do
 
   DurableServer supports these options in the `init/1` or `init/2` return tuple:
 
-  - `:auto_sync` - Enable automatic periodic syncing (default: false)
+  - `:auto_sync` - Enable automatic syncing on callback return (default: false)
   - `:sync_every_ms` - Sync interval in milliseconds (default: 30_000)
   - `:meta` - Optional metadata to include for the globally registered server which is
     returned alongside the pid with `DurableServer.Supervisor.lookup/2`.
@@ -202,6 +202,11 @@ defmodule DurableServer do
     sync can persist the dirty state. Storage conflicts remain fatal.
   3. **Graceful shutdown**: Automatically synced during normal termination, ie: cold deploys
   4. **Before stopping**: When returning `{:stop, reason, state}` from callbacks
+
+  Periodic and automatic sync skip dumping and hashing while callback state is exactly
+  unchanged and no earlier change is pending. Runtime changes are checked with `dump_state/1`
+  before deciding whether a storage write is needed. Explicit sync and lifecycle writes
+  always evaluate the dump.
 
   ## Stopping Behavior
 
@@ -269,20 +274,15 @@ defmodule DurableServer do
 
   ## Capacity-Aware Placement
 
-  DurableServers support automatic capacity-aware placement with remote fallback.
+  New children use the existing least-busy eligible-node ranking, with local considered
+  alongside remote nodes instead of filling local capacity first. Ranking uses the
+  highest utilization across configured child-count, CPU, and memory limits. Full,
+  draining, or resource-limited nodes are excluded; connected nodes are preferred.
 
-  ### Local Placement (Default)
-
-  When starting a child, the local node is tried first. If capacity limits are exceeded,
-  remote placement is attempted automatically.
-
-  ### Remote Placement
-
-  If local capacity is exhausted, DurableServer automatically tries remote nodes:
-
-  1. **Same-region nodes first** - Prioritizes nodes in the same region for lower latency
-  2. **Least busy nodes** - Selects nodes with the lowest utilization across all limits
-  3. **Configurable retries** - Default 3 remote nodes tried, configurable via `max_placement_retries`
+  Local counts include in-flight start reservations. Remote load remains heartbeat-based,
+  so placement is approximate rather than strictly even during bursts. Admission checks
+  on the selected node still enforce its limits. Restart, rehome, and sticky-placement
+  behavior is unchanged.
 
   ### Capacity Limits
 
@@ -306,14 +306,14 @@ defmodule DurableServer do
 
   Control remote placement behavior per start_child call:
 
-      # Default: Try local, then up to 3 remote nodes
+      # Default: Rank local alongside up to 3 remote nodes
       DurableServer.Supervisor.start_child(sup, {MyServer, key: "user_1", initial_state: %{}})
 
       # Local only, no remote fallback
       DurableServer.Supervisor.start_child(sup, {MyServer, key: "user_1", initial_state: %{}},
         max_placement_retries: 0)
 
-      # Try local, then up to 5 remote nodes
+      # Rank local alongside up to 5 remote nodes
       DurableServer.Supervisor.start_child(sup, {MyServer, key: "user_1", initial_state: %{}},
         max_placement_retries: 5)
 
@@ -757,6 +757,10 @@ defmodule DurableServer do
   - Transform the state shape for storage
   - Remove ephemeral data
 
+  Derive the output deterministically from the supplied state. Periodic and automatic
+  sync skip this callback when runtime state has not changed since the last successful
+  check. If the dump depends on external data, use explicit sync to re-evaluate it.
+
   The returned value must be a plain map at the top level. Nested values are passed
   through to the configured backend as-is, so they only need to be encodable by the
   backend you are using.
@@ -864,6 +868,7 @@ defmodule DurableServer do
             crash_history: [],
             module: nil,
             last_synced_user_state_hash: nil,
+            needs_sync_check: true,
             final_status_set: nil,
             terminator_handled: false,
             delete_requester: nil,
@@ -2111,7 +2116,12 @@ defmodule DurableServer do
   end
 
   def handle_info({@durable, :sync}, %__MODULE__{} = state) do
-    case sync_to_storage(state) do
+    state = maybe_migrate_on_callback(state)
+
+    sync_result =
+      if state.needs_sync_check, do: sync_to_storage(state), else: {:ok, state}
+
+    case sync_result do
       {:ok, %DurableServer{} = new_state} ->
         {:noreply, schedule_sync(new_state)}
 
@@ -2814,7 +2824,8 @@ defmodule DurableServer do
   def code_change(old_vsn, %__MODULE__{} = state, extra) do
     case state.module.code_change(old_vsn, state.user_state, extra) do
       {:ok, new_user_state} ->
-        {:ok, %{state | user_state: new_user_state}}
+        # The dumped shape can change across upgrades even if user state is unchanged.
+        {:ok, %{state | user_state: new_user_state, needs_sync_check: true}}
 
       {:error, reason} ->
         {:error, reason}
@@ -2966,7 +2977,13 @@ defmodule DurableServer do
 
       {:ok, new_user_state} = state.module.code_change(state.vsn, state.user_state, current_vsn)
 
-      %{state | vsn: current_vsn, old_vsn: state.vsn, user_state: new_user_state}
+      %{
+        state
+        | vsn: current_vsn,
+          old_vsn: state.vsn,
+          user_state: new_user_state,
+          needs_sync_check: true
+      }
     end
   end
 
@@ -3340,11 +3357,16 @@ defmodule DurableServer do
 
   defp update_state(%__MODULE__{} = state, new_user_state) do
     new_user_state = validate_user_state!(new_user_state)
-    %{state | user_state: new_user_state}
+
+    %{
+      state
+      | user_state: new_user_state,
+        needs_sync_check: state.needs_sync_check or new_user_state !== state.user_state
+    }
   end
 
   defp auto_sync_to_storage(%DurableServer{module: module, key: key} = state, old_user_state) do
-    if state.auto_sync do
+    if state.auto_sync && state.needs_sync_check do
       old_user_state = old_user_state || state.user_state
 
       # if auto sync fails we continue, but log
@@ -3415,14 +3437,14 @@ defmodule DurableServer do
 
       case put_object(new_state, storage_key(new_state), data) do
         {:ok, %DurableServer{} = new_state} ->
-          synced_state = %{new_state | status: new_meta.status}
+          synced_state = %{new_state | status: new_meta.status, needs_sync_check: false}
           maybe_apply_handle_sync(synced_state, old_user_state, user_state_changed?)
 
         {:error, reason} ->
           {:error, reason}
       end
     else
-      {:ok, new_state}
+      {:ok, %{new_state | needs_sync_check: false}}
     end
   end
 

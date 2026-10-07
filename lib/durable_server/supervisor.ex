@@ -760,6 +760,10 @@ defmodule DurableServer.Supervisor do
   @doc """
   Starts a DurableServer child process under this supervisor.
 
+  New children are placed using the existing least-busy eligible-node ranking,
+  with the local node considered alongside remote nodes. Explicit local starts,
+  automatic restarts, and sticky placement retain their existing behavior.
+
   The child spec is `{Module, key: key, initial_state: initial_state}`.
   `:initial_state` is required and must be a map. Before the first `init/1` or
   `init/2` call, DurableServer passes it through the module's `dump_state/1`,
@@ -772,9 +776,10 @@ defmodule DurableServer.Supervisor do
   - `:local_only` - When `true`, the child will only be started on the local node.
     If the local node is at capacity, returns `{:error, {:capacity_limit, reason}}`
     instead of attempting remote placement. Default: `false`.
-  - `:max_placement_retries` - Maximum number of remote nodes to try when local
-    placement fails due to capacity limits. Default: `3`. Ignored when `local_only: true`.
-  - `:placement_timeout` - Maximum time in milliseconds to keep retrying remote placement.
+  - `:max_placement_retries` - Maximum number of remote nodes to try per placement
+    round, in addition to local. Set to `0` for local-only placement. Default: `3`.
+    Ignored when `local_only: true`.
+  - `:placement_timeout` - Maximum time in milliseconds to keep retrying placement.
     If all placement attempts fail, the caller retries with fresh eligible nodes every
     #{@placement_retry_interval}ms until the deadline. Useful during rolling deploys when
     nodes are temporarily unavailable. Set to `nil` to disable. Default: `#{@default_placement_timeout}`ms.
@@ -934,28 +939,57 @@ defmodule DurableServer.Supervisor do
              check_existing(supervisor, init_arg, boot_info, Keyword.get(opts, :existing, false)) do
         child_spec = {module, init_arg, boot_info}
 
-        case do_start_child(supervisor, child_spec, 0, caller_deadline_ms, reply_to) do
-          {:ok, result} ->
-            {:ok, result}
+        # New starts rank local alongside the other nodes. Keep targeted/preloaded
+        # starts and already-running children on their existing paths.
+        ranked_start? =
+          max_placement_retries > 0 and is_nil(boot_info) and
+            is_nil(lookup(supervisor, Keyword.fetch!(init_arg, :key)))
 
-          {:error, {:capacity_limit, reason}} when max_placement_retries > 0 ->
-            Logger.info("""
-            DurableServer local capacity exceeded for #{inspect(module)} on #{Node.self()}
-            Reason: #{inspect(reason)}
-            Attempting remote placement (max retries: #{max_placement_retries})
-            """)
+        if ranked_start? do
+          # A zero placement timeout means one attempt round, not a zero-length
+          # bootstrap deadline. The caller timeout still bounds that round.
+          placement_deadline_ms =
+            if placement_timeout == 0,
+              do: caller_deadline_ms,
+              else:
+                earlier_deadline(
+                  caller_deadline_ms,
+                  deadline_after_optional_timeout(placement_timeout)
+                )
 
-            placement_deadline_ms = deadline_after_optional_timeout(placement_timeout)
+          try_placement_with_retry(
+            supervisor,
+            child_spec,
+            max_placement_retries,
+            placement_deadline_ms,
+            include_local: true,
+            reply_to: reply_to,
+            retry: placement_timeout != 0
+          )
+        else
+          case do_start_child(supervisor, child_spec, 0, caller_deadline_ms, reply_to) do
+            {:ok, result} ->
+              {:ok, result}
 
-            try_remote_placement_with_retry(
-              supervisor,
-              child_spec,
-              max_placement_retries,
-              earlier_deadline(caller_deadline_ms, placement_deadline_ms)
-            )
+            {:error, {:capacity_limit, reason}} when max_placement_retries > 0 ->
+              Logger.info("""
+              DurableServer local capacity exceeded for #{inspect(module)} on #{Node.self()}
+              Reason: #{inspect(reason)}
+              Attempting remote placement (max retries: #{max_placement_retries})
+              """)
 
-          error ->
-            error
+              placement_deadline_ms = deadline_after_optional_timeout(placement_timeout)
+
+              try_placement_with_retry(
+                supervisor,
+                child_spec,
+                max_placement_retries,
+                earlier_deadline(caller_deadline_ms, placement_deadline_ms)
+              )
+
+            error ->
+              error
+          end
         end
       end
     after
@@ -1630,11 +1664,12 @@ defmodule DurableServer.Supervisor do
 
   defp restart_claim_race_final_retry?(_retries, _remaining_ms), do: false
 
-  defp try_remote_placement(
+  defp try_placement(
          supervisor,
          {module, init_arg, boot_info} = child_spec,
          max_retries,
-         deadline
+         deadline,
+         opts \\ []
        ) do
     key = Keyword.fetch!(init_arg, :key)
 
@@ -1655,6 +1690,7 @@ defmodule DurableServer.Supervisor do
 
     eligible_nodes =
       LifecycleManager.find_eligible_nodes(supervisor, module,
+        include_local: Keyword.get(opts, :include_local, false),
         limit: candidate_limit,
         key: key,
         sticky_placement: sticky_placement,
@@ -1673,6 +1709,8 @@ defmodule DurableServer.Supervisor do
 
       nodes ->
         try_nodes(supervisor, child_spec, nodes,
+          include_local: Keyword.get(opts, :include_local, false),
+          reply_to: Keyword.get(opts, :reply_to),
           key: key,
           sticky_placement: sticky_placement,
           sticky_meta: sticky_meta,
@@ -1681,13 +1719,13 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  # Prioritizes remote placement targets to avoid timeout storms:
+  # Prioritizes placement targets to avoid timeout storms:
   # 1) Prefer connected nodes first
   # 2) Skip nodes currently in timeout cooldown
   # 3) If no connected targets remain, allow disconnected nodes as fallback
   defp prioritize_placement_nodes(nodes, supervisor, max_retries)
        when is_list(nodes) and is_atom(supervisor) and is_integer(max_retries) do
-    connected_set = Node.list() |> MapSet.new()
+    connected_set = [node() | Node.list()] |> MapSet.new()
 
     {connected_nodes, disconnected_nodes} =
       Enum.split_with(nodes, fn node -> MapSet.member?(connected_set, node) end)
@@ -1711,7 +1749,9 @@ defmodule DurableServer.Supervisor do
         [] -> disconnected_candidates
       end
 
-    Enum.take(candidates, max_retries)
+    # Local is an extra candidate, not part of the remote attempt budget.
+    remote_candidates = candidates |> Enum.reject(&(&1 == node())) |> Enum.take(max_retries)
+    Enum.filter(candidates, &(&1 == node() or &1 in remote_candidates))
   end
 
   defp placement_node_in_timeout_cooldown?(supervisor, node)
@@ -1756,17 +1796,17 @@ defmodule DurableServer.Supervisor do
     _ -> :ok
   end
 
-  defp try_remote_placement_with_retry(supervisor, child_spec, max_retries, deadline) do
-    case try_remote_placement(supervisor, child_spec, max_retries, deadline) do
+  defp try_placement_with_retry(supervisor, child_spec, max_retries, deadline, opts \\ []) do
+    case try_placement(supervisor, child_spec, max_retries, deadline, opts) do
       {:ok, result} ->
         {:ok, result}
 
       {:error, {:capacity_limit, reason}} = error
       when reason in [:no_available_nodes, :all_placement_attempts_failed] ->
-        if deadline != nil and
+        if Keyword.get(opts, :retry, true) and deadline != nil and
              System.monotonic_time(:millisecond) + @placement_retry_interval < deadline do
           Process.sleep(@placement_retry_interval)
-          try_remote_placement_with_retry(supervisor, child_spec, max_retries, deadline)
+          try_placement_with_retry(supervisor, child_spec, max_retries, deadline, opts)
         else
           error
         end
@@ -1860,6 +1900,23 @@ defmodule DurableServer.Supervisor do
     {:error, {:capacity_limit, :all_placement_attempts_failed}}
   end
 
+  defp try_nodes(supervisor, child_spec, [target | rest], placement_opts)
+       when target == node() do
+    case do_start_child(
+           supervisor,
+           child_spec,
+           0,
+           Keyword.get(placement_opts, :deadline),
+           Keyword.fetch!(placement_opts, :reply_to)
+         ) do
+      {:error, {:capacity_limit, _reason}} ->
+        try_nodes(supervisor, child_spec, rest, placement_opts)
+
+      result ->
+        result
+    end
+  end
+
   defp try_nodes(
          supervisor,
          {module, _init_arg, _boot_info} = child_spec,
@@ -1949,6 +2006,7 @@ defmodule DurableServer.Supervisor do
         fresh_nodes =
           LifecycleManager.find_eligible_nodes(supervisor, module,
             limit: 3,
+            include_local: Keyword.get(placement_opts, :include_local, false),
             key: Keyword.get(placement_opts, :key),
             sticky_placement: Keyword.get(placement_opts, :sticky_placement),
             sticky_meta: Keyword.get(placement_opts, :sticky_meta)
@@ -2061,9 +2119,10 @@ defmodule DurableServer.Supervisor do
     Skips sticky placement preferences and never attempts remote placement.
     If the local node is at capacity, returns `{:error, {:capacity_limit, reason}}`.
     Default: `false`.
-  - `:max_placement_retries` - Maximum number of remote nodes to try when local
-    placement fails due to capacity limits. Default: `3`. Ignored when `local_only: true`.
-  - `:placement_timeout` - Maximum time in milliseconds to keep retrying remote placement.
+  - `:max_placement_retries` - Maximum number of remote nodes to try per placement
+    round, in addition to local. Set to `0` for local-only placement. Default: `3`.
+    Ignored when `local_only: true`.
+  - `:placement_timeout` - Maximum time in milliseconds to keep retrying placement.
     When set, if all placement attempts fail, retries with fresh eligible nodes every
     #{@placement_retry_interval}ms until the deadline. Default: `nil` (no retry).
   - `:timeout` - Maximum total time in milliseconds to wait for the process to be
@@ -2245,7 +2304,7 @@ defmodule DurableServer.Supervisor do
             else
               case sticky_placement do
                 nil ->
-                  # No sticky placement, proceed with normal local-first logic
+                  # No sticky placement, proceed with normal placement.
                   {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
 
                 [%{env_var: :any, value: :any} | _] ->
@@ -2321,7 +2380,7 @@ defmodule DurableServer.Supervisor do
               )
 
             true ->
-              # Normal flow: try local first, then remote if capacity exceeded
+              # Rank new children; persisted children retain their local/sticky path.
               start_opts =
                 opts
                 |> Keyword.delete(:existing)
@@ -2636,7 +2695,7 @@ defmodule DurableServer.Supervisor do
          caller_deadline_ms
        ) do
     # First attempt remote placement (single round, no retry loop — we handle retry here)
-    case try_remote_placement(supervisor, child_spec, 3, placement_deadline_ms) do
+    case try_placement(supervisor, child_spec, 3, placement_deadline_ms) do
       {:ok, result} ->
         {:ok, result}
 

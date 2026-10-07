@@ -8,7 +8,7 @@ It implements fault-tolerant, stateful processes that can survive node failures,
 
 - **Durable state**: Automatically persists state to storage with configurable sync intervals
 - **Cluster coordination**: Uses distributed registry for process discovery and health monitoring
-- **Capacity-aware placement**: Monitors CPU, memory, and disk usage to route new processes to nodes with available capacity
+- **Capacity-aware placement**: Ranks local and remote nodes together by utilization, spreading new processes before local fills while respecting child-count and resource limits
 - **Sticky placement**: Environment variable-based placement preferences (e.g., same machine, same region, etc.) with time-gated fallback to ensure servers restart on preferred nodes when possible
 - **Automatic recovery**: Failed processes are detected and restarted across the cluster
 - **Graceful shutdown**: Ensures state is synchronized before termination
@@ -186,7 +186,7 @@ See `DurableServer.Backends.MirrorStore` for usage and an example rollout.
 
 DurableServer supports these options in the `init/1` return tuple:
 
-- `:auto_sync` - Enable automatic periodic syncing (default: false)
+- `:auto_sync` - Enable automatic syncing on callback return (default: false)
 - `:sync_every_ms` - Sync interval in milliseconds (default: 30_000)
 - `:meta` - Optional metadata included in the global registry
 
@@ -204,6 +204,16 @@ State is synchronized to storage in these scenarios:
    retries, automatic and periodic sync log the failure and keep the dirty in-memory state
    eligible for a later sync. Storage conflicts remain fatal.
 3. **Graceful shutdown**: State is always synced before termination
+
+Periodic and automatic sync skip dumping, serialization, and hashing when callback state is
+exactly unchanged and no earlier change is pending. Any runtime state change schedules a
+check of `dump_state/1`; if its output is unchanged, the check skips the storage write and
+clears the pending flag. Failed writes remain pending for a later sync.
+
+`dump_state/1` should deterministically derive its output from the supplied state. Changes
+to external data, such as ETS or the process dictionary, cannot be detected by state tracking;
+use an explicit sync to re-evaluate the dump when needed. Explicit sync and lifecycle writes
+always evaluate `dump_state/1`.
 
 Manual synchronization performs storage work inline. A `GenServer.call/3` timeout should be
 long enough to cover the configured backend's retry window. A caller timeout does not cancel
