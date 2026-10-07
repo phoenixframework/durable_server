@@ -84,7 +84,7 @@ defmodule DurableServer.RemotePlacementTest do
                )
     end
 
-    test "always excludes local node", %{
+    test "excludes local node by default", %{
       supervisor_name: supervisor_name,
       prefix: prefix
     } do
@@ -97,7 +97,7 @@ defmodule DurableServer.RemotePlacementTest do
          max_children: %{:total => 2}}
       )
 
-      # Local node should never be included (function is only called after local placement fails)
+      # Remote-only callers (restart/rehome) retain their existing candidate set.
       nodes =
         DurableServer.LifecycleManager.find_eligible_nodes(
           supervisor_name,
@@ -105,6 +105,117 @@ defmodule DurableServer.RemotePlacementTest do
         )
 
       refute Node.self() in nodes
+    end
+
+    test "ranks live local reservations alongside remote capacity", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{RemotePlacementTestServer => 3}}
+      )
+
+      local = node()
+      remote = :ranked_remote@test
+      heartbeat_table = :"durable_server_heartbeats_#{supervisor_name}"
+      now = System.system_time(:millisecond)
+
+      # A stale local count must not hide either free slots or pending starts.
+      :ets.insert(heartbeat_table, [
+        {to_string(local), 1, now, %{RemotePlacementTestServer => %{current: 3, limit: 3}}, nil,
+         %{}, %{}},
+        {to_string(remote), 2, now, %{RemotePlacementTestServer => %{current: 1, limit: 3}}, nil,
+         %{}, %{}}
+      ])
+
+      candidates = fn ->
+        LifecycleManager.find_eligible_nodes(supervisor_name, RemotePlacementTestServer,
+          include_local: true
+        )
+      end
+
+      assert candidates.() == [local, remote]
+
+      {:ok, first} = LifecycleManager.reserve_capacity(supervisor_name, RemotePlacementTestServer)
+
+      {:ok, second} =
+        LifecycleManager.reserve_capacity(supervisor_name, RemotePlacementTestServer)
+
+      assert candidates.() == [remote, local]
+
+      {:ok, third} = LifecycleManager.reserve_capacity(supervisor_name, RemotePlacementTestServer)
+      assert candidates.() == [remote]
+
+      Enum.each([first, second, third], &LifecycleManager.cancel_capacity_reservation/1)
+    end
+
+    test "local inclusion still respects zero module capacity", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{RemotePlacementTestServer => 0}}
+      )
+
+      assert [] ==
+               LifecycleManager.find_eligible_nodes(supervisor_name, RemotePlacementTestServer,
+                 include_local: true
+               )
+    end
+
+    test "local inclusion respects live resource and draining limits", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_memory: 80}
+      )
+
+      %{ets_table: table} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      candidates = fn ->
+        LifecycleManager.find_eligible_nodes(supervisor_name, RemotePlacementTestServer,
+          include_local: true
+        )
+      end
+
+      :ets.insert(table, {:resource_metrics, {nil, 90, nil, System.system_time(:millisecond)}})
+      assert candidates.() == []
+
+      :ets.insert(table, {:resource_metrics, {nil, 20, nil, System.system_time(:millisecond)}})
+      assert candidates.() == [node()]
+
+      :ets.insert(table, {:shutting_down, true})
+      assert candidates.() == []
+    end
+
+    test "local inclusion retains sticky preference gates", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()}
+      )
+
+      assert [] ==
+               LifecycleManager.find_eligible_nodes(supervisor_name, RemotePlacementTestServer,
+                 include_local: true,
+                 sticky_placement: [%{env_var: "OTHER_MACHINE", value: "remote"}],
+                 sticky_meta: nil
+               )
     end
 
     test "respects limit option", %{supervisor_name: supervisor_name, prefix: prefix} do
@@ -270,7 +381,8 @@ defmodule DurableServer.RemotePlacementTest do
                DurableServer.Supervisor.start_child(
                  supervisor_name,
                  {RemotePlacementTestServer, key: "key1", initial_state: %{}},
-                 max_placement_retries: 3
+                 max_placement_retries: 3,
+                 placement_timeout: 0
                )
 
       assert is_pid(pid)

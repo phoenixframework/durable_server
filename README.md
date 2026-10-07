@@ -8,7 +8,7 @@ It implements fault-tolerant, stateful processes that can survive node failures,
 
 - **Durable state**: Automatically persists state to storage with configurable sync intervals
 - **Cluster coordination**: Uses distributed registry for process discovery and health monitoring
-- **Capacity-aware placement**: Monitors CPU, memory, and disk usage to route new processes to nodes with available capacity
+- **Capacity-aware placement**: Ranks local and remote nodes together by utilization, spreading new processes before local fills while respecting child-count and resource limits
 - **Sticky placement**: Environment variable-based placement preferences (e.g., same machine, same region, etc.) with time-gated fallback to ensure servers restart on preferred nodes when possible
 - **Automatic recovery**: Failed processes are detected and restarted across the cluster
 - **Graceful shutdown**: Ensures state is synchronized before termination

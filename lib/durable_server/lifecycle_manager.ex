@@ -3329,12 +3329,13 @@ defmodule DurableServer.LifecycleManager do
   (global capacity, module capacity, CPU, memory). Nodes with lower utilization
   are prioritized for better load distribution.
 
-  Always excludes the local node since we only lookup eligible remote nodes
-  after local placement fails.
+  Excludes the local node unless `:include_local` is set. When included, local
+  capacity and resources are read directly instead of using its last heartbeat.
 
   ## Options
 
   - `:limit` - Maximum number of nodes to return (default: 3)
+  - `:include_local` - Include the local node using live capacity (default: false)
   - `:key` - The server key, used to load augmented sticky placement preferences and timing metadata
 
   ## Examples
@@ -3357,6 +3358,7 @@ defmodule DurableServer.LifecycleManager do
         limit = Keyword.get(opts, :limit, 3)
         key = Keyword.get(opts, :key)
         my_node = Node.self()
+        include_local = Keyword.get(opts, :include_local, false)
 
         # Get both the effective placement and its persisted metadata. Candidate
         # selection needs the metadata heartbeat to enforce cumulative time gates.
@@ -3373,6 +3375,19 @@ defmodule DurableServer.LifecycleManager do
         # 2. Group PG members — fast path, gives instant discovery via peer_connect
         # Liveness is ALWAYS computed from timestamp, never from mere Group presence.
         merged_nodes = merge_heartbeat_sources(supervisor_name, heartbeat_table, now)
+
+        merged_nodes =
+          if include_local do
+            local_entry =
+              {to_string(my_node), DurableServer.Supervisor.node_ref(supervisor_name), now,
+               DurableServer.Supervisor.current_capacity(supervisor_name),
+               calculate_resource_map(supervisor_name), get_my_env_vars(supervisor_name),
+               %{"draining" => check_shutting_down(supervisor_name) != :ok}}
+
+            [local_entry | Enum.reject(merged_nodes, &(elem(&1, 0) == to_string(my_node)))]
+          else
+            merged_nodes
+          end
 
         merged_nodes
         |> Enum.map(fn {node_str, node_ref, timestamp, capacity, resources, env_vars,
@@ -3409,7 +3424,7 @@ defmodule DurableServer.LifecycleManager do
         end)
         |> Enum.reject(&is_nil/1)
         |> Enum.filter(fn {node, health, matching_level, _timestamp} ->
-          node != my_node and
+          (include_local or node != my_node) and
             can_node_accept_module?(health, module, matching_level: matching_level) and
             sticky_candidate_gate_open?(
               sticky_placement,

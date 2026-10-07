@@ -274,20 +274,15 @@ defmodule DurableServer do
 
   ## Capacity-Aware Placement
 
-  DurableServers support automatic capacity-aware placement with remote fallback.
+  New children use the existing least-busy eligible-node ranking, with local considered
+  alongside remote nodes instead of filling local capacity first. Ranking uses the
+  highest utilization across configured child-count, CPU, and memory limits. Full,
+  draining, or resource-limited nodes are excluded; connected nodes are preferred.
 
-  ### Local Placement (Default)
-
-  When starting a child, the local node is tried first. If capacity limits are exceeded,
-  remote placement is attempted automatically.
-
-  ### Remote Placement
-
-  If local capacity is exhausted, DurableServer automatically tries remote nodes:
-
-  1. **Same-region nodes first** - Prioritizes nodes in the same region for lower latency
-  2. **Least busy nodes** - Selects nodes with the lowest utilization across all limits
-  3. **Configurable retries** - Default 3 remote nodes tried, configurable via `max_placement_retries`
+  Local counts include in-flight start reservations. Remote load remains heartbeat-based,
+  so placement is approximate rather than strictly even during bursts. Admission checks
+  on the selected node still enforce its limits. Restart, rehome, and sticky-placement
+  behavior is unchanged.
 
   ### Capacity Limits
 
@@ -311,14 +306,14 @@ defmodule DurableServer do
 
   Control remote placement behavior per start_child call:
 
-      # Default: Try local, then up to 3 remote nodes
+      # Default: Rank local alongside up to 3 remote nodes
       DurableServer.Supervisor.start_child(sup, {MyServer, key: "user_1", initial_state: %{}})
 
       # Local only, no remote fallback
       DurableServer.Supervisor.start_child(sup, {MyServer, key: "user_1", initial_state: %{}},
         max_placement_retries: 0)
 
-      # Try local, then up to 5 remote nodes
+      # Rank local alongside up to 5 remote nodes
       DurableServer.Supervisor.start_child(sup, {MyServer, key: "user_1", initial_state: %{}},
         max_placement_retries: 5)
 

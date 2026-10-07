@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Balance new child starts using the existing eligible-node ranking, considering live local capacity alongside remote heartbeat capacity instead of filling local first. Explicit local starts, restart/rehome, and sticky-placement behavior are unchanged.
 - Skip dumping, serialization, and hashing during periodic and automatic sync when callback state is exactly unchanged and no earlier change is pending. Runtime state changes still use `dump_state/1` to determine whether a storage write is needed; explicit sync and lifecycle writes continue to evaluate the dump.
 - Resolve duplicate DurableServer ownership by a persisted, monotonically increasing lock epoch. Group now keeps the latest successful object-store claimant and retires only stale owners instead of killing every claimant and causing repeated anti-entropy restart loops.
 - Enforce cumulative sticky-placement gates during request-driven remote placement so an existing server cannot move to a fallback node before that level unlocks.
