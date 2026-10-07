@@ -171,6 +171,49 @@ defmodule DurableServer.RemotePlacementTest do
                )
     end
 
+    test "candidate limit preserves eligible local without changing rank or duplicating it", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{total: 2}}
+      )
+
+      remotes = add_ranked_remote_heartbeats(supervisor_name, 13)
+
+      candidates = fn ->
+        LifecycleManager.find_eligible_nodes(supervisor_name, RemotePlacementTestServer,
+          include_local: true,
+          limit: 12
+        )
+      end
+
+      # Local stays first when least busy and is not added a second time.
+      assert candidates.() == [node() | Enum.take(remotes, 11)]
+
+      {:ok, first} = LifecycleManager.reserve_capacity(supervisor_name, RemotePlacementTestServer)
+
+      # All 13 remotes now rank ahead of local. Retain local after the capped
+      # remote pool without promoting it ahead of less busy candidates.
+      assert candidates.() == Enum.take(remotes, 12) ++ [node()]
+
+      assert LifecycleManager.find_eligible_nodes(supervisor_name, RemotePlacementTestServer,
+               limit: 12
+             ) == Enum.take(remotes, 12)
+
+      {:ok, second} =
+        LifecycleManager.reserve_capacity(supervisor_name, RemotePlacementTestServer)
+
+      # Retention must not resurrect an ineligible (full) local node.
+      assert candidates.() == Enum.take(remotes, 12)
+
+      Enum.each([first, second], &LifecycleManager.cancel_capacity_reservation/1)
+    end
+
     test "local inclusion respects live resource and draining limits", %{
       supervisor_name: supervisor_name,
       prefix: prefix
@@ -364,6 +407,46 @@ defmodule DurableServer.RemotePlacementTest do
   end
 
   describe "start_child with max_placement_retries" do
+    test "retains local when a full candidate pool of less busy remotes is in cooldown", %{
+      supervisor_name: supervisor_name,
+      prefix: prefix
+    } do
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor_name,
+         prefix: prefix,
+         object_store: test_object_store_opts(),
+         max_children: %{total: 2}}
+      )
+
+      assert {:ok, _} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {RemotePlacementTestServer, key: "local-seed", initial_state: %{}},
+                 local_only: true
+               )
+
+      %{circuit_breaker: breaker} = DurableServer.Supervisor.__get_config__(supervisor_name)
+
+      for remote <- add_ranked_remote_heartbeats(supervisor_name, 13) do
+        :ok =
+          DurableServer.CircuitBreaker.trip_placement_node_timeout_circuit_breaker(
+            breaker,
+            to_string(remote),
+            60_000
+          )
+      end
+
+      assert {:ok, {pid, _}} =
+               DurableServer.Supervisor.start_child(
+                 supervisor_name,
+                 {RemotePlacementTestServer, key: "local-fallback", initial_state: %{}},
+                 placement_timeout: 0
+               )
+
+      assert node(pid) == node()
+    end
+
     test "succeeds locally when capacity available", %{
       supervisor_name: supervisor_name,
       prefix: prefix
@@ -937,5 +1020,19 @@ defmodule DurableServer.RemotePlacementTest do
                  local_only: true
                )
     end
+  end
+
+  defp add_ranked_remote_heartbeats(supervisor_name, count) do
+    remotes = for i <- 1..count, do: :"placement_pool_remote_#{i}@test"
+    now = System.system_time(:millisecond)
+
+    entries =
+      for {remote, current} <- Enum.with_index(remotes, 1) do
+        {to_string(remote), current, now, %{total: %{current: current, limit: 100}}, nil, %{},
+         %{}}
+      end
+
+    :ets.insert(:"durable_server_heartbeats_#{supervisor_name}", entries)
+    remotes
   end
 end

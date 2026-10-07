@@ -3334,7 +3334,8 @@ defmodule DurableServer.LifecycleManager do
 
   ## Options
 
-  - `:limit` - Maximum number of nodes to return (default: 3)
+  - `:limit` - Maximum number of ranked candidates to return (default: 3).
+    With `:include_local`, an eligible local node is also retained if it falls beyond this limit.
   - `:include_local` - Include the local node using live capacity (default: false)
   - `:key` - The server key, used to load augmented sticky placement preferences and timing metadata
 
@@ -3439,8 +3440,15 @@ defmodule DurableServer.LifecycleManager do
           staleness = -timestamp
           {level_priority, busyness, staleness}
         end)
-        |> Enum.take(limit)
         |> Enum.map(fn {node, _health, _matching_level, _timestamp} -> node end)
+        |> Enum.split(limit)
+        |> then(fn {candidates, rest} ->
+          # Keep local available as a fallback even when busier than the whole
+          # remote pool. It has already passed the same eligibility checks.
+          if include_local,
+            do: candidates ++ Enum.filter(rest, &(&1 == my_node)),
+            else: candidates
+        end)
     end
   end
 
