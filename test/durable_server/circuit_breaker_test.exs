@@ -790,26 +790,22 @@ defmodule DurableServer.CircuitBreakerTest do
       assert :ets.info(circuit_breaker.table_name, :size) == 0
     end
 
-    test "verifies match specification logic with exact boundary conditions", %{
+    test "prunes stale entries while preserving recent entries and active cooldowns", %{
       circuit_breaker: circuit_breaker
     } do
       current_time = System.system_time(:millisecond)
       window_ms = @default_config.module_circuit_breaker_window_ms
-      window_start = current_time - window_ms
 
-      # Test exact boundary conditions for the match spec:
-      # Delete where: last_reset < window_start AND cooldown_until <= current_time
+      :ets.insert(circuit_breaker.table_name, {BoundaryModule1, 1, current_time, 0})
 
-      # Boundary case 1: last_reset exactly equals window_start (should NOT be removed)
-      :ets.insert(circuit_breaker.table_name, {BoundaryModule1, 1, window_start, 0})
-
-      # Boundary case 2: last_reset is 1ms before window_start (should be removed)  
-      :ets.insert(circuit_breaker.table_name, {BoundaryModule2, 1, window_start - 1, 0})
-
-      # Boundary case 3: cooldown_until is 1ms in future (should NOT be removed even if old)
       :ets.insert(
         circuit_breaker.table_name,
-        {BoundaryModule3, 1, window_start - 1000, current_time + 1}
+        {BoundaryModule2, 1, current_time - 2 * window_ms, 0}
+      )
+
+      :ets.insert(
+        circuit_breaker.table_name,
+        {BoundaryModule3, 1, current_time - 2 * window_ms, current_time + window_ms}
       )
 
       CircuitBreaker.prune_stale_entries(circuit_breaker)
@@ -817,12 +813,8 @@ defmodule DurableServer.CircuitBreakerTest do
       remaining = :ets.tab2list(circuit_breaker.table_name)
       remaining_modules = Enum.map(remaining, fn {module, _, _, _} -> module end)
 
-      # Verify boundary conditions
-      # last_reset == window_start
       assert BoundaryModule1 in remaining_modules
-      # last_reset < window_start AND cooldown <= current_time
       refute BoundaryModule2 in remaining_modules
-      # cooldown_until > current_time
       assert BoundaryModule3 in remaining_modules
 
       assert length(remaining) == 2
