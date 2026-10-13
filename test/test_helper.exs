@@ -14,18 +14,23 @@ case File.read(".env") do
     :noop
 end
 
-# Exclude integration tests by default (they require real credentials)
-ExUnit.configure(exclude: [:integration, :stress])
+# Selecting storage-free tests must not contact LocalStack. Each suite invocation
+# gets its own bucket; LocalStackCase creates it only when one of its tests runs.
+Application.put_env(
+  :durable_server,
+  :test_object_store_bucket,
+  "durable-test-#{DurableServer.UUID.uuid4()}"
+)
 
-alias DurableServer.ObjectStore
-import DurableServer.TestHelper
+Application.put_env(:durable_server, :test_object_store_used, false)
 
-# Clear object store (local stack) for this run
-store = test_object_store()
-:ok = ObjectStore.ensure_bucket_exists(store)
+ExUnit.start(
+  exclude: [:localstack, :ekv, :integration, :stress],
+  assert_receive_timeout: 1_000
+)
 
-for obj <- ObjectStore.list_all_objects_stream(store, "") do
-  :ok = ObjectStore.delete_object(store, obj.key)
-end
-
-ExUnit.start()
+ExUnit.after_suite(fn _results ->
+  if Application.fetch_env!(:durable_server, :test_object_store_used) do
+    DurableServer.TestHelper.clean_test_object_store!()
+  end
+end)

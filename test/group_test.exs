@@ -1,5 +1,5 @@
 defmodule GroupTest do
-  use ExUnit.Case, async: true
+  use DurableServer.LocalStackCase, async: true
   import DurableServer.TestHelper
 
   @moduletag :capture_log
