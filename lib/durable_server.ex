@@ -896,6 +896,8 @@ defmodule DurableServer do
   @durable :durable
   @max_crash_reason_length 500
   @max_sync_retries 5
+  # Matches ObjectStore.try_claim/3, the first-ever claim.
+  @lock_claim_retries 2
   @bootstrap_continue {@durable, :bootstrap}
 
   defguardp is_callback_action(action)
@@ -3991,7 +3993,14 @@ defmodule DurableServer do
          %DurableServer{key: key, object_store: store} = state,
          data
        ) do
-    case StorageBackend.put_object(store, storage_key(state), data, etag: state.etag) do
+    # Retries transient failures like the first-ever claim does: object storage
+    # throttles rapid writes to one key (Tigris 503 SlowDown), and a restart
+    # claims the key right after the previous owner's final writes. A retry
+    # whose earlier attempt landed resolves as this boot's own claim.
+    case StorageBackend.put_object(store, storage_key(state), data,
+           etag: state.etag,
+           max_retries: @lock_claim_retries
+         ) do
       # obj still matched our etag, we got the claim
       {:ok, %{etag: new_etag}} ->
         Logger.info(

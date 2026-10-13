@@ -1370,6 +1370,91 @@ defmodule DurableServerTest do
       assert message =~ "allowed keys are: [:auto_sync, :sync_every_ms, :meta, :permanent]"
     end
 
+    test "a restart retries a throttled lock claim" do
+      throttles = start_supervised!({Agent, fn -> 0 end}, id: :lock_claim_throttles)
+
+      # Object storage answers the next `throttles` conditional PUTs with 503
+      # SlowDown, as Tigris does to rapid writes to one key.
+      adapter = fn request ->
+        throttle? =
+          request.method == :put and Req.Request.get_header(request, "if-match") != [] and
+            Agent.get_and_update(throttles, fn left -> {left > 0, max(left - 1, 0)} end)
+
+        if throttle? do
+          {request, %Req.Response{status: 503, body: "<Error><Code>SlowDown</Code></Error>"}}
+        else
+          Req.Steps.run_finch(request)
+        end
+      end
+
+      {supervisor_name, _supervisor_pid, _prefix} =
+        start_test_supervisor(
+          object_store:
+            test_object_store_opts(
+              req_opts: [adapter: adapter, retry_delay: 0, retry_log_level: false]
+            )
+        )
+
+      key = "throttled-claim-#{DurableServer.UUID.uuid4()}"
+      child = {TestServer, key: key, initial_state: %{}}
+
+      assert {:ok, {pid, _meta}} = DurableServer.Supervisor.start_child(supervisor_name, child)
+      assert :ok = GenServer.stop(pid, :shutdown)
+      Agent.update(throttles, fn _left -> 1 end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, {restarted, _meta}} =
+                   DurableServer.Supervisor.start_child(supervisor_name, child)
+
+          assert restarted != pid
+        end)
+
+      assert log =~ "won the lock for #{inspect(key)}"
+      assert Agent.get(throttles, & &1) == 0
+    end
+
+    test "a retried lock claim whose first attempt landed is this boot's claim" do
+      lost = start_supervised!({Agent, fn -> 0 end}, id: :lost_lock_claim_responses)
+
+      # The next `lost` conditional PUTs reach storage, but their success
+      # responses are lost and the client sees 503.
+      adapter = fn request ->
+        lose? =
+          request.method == :put and Req.Request.get_header(request, "if-match") != [] and
+            Agent.get_and_update(lost, fn left -> {left > 0, max(left - 1, 0)} end)
+
+        {request, response} = Req.Steps.run_finch(request)
+
+        if lose? and response.status in 200..299 do
+          {request, %Req.Response{status: 503, body: "<Error><Code>SlowDown</Code></Error>"}}
+        else
+          {request, response}
+        end
+      end
+
+      {supervisor_name, _supervisor_pid, _prefix} =
+        start_test_supervisor(
+          object_store:
+            test_object_store_opts(
+              req_opts: [adapter: adapter, retry_delay: 0, retry_log_level: false]
+            )
+        )
+
+      key = "lost-claim-#{DurableServer.UUID.uuid4()}"
+      child = {TestServer, key: key, initial_state: %{}}
+
+      assert {:ok, {pid, _meta}} = DurableServer.Supervisor.start_child(supervisor_name, child)
+      assert :ok = GenServer.stop(pid, :shutdown)
+      Agent.update(lost, fn _left -> 1 end)
+
+      assert {:ok, {restarted, _meta}} =
+               DurableServer.Supervisor.start_child(supervisor_name, child)
+
+      assert restarted != pid
+      assert Agent.get(lost, & &1) == 0
+    end
+
     test "returns startup sync failure to caller and logs the error" do
       {supervisor_name, _supervisor_pid, _prefix} =
         start_test_supervisor(
