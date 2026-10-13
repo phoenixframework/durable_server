@@ -51,6 +51,44 @@ defmodule DurableServer.ObjectStoreClaimTest do
     end
   end
 
+  describe "conditional put retries" do
+    test "retries a throttled put" do
+      store =
+        object_store([
+          %Req.Response{status: 503, body: "<Error><Code>SlowDown</Code></Error>"},
+          %Req.Response{status: 200, headers: %{"etag" => ["next-etag"]}}
+        ])
+
+      assert {:ok, %{etag: "next-etag"}} =
+               ObjectStore.put_object(store, "server/one", "state",
+                 etag: "current-etag",
+                 max_retries: 2
+               )
+
+      for _attempt <- 1..2 do
+        assert_receive {:request, %Req.Request{method: :put} = request}
+        assert Req.Request.get_header(request, "if-match") == ["current-etag"]
+      end
+    end
+
+    test "does not retry a lost etag race" do
+      store =
+        object_store([
+          %Req.Response{status: 412},
+          %Req.Response{status: 200, headers: %{"etag" => ["never-sent"]}}
+        ])
+
+      assert {:error, :conflict} =
+               ObjectStore.put_object(store, "server/one", "state",
+                 etag: "current-etag",
+                 max_retries: 2
+               )
+
+      assert_receive {:request, %Req.Request{method: :put}}
+      refute_receive {:request, _request}
+    end
+  end
+
   describe "initial claim recovery" do
     test "adopts the committed claim when a lost response is followed by a conflict" do
       attempted = stored_state(%{value: 1})
