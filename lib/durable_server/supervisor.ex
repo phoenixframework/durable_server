@@ -765,7 +765,8 @@ defmodule DurableServer.Supervisor do
   automatic restarts, and sticky placement retain their existing behavior.
 
   The child spec is `{Module, key: key, initial_state: initial_state}`.
-  `:initial_state` is required and must be a map. Before the first `init/1` or
+  `:initial_state` is required: a map for GenServers, or `{state_name, data}` for
+  modules using `behaviour: :gen_statem`. Before the first `init/1` or
   `init/2` call, DurableServer passes it through the module's `dump_state/1`,
   the configured backend's encode/decode path, and then `load_state/2`. This
   means the dumped initial state must be encodable by the configured backend,
@@ -821,7 +822,7 @@ defmodule DurableServer.Supervisor do
   def start_child(supervisor, child_spec, opts \\ [])
 
   def start_child(supervisor, {module, init_arg}, opts) do
-    init_arg = validate_child_init_arg!(init_arg, "start_child")
+    init_arg = validate_child_init_arg!(module, init_arg, "start_child")
 
     __start_child__(supervisor, {module, init_arg, nil}, opts)
   end
@@ -836,7 +837,7 @@ defmodule DurableServer.Supervisor do
 
   def __start_child__(supervisor, {module, init_arg, boot_info}, opts)
       when is_map(boot_info) or is_nil(boot_info) do
-    init_arg = validate_child_init_arg!(init_arg, "__start_child__")
+    init_arg = validate_child_init_arg!(module, init_arg, "__start_child__")
 
     do_start_child_with_init_arg(supervisor, {module, init_arg, boot_info}, opts)
   end
@@ -846,7 +847,7 @@ defmodule DurableServer.Supervisor do
           "__start_child__ expects {Module, init_arg, boot_info}, got: #{inspect(child_spec)}"
   end
 
-  defp validate_child_init_arg!(args, function_name) when is_list(args) do
+  defp validate_child_init_arg!(module, args, function_name) when is_list(args) do
     args = Keyword.validate!(args, [:key, :initial_state])
 
     key =
@@ -865,12 +866,28 @@ defmodule DurableServer.Supervisor do
 
     initial_state =
       case Keyword.fetch(args, :initial_state) do
-        {:ok, initial_state} when is_map(initial_state) ->
-          initial_state
+        {:ok, initial_state} ->
+          # Callers may route to workers with callback modules unavailable here.
+          # The destination validates the state when it receives the start request.
+          if Code.ensure_loaded?(module) do
+            case {DurableServer.__callback_behaviour__(module), initial_state} do
+              {GenServer, %{} = initial_state} ->
+                initial_state
 
-        {:ok, other} ->
-          raise ArgumentError,
-                "#{function_name} :initial_state must be a map, got: #{inspect(other)}"
+              {:gen_statem, {_name, _data} = initial_state} ->
+                initial_state
+
+              {GenServer, other} ->
+                raise ArgumentError,
+                      "#{function_name} :initial_state must be a map, got: #{inspect(other)}"
+
+              {:gen_statem, other} ->
+                raise ArgumentError,
+                      "#{function_name} :initial_state must be {state_name, data}, got: #{inspect(other)}"
+            end
+          else
+            initial_state
+          end
 
         :error ->
           raise ArgumentError, "#{function_name} requires :initial_state"
@@ -881,7 +898,7 @@ defmodule DurableServer.Supervisor do
     |> Keyword.put(:initial_state, initial_state)
   end
 
-  defp validate_child_init_arg!(init_arg, function_name) do
+  defp validate_child_init_arg!(_module, init_arg, function_name) do
     raise ArgumentError,
           "#{function_name} expects {Module, key: \"...\", initial_state: %{...}}, got: #{inspect(init_arg)}"
   end
@@ -2106,7 +2123,8 @@ defmodule DurableServer.Supervisor do
   ensure a process exists but don't know if it's already running.
 
   The child spec is `{Module, key: key, initial_state: initial_state}`.
-  `:initial_state` is required and must be a map. If a new process is started
+  `:initial_state` is required: a map for GenServers, or `{state_name, data}` for
+  modules using `behaviour: :gen_statem`. If a new process is started
   and no persisted state exists yet, DurableServer passes `:initial_state`
   through the module's `dump_state/1`, the configured backend's encode/decode
   path, and then `load_state/2` before `init/1` or `init/2`. This means the
@@ -2161,7 +2179,7 @@ defmodule DurableServer.Supervisor do
   def ensure_started_child(supervisor, child_spec, opts \\ [])
 
   def ensure_started_child(supervisor, {module, init_arg}, opts) do
-    init_arg = validate_child_init_arg!(init_arg, "ensure_started_child")
+    init_arg = validate_child_init_arg!(module, init_arg, "ensure_started_child")
 
     __ensure_started_child__(supervisor, {module, init_arg, nil}, opts)
   end
@@ -2176,7 +2194,7 @@ defmodule DurableServer.Supervisor do
 
   def __ensure_started_child__(supervisor, {module, init_arg, boot_info}, opts)
       when is_map(boot_info) or is_nil(boot_info) do
-    init_arg = validate_child_init_arg!(init_arg, "__ensure_started_child__")
+    init_arg = validate_child_init_arg!(module, init_arg, "__ensure_started_child__")
     child_spec = {module, init_arg, boot_info}
 
     opts =
@@ -2826,6 +2844,8 @@ defmodule DurableServer.Supervisor do
   """
   def terminate_child(supervisor_name, pid) when is_atom(supervisor_name) and is_pid(pid) do
     Logger.debug(fn -> "terminating #{inspect(pid)} for #{inspect(supervisor_name)}" end)
+
+    # A PID does not identify its behaviour; GenServer and :gen_statem share the call protocol.
     GenServer.call(pid, {@durable, {:stop_with_status, :stopped_graceful, :normal}})
   end
 
@@ -2965,7 +2985,7 @@ defmodule DurableServer.Supervisor do
       )
   """
   def rehome_child(supervisor, {module, init_arg}, opts \\ []) do
-    init_arg = validate_child_init_arg!(init_arg, "rehome_child")
+    init_arg = validate_child_init_arg!(module, init_arg, "rehome_child")
 
     opts = Keyword.validate!(opts, [:target_node, :force, :shutdown_timeout])
     shutdown_timeout = Keyword.get(opts, :shutdown_timeout, 15_000)

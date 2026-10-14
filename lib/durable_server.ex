@@ -1,6 +1,6 @@
 defmodule DurableServer do
   @moduledoc ~S"""
-  DurableServer provides durable, distributed GenServer processes backed by pluggable storage.
+  DurableServer provides durable, distributed GenServer and `gen_statem` processes backed by pluggable storage.
 
   DurableServer implements fault-tolerant, stateful processes that can survive node failures,
   restarts, and deployments by automatically persisting state to storage and
@@ -27,6 +27,32 @@ defmodule DurableServer do
   - Automatic lifecycle management and restart capabilities with coordination across the cluster
 
   See `DurableServer.Supervisor` for supervisor setup and configuration options.
+
+  ## State machines
+
+  `use DurableServer, vsn: 1, behaviour: :gen_statem` selects OTP's native state
+  machine engine. The `:behaviour` option accepts `GenServer` (the default) or
+  `:gen_statem`. The same supervisor, placement, storage, and lifecycle APIs
+  serve both engines.
+
+  Implement `callback_mode/0` to select `:handle_event_function` or
+  `:state_functions`, optionally with `:state_enter`. Event callbacks,
+  `terminate/3`, and `code_change/4` use their native state-machine signatures.
+
+  Durable user state is `{state_name, data}`. Both `:initial_state` and the
+  return from `load_state/2` use that pair; `dump_state/1` receives the pair and
+  must return a plain storage-compatible map. The application controls how the
+  state name and data are encoded.
+
+  Add `{:durable, options}` to a native action list to use DurableServer options.
+  In `init/1` or `init/2`, the options are `:auto_sync`, `:sync_every_ms`, `:meta`,
+  and `:permanent`. In event callbacks, they are `:sync` and `:meta`. An explicit
+  `sync: true` commits the transition before any native actions execute,
+  including replies and inserted events. `handle_sync/3` retains its existing
+  contract and receives the old and new `{state_name, data}` pairs.
+
+  Native postponed events and timers are process-local; reconstruct any
+  required work after a cold start.
 
   ## Basic Usage
 
@@ -864,6 +890,7 @@ defmodule DurableServer do
             sync_every_ms: nil,
             sync_timer_ref: nil,
             user_state: nil,
+            behaviour: {DurableServer.Behaviours.GenServer, %{}},
             user_meta: nil,
             crash_history: [],
             module: nil,
@@ -900,6 +927,8 @@ defmodule DurableServer do
   @lock_claim_retries 2
   @bootstrap_continue {@durable, :bootstrap}
 
+  @compile {:inline, behaviour: 1, __dispatch__: 3, update_state: 2, auto_sync_to_storage: 2}
+
   defguardp is_callback_action(action)
             when is_atom(action) or is_tuple(action) or
                    (is_integer(action) and action >= 0)
@@ -918,75 +947,30 @@ defmodule DurableServer do
                 "the current :vsn must be provided:, ie: `use DurableServer, vsn: 1`"
       end
 
+    behaviour = Macro.expand(Keyword.get(opts, :behaviour, GenServer), __CALLER__)
+
+    defaults =
+      case behaviour do
+        GenServer ->
+          DurableServer.Behaviours.GenServer.defaults()
+
+        :gen_statem ->
+          DurableServer.Behaviours.StateMachine.defaults()
+
+        other ->
+          raise ArgumentError,
+                "expected :behaviour to be GenServer or :gen_statem, got: #{inspect(other)}"
+      end
+
     quote do
-      @behaviour DurableServer
       @vsn unquote(vsn)
       import unquote(__MODULE__)
 
       def __durable_server_config__() do
-        %{
-          vsn: @vsn
-        }
+        %{vsn: @vsn, behaviour: unquote(behaviour)}
       end
 
-      # Default implementations
-      def init(state) do
-        {:ok, state}
-      end
-
-      def handle_call(_request, _from, state) do
-        {:reply, :ok, state}
-      end
-
-      def handle_cast(_request, state) do
-        {:noreply, state}
-      end
-
-      def handle_info(_msg, state) do
-        {:noreply, state}
-      end
-
-      def handle_continue(_continue, state) do
-        {:noreply, state}
-      end
-
-      def handle_sync(_info, _old_state, new_state) do
-        {:ok, new_state}
-      end
-
-      def terminate(_reason, _state) do
-        :ok
-      end
-
-      def after_terminate(_terminate_return, _info) do
-        :ok
-      end
-
-      # Default code_change for hot upgrades: no migration needed
-      # Override this to provide version-specific state migrations:
-      #
-      #   def code_change(1, old_state, 2) do
-      #     # Migrate from v1 to v2
-      #     {:ok, Map.put(old_state, :new_field, "default")}
-      #   end
-      #
-      #   def code_change(_, state, _) do
-      #     # No migration for other versions
-      #     {:ok, state}
-      #   end
-      def code_change(_old_vsn, state, _new_vsn) do
-        {:ok, state}
-      end
-
-      defoverridable init: 1,
-                     handle_call: 3,
-                     handle_cast: 2,
-                     handle_info: 2,
-                     handle_continue: 2,
-                     handle_sync: 3,
-                     terminate: 2,
-                     after_terminate: 2,
-                     code_change: 3
+      unquote(defaults)
     end
   end
 
@@ -1010,7 +994,8 @@ defmodule DurableServer do
           config: config
         } = info
       ) do
-    GenServer.start_link(__MODULE__, info, start_opts(info.module, config))
+    adapter = callback_adapter(info.module)
+    adapter.start_link(info, start_opts(info.module, config))
   end
 
   defp start_opts(module, config) do
@@ -1064,6 +1049,7 @@ defmodule DurableServer do
       key: key,
       prefix: prefix,
       module: module,
+      behaviour: {callback_adapter(module), %{}},
       supervisor: supervisor_name,
       dynamic_supervisor: DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name),
       task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
@@ -1317,6 +1303,7 @@ defmodule DurableServer do
       old_vsn: old_vsn,
       user_state: user_state,
       module: module,
+      behaviour: {callback_adapter(module), %{}},
       supervisor: supervisor_name,
       dynamic_supervisor: DurableServer.Supervisor.get_dynamic_supervisor(supervisor_name),
       task_supervisor: DurableServer.Supervisor.get_task_supervisor(supervisor_name),
@@ -2083,16 +2070,12 @@ defmodule DurableServer do
   end
 
   def handle_call(request, from, %DurableServer{} = state) do
-    state = maybe_migrate_on_callback(state)
-    result = state.module.handle_call(request, from, state.user_state)
-    process_callback_result(result, state)
+    __dispatch__({:call, from}, request, state)
   end
 
   @impl true
   def handle_cast(request, %__MODULE__{} = state) do
-    state = maybe_migrate_on_callback(state)
-    result = state.module.handle_cast(request, state.user_state)
-    process_callback_result(result, state)
+    __dispatch__(:cast, request, state)
   end
 
   @impl true
@@ -2189,9 +2172,7 @@ defmodule DurableServer do
   end
 
   def handle_info(msg, %DurableServer{} = state) do
-    state = maybe_migrate_on_callback(state)
-    result = state.module.handle_info(msg, state.user_state)
-    process_callback_result(result, state)
+    __dispatch__(:info, msg, state)
   end
 
   @impl true
@@ -2201,9 +2182,7 @@ defmodule DurableServer do
 
   @impl true
   def handle_continue(continue, %DurableServer{} = state) do
-    state = maybe_migrate_on_callback(state)
-    result = state.module.handle_continue(continue, state.user_state)
-    process_callback_result(result, state)
+    __dispatch__(:continue, continue, state)
   end
 
   @impl true
@@ -2219,8 +2198,9 @@ defmodule DurableServer do
   end
 
   def terminate(reason, %DurableServer{} = state) do
-    # Ensure user callback terminate/2 finishes before we persist final status metadata.
-    terminate_return = state.module.terminate(reason, state.user_state)
+    # Ensure the user terminate callback finishes before persisting final status metadata.
+    {adapter, _adapter_state} = behaviour(state)
+    terminate_return = adapter.terminate(reason, state)
 
     {final_status, sync_result, delete_result} =
       case state.user_initiated_stop do
@@ -2392,14 +2372,20 @@ defmodule DurableServer do
                 init_info = Map.fetch!(config, :init_info)
                 info = Map.merge(info, init_info)
 
-                init_result =
-                  if function_exported?(module, :init, 2) do
-                    module.init(loaded_init_state, info)
-                  else
-                    module.init(loaded_init_state)
-                  end
+                init_args =
+                  if function_exported?(module, :init, 2),
+                    do: [loaded_init_state, info],
+                    else: [loaded_init_state]
+
+                {adapter, _adapter_state} = behaviour(locked_state)
+                {locked_state, init_result} = adapter.init_callback(init_args, locked_state)
 
                 case init_result do
+                  {:statem_init_stop, reason} ->
+                    repair_failed_boot_storage(locked_state)
+                    send(reply_to, {from_ref, {:error, reason}})
+                    {:stop, {:shutdown, {@durable, {:init_failed, reason}}}, locked_state}
+
                   :ignore ->
                     handle_ignore(locked_state, init_from)
 
@@ -2410,11 +2396,11 @@ defmodule DurableServer do
                     handle_init(locked_state, user_state, opts, _continue_or_timeout = nil)
 
                   {:ok, user_state, {tag, _} = continue_or_timeout}
-                  when tag in [:continue, :timeout] ->
+                  when tag in [:continue, :timeout, :statem] ->
                     handle_init(locked_state, user_state, [], continue_or_timeout)
 
                   {:ok, user_state, {tag, _} = continue_or_timeout, opts}
-                  when tag in [:continue, :timeout] and is_list(opts) ->
+                  when tag in [:continue, :timeout, :statem] and is_list(opts) ->
                     handle_init(locked_state, user_state, opts, continue_or_timeout)
 
                   other ->
@@ -2824,13 +2810,20 @@ defmodule DurableServer do
 
   @impl true
   def code_change(old_vsn, %__MODULE__{} = state, extra) do
-    case state.module.code_change(old_vsn, state.user_state, extra) do
-      {:ok, new_user_state} ->
-        # The dumped shape can change across upgrades even if user state is unchanged.
-        {:ok, %{state | user_state: new_user_state, needs_sync_check: true}}
+    {adapter, _adapter_state} = behaviour(state)
 
-      {:error, reason} ->
-        {:error, reason}
+    with true <- adapter == callback_adapter(state.module),
+         {:ok, new_user_state, adapter_state} <- adapter.code_change(old_vsn, state, extra) do
+      state =
+        state
+        |> Map.put(:behaviour, {adapter, adapter_state})
+        |> update_state(new_user_state)
+
+      # The dumped shape can change even when the user state is unchanged.
+      {:ok, %{state | needs_sync_check: true}}
+    else
+      false -> {:error, :behaviour_change_requires_restart}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -2977,19 +2970,62 @@ defmodule DurableServer do
         "[DurableServer] Hot upgrade: #{state.key} migrating from v#{inspect(state.vsn)} to v#{inspect(current_vsn)}"
       )
 
-      {:ok, new_user_state} = state.module.code_change(state.vsn, state.user_state, current_vsn)
-
-      %{
-        state
-        | vsn: current_vsn,
-          old_vsn: state.vsn,
-          user_state: new_user_state,
-          needs_sync_check: true
-      }
+      {:ok, migrated} = code_change(state.vsn, state, current_vsn)
+      %{migrated | vsn: current_vsn, old_vsn: state.vsn}
     end
   end
 
-  defp process_callback_result(result, %__MODULE__{} = state) do
+  @doc false
+  def __callback_behaviour__(module),
+    do: Map.get(module.__durable_server_config__(), :behaviour, GenServer)
+
+  defp callback_adapter(module) do
+    case __callback_behaviour__(module) do
+      GenServer -> DurableServer.Behaviours.GenServer
+      :gen_statem -> DurableServer.Behaviours.StateMachine
+    end
+  end
+
+  defp behaviour(state) do
+    case state do
+      %{behaviour: behaviour} -> behaviour
+      # Processes started before adapter support have no behaviour field.
+      _ -> {DurableServer.Behaviours.GenServer, %{}}
+    end
+  end
+
+  @doc false
+  def __dispatch__(type, content, state) do
+    state = maybe_migrate_on_callback(state)
+    {adapter, _adapter_state} = behaviour(state)
+    adapter.dispatch(type, content, state)
+  end
+
+  @doc false
+  def __statem_transition__(user_state, opts, state),
+    do: __process_callback_result__({:noreply, user_state, opts}, state)
+
+  @doc false
+  def __statem_stop__(reason, user_state, state)
+      when reason in [
+             :normal,
+             :delete,
+             :permanent,
+             {:shutdown, :normal},
+             {:shutdown, :delete},
+             {:shutdown, :permanent}
+           ] do
+    __process_callback_result__({:stop, reason, user_state}, state)
+  end
+
+  def __statem_stop__({:error, _} = reason, user_state, state),
+    do: __process_callback_result__({:stop, reason, user_state}, state)
+
+  def __statem_stop__(reason, user_state, state),
+    do: {:stop, reason, update_state(state, user_state)}
+
+  @doc false
+  def __process_callback_result__(result, %__MODULE__{} = state) do
     case result do
       {:reply, reply, new_user_state} ->
         old_user_state = state.user_state
@@ -3350,22 +3386,19 @@ defmodule DurableServer do
     end
   end
 
-  defp validate_user_state!(%{} = user_state), do: user_state
-
-  defp validate_user_state!(user_state) do
-    raise ArgumentError,
-          "expected callback to return a map of user state, got: #{inspect(user_state)}"
-  end
-
   defp update_state(%__MODULE__{} = state, new_user_state) do
-    new_user_state = validate_user_state!(new_user_state)
+    {adapter, _adapter_state} = behaviour(state)
+    new_user_state = adapter.validate_user_state!(new_user_state)
 
-    %{
-      state
-      | user_state: new_user_state,
-        needs_sync_check: state.needs_sync_check or new_user_state !== state.user_state
-    }
+    cond do
+      state.needs_sync_check -> %{state | user_state: new_user_state}
+      new_user_state === state.user_state -> state
+      true -> %{state | user_state: new_user_state, needs_sync_check: true}
+    end
   end
+
+  defp auto_sync_to_storage(%{auto_sync: false} = state, _old_user_state), do: state
+  defp auto_sync_to_storage(%{needs_sync_check: false} = state, _old_user_state), do: state
 
   defp auto_sync_to_storage(%DurableServer{module: module, key: key} = state, old_user_state) do
     if state.auto_sync && state.needs_sync_check do
