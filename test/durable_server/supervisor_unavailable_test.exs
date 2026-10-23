@@ -97,6 +97,36 @@ defmodule DurableServer.SupervisorUnavailableTest do
       assert local_children(name) == []
     end
 
+    test "ensure_started_child waiting on another owner returns supervisor_unavailable when the config table disappears" do
+      {name, _pid} = start_test_supervisor()
+      key = unique_key()
+      parent = self()
+
+      # Another acquisition already holds the singleflight and is still running.
+      owner =
+        spawn_link(fn ->
+          {:ok, _} =
+            Registry.register(
+              :"durable_sf_owner_#{name}",
+              {:ensure_started_child, key, TestCounterServer},
+              :singleflight_owner
+            )
+
+          send(parent, :owner_registered)
+          receive do: (:stop -> :ok)
+        end)
+
+      assert_receive :owner_registered
+      true = :ets.delete(DurableServer.Supervisor.__ets_table_name__(name))
+
+      assert {:error, :supervisor_unavailable} =
+               DurableServer.Supervisor.ensure_started_child(name, child_spec(key),
+                 timeout: 2_000
+               )
+
+      send(owner, :stop)
+    end
+
     test "start_child returns supervisor_unavailable when the config table disappears" do
       {name, _pid} = start_test_supervisor()
       true = :ets.delete(DurableServer.Supervisor.__ets_table_name__(name))

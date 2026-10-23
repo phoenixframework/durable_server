@@ -938,7 +938,7 @@ defmodule DurableServer.Supervisor do
         end
       end
 
-      with {:ok, config} <- __fetch_config__(supervisor),
+      with {:ok, config} <- fetch_config(supervisor),
            {:ok, boot_info} <-
              check_existing(config, init_arg, boot_info, Keyword.get(opts, :existing, false)) do
         child_spec = {module, init_arg, boot_info}
@@ -2266,7 +2266,7 @@ defmodule DurableServer.Supervisor do
       nil ->
         # The singleflight claim does not keep the supervisor alive: its config
         # table can disappear while this acquisition runs.
-        case __fetch_config__(supervisor) do
+        case fetch_config(supervisor) do
           {:ok, config} ->
             ensure_started_missing_child(
               supervisor,
@@ -2647,7 +2647,7 @@ defmodule DurableServer.Supervisor do
 
   defp acquire_singleflight_waiter_guard(supervisor, singleflight_key, wait_timeout_ms) do
     with {:ok, %{max_singleflight_waiters_per_key_module: max_waiters}} <-
-           __fetch_config__(supervisor) do
+           fetch_config(supervisor) do
       SingleflightGuard.acquire(supervisor, singleflight_key, wait_timeout_ms, max_waiters)
     end
   end
@@ -3884,12 +3884,10 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  @doc false
-  # Non-raising config read for acquisition entry points. The table is owned by
-  # the supervisor process, so it is absent while the supervisor is starting,
-  # after it exits, and between a crash and its restart. `:ets.lookup/2` raises
-  # ArgumentError only when the named table does not exist.
-  def __fetch_config__(supervisor_name) do
+  # The supervisor process owns the table, so it is absent while the supervisor
+  # starts, after it exits, and until it restarts. `:ets.lookup/2` raises
+  # ArgumentError only for a missing table.
+  defp fetch_config(supervisor_name) do
     case :ets.lookup(ets_table_name(supervisor_name), :config) do
       [{:config, config}] -> {:ok, config}
       [] -> {:error, :supervisor_unavailable}
