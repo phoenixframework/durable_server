@@ -1,3 +1,7 @@
+## Unreleased
+
+- Return `{:error, :supervisor_unavailable}` from `ensure_started_child/3`, `start_child/3`, and `rehome_child/3` when the local supervisor is not running, is restarting, or its singleflight registries have already stopped during shutdown. Previously a missing singleflight registry made the acquisition run anyway, outside deduplication, and raise from the supervisor's missing config table. Remote placement treats the result like any other failed target and tries the next node. Graceful shutdown is unchanged: the registries stay up until the Terminator has drained children.
+
 ## 0.1.6 (2026-10-12)
 
 - Balance new child starts using the existing eligible-node ranking, considering live local capacity alongside remote heartbeat capacity instead of filling local first. Eligible local remains a candidate even when it ranks beyond the remote candidate-pool limit. Explicit local starts, restart/rehome, and sticky-placement behavior are unchanged.

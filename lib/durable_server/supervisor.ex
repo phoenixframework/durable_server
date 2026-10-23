@@ -787,6 +787,9 @@ defmodule DurableServer.Supervisor do
     complete, including internal retries. Returns `{:error, :timeout}` on expiration.
     Set to `:infinity` to disable. Default: `#{@default_start_child_timeout}`ms.
 
+  Returns `{:error, :supervisor_unavailable}` without attempting a start when the
+  local supervisor is not running or is restarting.
+
   ## Examples
 
       # Start with init args
@@ -935,8 +938,9 @@ defmodule DurableServer.Supervisor do
         end
       end
 
-      with {:ok, boot_info} <-
-             check_existing(supervisor, init_arg, boot_info, Keyword.get(opts, :existing, false)) do
+      with {:ok, config} <- __fetch_config__(supervisor),
+           {:ok, boot_info} <-
+             check_existing(config, init_arg, boot_info, Keyword.get(opts, :existing, false)) do
         child_spec = {module, init_arg, boot_info}
 
         # New starts rank local alongside the other nodes. Keep targeted/preloaded
@@ -997,12 +1001,10 @@ defmodule DurableServer.Supervisor do
     end
   end
 
-  defp check_existing(_supervisor, _init_arg, boot_info, false), do: {:ok, boot_info}
+  defp check_existing(_config, _init_arg, boot_info, false), do: {:ok, boot_info}
 
-  defp check_existing(supervisor, init_arg, _boot_info, true) do
+  defp check_existing(config, init_arg, _boot_info, true) do
     key = Keyword.fetch!(init_arg, :key)
-
-    config = __get_config__(supervisor)
     storage_key = config.prefix <> key
 
     case StorageBackend.get_object(config.storage_backend, storage_key, consistent: true) do
@@ -2135,6 +2137,9 @@ defmodule DurableServer.Supervisor do
   - `{:ok, {pid, meta}}` - Process is running (either found or newly started)
   - `{:error, {:unreachable, pid}}` - Storage has a live lock for `pid`, but no
     Group metadata became reachable before the registration-race wait expired
+  - `{:error, :supervisor_unavailable}` - The local supervisor is not running,
+    is restarting, or has begun its final shutdown teardown, so no acquisition
+    was attempted. Retryable once the supervisor is running again.
   - `{:error, reason}` - Failed to start the process
 
   ## Examples
@@ -2259,153 +2264,178 @@ defmodule DurableServer.Supervisor do
         {:ok, {pid, meta}}
 
       nil ->
-        {_, init_arg, _boot_info} = child_spec
-        local_only = Keyword.get(opts, :local_only, false)
-        # ensure_started_child should be single-attempt by default so hot paths
-        # can control retry policy at the caller boundary.
-        placement_timeout = Keyword.get(opts, :placement_timeout, nil)
+        # The singleflight claim does not keep the supervisor alive: its config
+        # table can disappear while this acquisition runs.
+        case __fetch_config__(supervisor) do
+          {:ok, config} ->
+            ensure_started_missing_child(
+              supervisor,
+              module,
+              key,
+              child_spec,
+              opts,
+              deadline_ms,
+              config
+            )
 
-        placement_deadline_ms =
-          earlier_deadline(deadline_ms, deadline_after_optional_timeout(placement_timeout))
+          {:error, :supervisor_unavailable} = error ->
+            error
+        end
+    end
+  end
 
-        # Try to fetch stored object to check sticky placement before attempting local start
-        config = __get_config__(supervisor)
-        storage_key = config.prefix <> key
+  defp ensure_started_missing_child(
+         supervisor,
+         module,
+         key,
+         child_spec,
+         opts,
+         deadline_ms,
+         config
+       ) do
+    {_, init_arg, _boot_info} = child_spec
+    local_only = Keyword.get(opts, :local_only, false)
+    # ensure_started_child should be single-attempt by default so hot paths
+    # can control retry policy at the caller boundary.
+    placement_timeout = Keyword.get(opts, :placement_timeout, nil)
 
-        existing = Keyword.get(opts, :existing, false)
+    placement_deadline_ms =
+      earlier_deadline(deadline_ms, deadline_after_optional_timeout(placement_timeout))
 
-        {stored_object, sticky_placement} =
-          case StorageBackend.get_object(
-                 config.storage_backend,
-                 storage_key,
-                 consistent: existing
-               ) do
-            {:ok, %{body: body, etag: etag}} ->
-              # Get augmented sticky placement (handles module config updates like :any)
-              augmented_placement =
-                __get_augmented_sticky_placement__(supervisor, module, key, body)
+    # Try to fetch stored object to check sticky placement before attempting local start
+    storage_key = config.prefix <> key
+    existing = Keyword.get(opts, :existing, false)
 
-              {{:ok, %{body: body, etag: etag}}, augmented_placement}
+    {stored_object, sticky_placement} =
+      case StorageBackend.get_object(
+             config.storage_backend,
+             storage_key,
+             consistent: existing
+           ) do
+        {:ok, %{body: body, etag: etag}} ->
+          # Get augmented sticky placement (handles module config updates like :any)
+          augmented_placement =
+            __get_augmented_sticky_placement__(supervisor, module, key, body)
 
-            {:error, _} ->
-              {nil, nil}
-          end
+          {{:ok, %{body: body, etag: etag}}, augmented_placement}
 
-        if existing and stored_object == nil do
-          {:error, :not_found}
+        {:error, _} ->
+          {nil, nil}
+      end
+
+    if existing and stored_object == nil do
+      {:error, :not_found}
+    else
+      # Check if we should respect sticky placement and skip local start
+      # Also track matching_level for time-gated fallback when remote placement fails
+      # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
+      # When local_only: true, never skip local — ignore sticky placement preferences
+      {should_skip_local, is_sticky_local, matching_level} =
+        if local_only do
+          {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
         else
-          # Check if we should respect sticky placement and skip local start
-          # Also track matching_level for time-gated fallback when remote placement fails
-          # Also track if local node matches sticky level 0 with a SPECIFIC env var (for disk check bypass)
-          # When local_only: true, never skip local — ignore sticky placement preferences
-          {should_skip_local, is_sticky_local, matching_level} =
-            if local_only do
+          case sticky_placement do
+            nil ->
+              # No sticky placement, proceed with normal placement.
               {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
-            else
-              case sticky_placement do
-                nil ->
-                  # No sticky placement, proceed with normal placement.
-                  {_should_skip_local = false, _is_sticky_local = false, _matching_level = nil}
 
-                [%{env_var: :any, value: :any} | _] ->
-                  # First level is :any, so local node is acceptable but we don't know
-                  # if data is specifically here (could have been on any node)
-                  {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
+            [%{env_var: :any, value: :any} | _] ->
+              # First level is :any, so local node is acceptable but we don't know
+              # if data is specifically here (could have been on any node)
+              {_should_skip_local = false, _is_sticky_local = false, _matching_level = 0}
 
-                placement ->
-                  # Have specific sticky placement (first element is not :any)
-                  # Check if local node matches
-                  env_var_names =
-                    DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
+            placement ->
+              # Have specific sticky placement (first element is not :any)
+              # Check if local node matches
+              env_var_names =
+                DurableServer.Supervisor.collect_sticky_placement_env_vars(supervisor)
 
-                  my_env_vars =
-                    env_var_names
-                    |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
-                    |> Enum.into(%{})
+              my_env_vars =
+                env_var_names
+                |> Enum.map(fn var_name -> {var_name, System.get_env(var_name)} end)
+                |> Enum.into(%{})
 
-                  # Check if we match any level (0 = exact, 1 = less specific, etc.)
-                  my_matching_level =
-                    Enum.find_index(placement, fn preference ->
-                      case preference do
-                        %{env_var: :any, value: :any} ->
-                          true
+              # Check if we match any level (0 = exact, 1 = less specific, etc.)
+              my_matching_level =
+                Enum.find_index(placement, fn preference ->
+                  case preference do
+                    %{env_var: :any, value: :any} ->
+                      true
 
-                        %{env_var: env_var, value: expected_value} ->
-                          Map.get(my_env_vars, env_var) == expected_value
+                    %{env_var: env_var, value: expected_value} ->
+                      Map.get(my_env_vars, env_var) == expected_value
 
-                        _ ->
-                          false
-                      end
-                    end)
-
-                  # Skip local start only if we don't match level 0 (exact match)
-                  # This ensures servers stay on their sticky placement node for specific matches
-                  if my_matching_level == 0 do
-                    # Level 0 match with specific env var - use local, bypass disk check
-                    # (we know it's specific because :any at level 0 is handled above)
-                    {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
-                  else
-                    # Level > 0 match or nil (no match) - skip local to try remote first
-                    {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
+                    _ ->
+                      false
                   end
-              end
-            end
+                end)
 
-          child_spec_with_boot_info =
-            case stored_object do
-              {:ok, %{body: body, etag: etag}} ->
-                {module, init_arg,
-                 preloaded_boot_info(body, etag, is_sticky_local: is_sticky_local)}
-
-              nil ->
-                child_spec
-            end
-
-          # If we should skip local due to sticky placement, go straight to remote placement
-          cond do
-            should_skip_local ->
-              Logger.info(
-                "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
-              )
-
-              await_sticky_placement(
-                supervisor,
-                module,
-                key,
-                stored_object,
-                child_spec_with_boot_info,
-                matching_level,
-                placement_deadline_ms,
-                deadline_ms
-              )
-
-            true ->
-              # Rank new children; persisted children retain their local/sticky path.
-              start_opts =
-                opts
-                |> Keyword.delete(:existing)
-                |> Keyword.put_new(:placement_timeout, nil)
-                |> Keyword.put(:timeout, timeout_option(deadline_ms))
-
-              case __start_child__(
-                     supervisor,
-                     child_spec_with_boot_info,
-                     start_opts
-                   ) do
-                {:ok, {pid, meta}} ->
-                  {:ok, {pid, meta}}
-
-                {:error, {:already_started, other}} ->
-                  normalize_already_started_result(supervisor, key, other, deadline_ms)
-
-                :ignore ->
-                  :ignore
-
-                {:error, reason} ->
-                  {:error, reason}
+              # Skip local start only if we don't match level 0 (exact match)
+              # This ensures servers stay on their sticky placement node for specific matches
+              if my_matching_level == 0 do
+                # Level 0 match with specific env var - use local, bypass disk check
+                # (we know it's specific because :any at level 0 is handled above)
+                {_should_skip_local = false, _is_sticky_local = true, my_matching_level}
+              else
+                # Level > 0 match or nil (no match) - skip local to try remote first
+                {_should_skip_local = true, _is_sticky_local = false, my_matching_level}
               end
           end
         end
+
+      child_spec_with_boot_info =
+        case stored_object do
+          {:ok, %{body: body, etag: etag}} ->
+            {module, init_arg, preloaded_boot_info(body, etag, is_sticky_local: is_sticky_local)}
+
+          nil ->
+            child_spec
+        end
+
+      # If we should skip local due to sticky placement, go straight to remote placement
+      cond do
+        should_skip_local ->
+          Logger.info(
+            "Skipping local start for #{key} due to sticky placement mismatch (level=#{inspect(matching_level)}), trying remote placement"
+          )
+
+          await_sticky_placement(
+            supervisor,
+            module,
+            key,
+            stored_object,
+            child_spec_with_boot_info,
+            matching_level,
+            placement_deadline_ms,
+            deadline_ms
+          )
+
+        true ->
+          # Rank new children; persisted children retain their local/sticky path.
+          start_opts =
+            opts
+            |> Keyword.delete(:existing)
+            |> Keyword.put_new(:placement_timeout, nil)
+            |> Keyword.put(:timeout, timeout_option(deadline_ms))
+
+          case __start_child__(
+                 supervisor,
+                 child_spec_with_boot_info,
+                 start_opts
+               ) do
+            {:ok, {pid, meta}} ->
+              {:ok, {pid, meta}}
+
+            {:error, {:already_started, other}} ->
+              normalize_already_started_result(supervisor, key, other, deadline_ms)
+
+            :ignore ->
+              :ignore
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
     end
   end
 
@@ -2507,8 +2537,11 @@ defmodule DurableServer.Supervisor do
         )
 
       {:error, :registry_unavailable} ->
-        # Supervisor is shutting down or the registry is already gone.
-        {:result, fun.()}
+        # The singleflight registries stop before the rest of the tree during
+        # shutdown and are absent while the supervisor is down or restarting.
+        # Running the acquisition here would bypass deduplication and then fail
+        # on the supervisor's missing config table.
+        {:result, {:error, :supervisor_unavailable}}
     end
   end
 
@@ -2533,11 +2566,9 @@ defmodule DurableServer.Supervisor do
     if owner_pid == self() do
       :retry
     else
-      %{max_singleflight_waiters_per_key_module: max_waiters} = __get_config__(supervisor)
-
-      case SingleflightGuard.acquire(supervisor, singleflight_key, wait_timeout_ms, max_waiters) do
-        {:error, :singleflight_overloaded} ->
-          {:result, {:error, :singleflight_overloaded}}
+      case acquire_singleflight_waiter_guard(supervisor, singleflight_key, wait_timeout_ms) do
+        {:error, reason} when reason in [:supervisor_unavailable, :singleflight_overloaded] ->
+          {:result, {:error, reason}}
 
         {:ok, guard_ref} ->
           waiter_ref = make_ref()
@@ -2612,6 +2643,13 @@ defmodule DurableServer.Supervisor do
     end
   rescue
     ArgumentError -> :retry
+  end
+
+  defp acquire_singleflight_waiter_guard(supervisor, singleflight_key, wait_timeout_ms) do
+    with {:ok, %{max_singleflight_waiters_per_key_module: max_waiters}} <-
+           __fetch_config__(supervisor) do
+      SingleflightGuard.acquire(supervisor, singleflight_key, wait_timeout_ms, max_waiters)
+    end
   end
 
   @doc false
@@ -3844,6 +3882,20 @@ defmodule DurableServer.Supervisor do
       [] ->
         raise "DurableServer.Supervisor ets table not found for #{inspect(supervisor_name)}. Make sure the supervisor is started."
     end
+  end
+
+  @doc false
+  # Non-raising config read for acquisition entry points. The table is owned by
+  # the supervisor process, so it is absent while the supervisor is starting,
+  # after it exits, and between a crash and its restart. `:ets.lookup/2` raises
+  # ArgumentError only when the named table does not exist.
+  def __fetch_config__(supervisor_name) do
+    case :ets.lookup(ets_table_name(supervisor_name), :config) do
+      [{:config, config}] -> {:ok, config}
+      [] -> {:error, :supervisor_unavailable}
+    end
+  rescue
+    ArgumentError -> {:error, :supervisor_unavailable}
   end
 
   @doc false
