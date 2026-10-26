@@ -472,15 +472,31 @@ defmodule DurableServer.Supervisor do
       iex> DurableServer.Supervisor.get_server_info(MyDurableSup, "nonexistent")
       {:error, :not_found}
 
+  `{:error, :not_found}` means the store says no state exists. When the state
+  could not be read, after retrying a read error that may pass
+  (#{@stored_read_attempts} attempts in all), it returns
+  `{:error, {:storage_unavailable, reason}}`, which says nothing about whether
+  the server exists.
+
+  ## Options
+
+  - `:consistent` - Read from the store's consistent view rather than the
+    nearest replica. An eventually consistent read can miss state written
+    moments ago, so use `true` before acting on a miss. Default: `false`.
   """
-  def get_server_info(sup_name, key) when is_atom(sup_name) and is_binary(key) do
+  def get_server_info(sup_name, key, opts \\ []) when is_atom(sup_name) and is_binary(key) do
+    opts = Keyword.validate!(opts, consistent: false)
     %{storage_backend: storage_backend, prefix: prefix} = __get_config__(sup_name)
 
-    case DurableServer.fetch_stored_state(
-           storage_backend,
-           %{key: key, prefix: prefix},
-           consistent: false
-         ) do
+    fetch = fn ->
+      DurableServer.fetch_stored_state(
+        storage_backend,
+        %{key: key, prefix: prefix},
+        consistent: Keyword.fetch!(opts, :consistent)
+      )
+    end
+
+    case retry_read(fetch, nil) do
       {:ok, %DurableServer.StoredState{meta: meta, state: user_state, vsn: vsn}} ->
         # Check if server is currently running
         {pid, running} =
@@ -507,8 +523,11 @@ defmodule DurableServer.Supervisor do
 
         {:ok, info}
 
-      {:error, _reason} ->
+      {:error, :not_found} ->
         {:error, :not_found}
+
+      {:error, reason} ->
+        {:error, {:storage_unavailable, reason}}
     end
   end
 
@@ -1041,25 +1060,36 @@ defmodule DurableServer.Supervisor do
   # exist is `:not_found`. Any other failure is retried while it may pass and
   # the caller's deadline allows, then returned as it is: it says nothing about
   # whether the object exists.
-  defp read_stored_object(config, storage_key, consistent, deadline_ms, attempt \\ 1) do
-    case StorageBackend.get_object(config.storage_backend, storage_key, consistent: consistent) do
-      {:ok, %{body: _body, etag: _etag}} = ok ->
-        ok
+  defp read_stored_object(config, storage_key, consistent, deadline_ms) do
+    read = fn ->
+      StorageBackend.get_object(config.storage_backend, storage_key, consistent: consistent)
+    end
 
-      {:error, :not_found} ->
-        :not_found
+    case retry_read(read, deadline_ms) do
+      {:ok, %{body: _body, etag: _etag}} = ok -> ok
+      {:error, :not_found} -> :not_found
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-      {:error, reason} ->
+  # Runs `read` again while it fails for a reason that may pass and the
+  # deadline (`nil` for none) leaves room for the backoff.
+  defp retry_read(read, deadline_ms, attempt \\ 1) do
+    case read.() do
+      {:error, reason} = error when reason != :not_found ->
         delay_ms =
           @stored_read_retry_base_ms * attempt + :rand.uniform(@stored_read_retry_base_ms)
 
         if attempt < @stored_read_attempts and retryable_read_error?(reason) and
              retry_fits_deadline?(deadline_ms, delay_ms) do
           Process.sleep(delay_ms)
-          read_stored_object(config, storage_key, consistent, deadline_ms, attempt + 1)
+          retry_read(read, deadline_ms, attempt + 1)
         else
-          {:error, reason}
+          error
         end
+
+      result ->
+        result
     end
   end
 

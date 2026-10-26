@@ -30,8 +30,9 @@ defmodule DurableServer.ExistingReadErrorTest do
     def ensure_ready(_state), do: :ok
 
     @impl true
-    def get_object(%{table: table}, key, _opts) do
+    def get_object(%{table: table}, key, opts) do
       :ets.update_counter(table, {:reads, key}, 1, {{:reads, key}, 0})
+      :ets.insert(table, {{:read_opts, key}, opts})
 
       case :ets.lookup(table, {:fail, key}) do
         [{_, reason, count}] when count > 0 ->
@@ -102,6 +103,13 @@ defmodule DurableServer.ExistingReadErrorTest do
       case :ets.lookup(table, {:reads, key}) do
         [{_, count}] -> count
         [] -> 0
+      end
+    end
+
+    def read_opts(table, key) do
+      case :ets.lookup(table, {:read_opts, key}) do
+        [{_, opts}] -> opts
+        [] -> nil
       end
     end
 
@@ -217,6 +225,56 @@ defmodule DurableServer.ExistingReadErrorTest do
 
         assert FlakyReadBackend.reads(ctx.table, storage_key) == 1
       end
+    end
+  end
+
+  describe "get_server_info" do
+    test "retries a retryable read error", ctx do
+      key = "info-retry"
+      store(ctx.supervisor, key)
+      storage_key = ctx.prefix <> key
+      reads = FlakyReadBackend.reads(ctx.table, storage_key)
+      FlakyReadBackend.fail_reads(ctx.table, storage_key, :bad_gateway, 1)
+
+      assert {:ok, %{key: ^key, user_state: user_state}} =
+               DurableServer.Supervisor.get_server_info(ctx.supervisor, key)
+
+      assert user_state in [%{count: 1}, %{"count" => 1}]
+      assert FlakyReadBackend.reads(ctx.table, storage_key) - reads == 2
+    end
+
+    test "a read that keeps failing is storage_unavailable, not not_found", ctx do
+      key = "info-unavailable"
+      store(ctx.supervisor, key)
+      storage_key = ctx.prefix <> key
+      reason = %Req.TransportError{reason: :closed}
+      FlakyReadBackend.fail_reads(ctx.table, storage_key, reason, 1_000)
+
+      assert {:error, {:storage_unavailable, ^reason}} =
+               DurableServer.Supervisor.get_server_info(ctx.supervisor, key)
+    end
+
+    test "a definite miss is not_found, read once", ctx do
+      storage_key = ctx.prefix <> "info-missing"
+
+      assert {:error, :not_found} =
+               DurableServer.Supervisor.get_server_info(ctx.supervisor, "info-missing")
+
+      assert FlakyReadBackend.reads(ctx.table, storage_key) == 1
+    end
+
+    test "reads eventually consistent by default, or consistent on request", ctx do
+      key = "info-consistent"
+      store(ctx.supervisor, key)
+      storage_key = ctx.prefix <> key
+
+      assert {:ok, _info} = DurableServer.Supervisor.get_server_info(ctx.supervisor, key)
+      assert FlakyReadBackend.read_opts(ctx.table, storage_key)[:consistent] == false
+
+      assert {:ok, _info} =
+               DurableServer.Supervisor.get_server_info(ctx.supervisor, key, consistent: true)
+
+      assert FlakyReadBackend.read_opts(ctx.table, storage_key)[:consistent] == true
     end
   end
 end
