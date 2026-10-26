@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Stop reporting a stored-state read failure as a missing child. `start_child/3` and `ensure_started_child/3` with `existing: true` returned `{:error, :not_found}` for any read error: a throttled or failed store response, a timeout, a dropped connection, an undecodable object. They now return `{:error, :not_found}` only when the store says the object doesn't exist. A read error that may pass is retried (3 attempts in all, with a short backoff, within the caller's `:timeout`), and one that persists returns `{:error, {:storage_unavailable, reason}}` without starting anything. Without `existing: true`, an unreadable stored state is retried the same way and then starts as before, with the child's init reading and claiming its state itself.
 - Return `{:error, :supervisor_unavailable}` from `ensure_started_child/3`, `start_child/3`, and `rehome_child/3` when the local supervisor is not running, is restarting, or its singleflight registries have already stopped during shutdown. Previously a missing singleflight registry made the acquisition run anyway, outside deduplication, and raise from the supervisor's missing config table. Remote placement treats the result like any other failed target and tries the next node. Graceful shutdown is unchanged: the registries stay up until the Terminator has drained children.
 
 ## 0.1.6 (2026-10-12)
