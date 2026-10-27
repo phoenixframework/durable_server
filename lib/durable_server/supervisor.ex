@@ -480,12 +480,13 @@ defmodule DurableServer.Supervisor do
 
   ## Options
 
-  - `:consistent` - Read from the store's consistent view rather than the
-    nearest replica. An eventually consistent read can miss state written
-    moments ago, so use `true` before acting on a miss. Default: `false`.
+  - `:consistent` - Read from the store's consistent view. With `false`,
+    the read is eventually consistent: cheaper, but it can miss state written
+    moments ago, so a caller that acts on a miss shouldn't use it. Default:
+    `true`.
   """
   def get_server_info(sup_name, key, opts \\ []) when is_atom(sup_name) and is_binary(key) do
-    opts = Keyword.validate!(opts, consistent: false)
+    opts = Keyword.validate!(opts, consistent: true)
     %{storage_backend: storage_backend, prefix: prefix} = __get_config__(sup_name)
 
     fetch = fn ->
@@ -560,7 +561,9 @@ defmodule DurableServer.Supervisor do
     |> Stream.reject(fn %{key: key} -> String.contains?(key, "/__nodes/") end)
     |> Stream.map(fn %{key: storage_key} ->
       key = String.trim_leading(storage_key, prefix)
-      get_server_info(sup_name, key)
+      # The listing is eventually consistent already; a consistent read per
+      # entry would only add load.
+      get_server_info(sup_name, key, consistent: false)
     end)
     |> Stream.filter(fn
       {:ok, _info} -> true

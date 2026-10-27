@@ -263,18 +263,24 @@ defmodule DurableServer.ExistingReadErrorTest do
       assert FlakyReadBackend.reads(ctx.table, storage_key) == 1
     end
 
-    test "reads eventually consistent by default, or consistent on request", ctx do
+    test "reads consistent by default, or eventually consistent on request", ctx do
       key = "info-consistent"
       store(ctx.supervisor, key)
       storage_key = ctx.prefix <> key
 
       assert {:ok, _info} = DurableServer.Supervisor.get_server_info(ctx.supervisor, key)
-      assert FlakyReadBackend.read_opts(ctx.table, storage_key)[:consistent] == false
+      assert FlakyReadBackend.read_opts(ctx.table, storage_key)[:consistent] == true
 
       assert {:ok, _info} =
-               DurableServer.Supervisor.get_server_info(ctx.supervisor, key, consistent: true)
+               DurableServer.Supervisor.get_server_info(ctx.supervisor, key, consistent: false)
 
-      assert FlakyReadBackend.read_opts(ctx.table, storage_key)[:consistent] == true
+      assert FlakyReadBackend.read_opts(ctx.table, storage_key)[:consistent] == false
+
+      # A full listing reads each entry eventually consistent.
+      assert [%{key: ^key}] =
+               Enum.to_list(DurableServer.Supervisor.stream_all_server_info(ctx.supervisor))
+
+      assert FlakyReadBackend.read_opts(ctx.table, storage_key)[:consistent] == false
     end
   end
 end
