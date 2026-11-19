@@ -7,6 +7,7 @@ defmodule DurableServer.SupervisorBackendSpecTest do
   alias DurableServer.Backends.EKVStore
   alias DurableServer.Backends.MirrorStore
   alias DurableServer.StorageBackend
+  alias __MODULE__.RemoteOnlyServer
 
   def throw_not_ready do
     throw({:error, :not_ready})
@@ -202,6 +203,96 @@ defmodule DurableServer.SupervisorBackendSpecTest do
     assert storage_backend.adapter == InMemoryBackend
     assert storage_backend.state.name == :custom
     assert object_store == nil
+  end
+
+  describe "callback modules available only on worker nodes" do
+    setup do
+      supervisor = unique_supervisor_name("remote_module")
+
+      start_supervised!(
+        {DurableServer.Supervisor,
+         name: supervisor,
+         prefix: unique_prefix("remote_module"),
+         backend: {InMemoryBackend, []},
+         max_children: %{RemoteOnlyServer => 0},
+         graceful_shutdown_timeout_ms: 500}
+      )
+
+      refute Code.ensure_loaded?(RemoteOnlyServer)
+      %{supervisor: supervisor}
+    end
+
+    for {behaviour, initial_state} <- [
+          {GenServer, %{count: 0}},
+          {:gen_statem, {:idle, %{count: 0}}}
+        ] do
+      test "returns an existing owner for an unavailable #{behaviour} module", %{
+        supervisor: supervisor
+      } do
+        key = "existing-owner"
+        pid = self()
+        meta = %{count: 1}
+        :ok = Group.register(supervisor, key, %{user_meta: meta})
+        args = [key: key, initial_state: unquote(Macro.escape(initial_state))]
+
+        try do
+          assert {:ok, {^pid, ^meta}} =
+                   DurableServer.Supervisor.ensure_started_child(
+                     supervisor,
+                     {RemoteOnlyServer, args}
+                   )
+
+          assert {:ok, {^pid, ^meta}} =
+                   DurableServer.Supervisor.__ensure_started_child__(
+                     supervisor,
+                     {RemoteOnlyServer, args, nil}
+                   )
+
+          assert {:error, {:already_started, {^pid, ^meta}}} =
+                   DurableServer.Supervisor.start_child(supervisor, {RemoteOnlyServer, args})
+
+          assert {:error, {:already_started, {^pid, ^meta}}} =
+                   DurableServer.Supervisor.__start_child__(
+                     supervisor,
+                     {RemoteOnlyServer, args, nil}
+                   )
+        after
+          Group.unregister(supervisor, key)
+        end
+      end
+
+      for start <- [:start_child, :ensure_started_child] do
+        test "#{start} attempts remote placement for an unavailable #{behaviour} module", %{
+          supervisor: supervisor
+        } do
+          remote = :remote_only_worker@test
+          heartbeat_table = :"durable_server_heartbeats_#{supervisor}"
+
+          :ets.insert(
+            heartbeat_table,
+            {to_string(remote), 1, System.system_time(:millisecond),
+             %{RemoteOnlyServer => %{current: 0, limit: 1}}, nil, %{}, %{}}
+          )
+
+          log =
+            capture_log(fn ->
+              assert {:error, {:capacity_limit, :all_placement_attempts_failed}} =
+                       apply(DurableServer.Supervisor, unquote(start), [
+                         supervisor,
+                         {RemoteOnlyServer,
+                          key: "remote-placement",
+                          initial_state: unquote(Macro.escape(initial_state))},
+                         [placement_timeout: 0, timeout: 1_000]
+                       ])
+            end)
+
+          # The worker is deliberately unreachable; reaching ERPC proves that
+          # local callback inspection did not prevent routing to it.
+          assert log =~ "Attempting to place #{inspect(RemoteOnlyServer)} on remote node"
+          assert log =~ to_string(remote)
+        end
+      end
+    end
   end
 
   test "caps placement ERPC timeout by the caller deadline" do

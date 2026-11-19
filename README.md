@@ -1,6 +1,6 @@
 # DurableServer
 
-DurableServer provides durable, distributed GenServer processes backed by pluggable storage backends.
+DurableServer provides durable, distributed GenServer and `gen_statem` processes backed by pluggable storage backends.
 
 It implements fault-tolerant, stateful processes that can survive node failures, restarts, and deployments by automatically persisting state and coordinating across a distributed cluster.
 
@@ -94,10 +94,74 @@ GenServer.call(pid, :increment)  # => 2
 GenServer.call(pid, :get_count)  # => 2
 ```
 
-`:initial_state` is required and must be a map. On first boot, DurableServer
+For GenServers, `:initial_state` is required and must be a map. On first boot, DurableServer
 passes it through `dump_state/1`, the configured backend's encode/decode path,
 and then `load_state/2` before `init/1` or `init/2`. The dumped initial state
 must therefore be encodable by your configured backend.
+
+## State Machines
+
+Opt in with `use DurableServer, vsn: 1, behaviour: :gen_statem`. The process runs
+on OTP's native [`gen_statem`](https://www.erlang.org/doc/apps/stdlib/gen_statem.html)
+engine, with state entry callbacks, postponed events, inserted events, named
+timeouts, and state timeouts. Implement `callback_mode/0` to select
+`:handle_event_function` or `:state_functions`, optionally with `:state_enter`,
+just as with native `gen_statem`.
+The `:behaviour` option accepts `GenServer` (the default) or `:gen_statem`.
+
+```elixir
+defmodule DurableSwitch do
+  use DurableServer, vsn: 1, behaviour: :gen_statem
+
+  def callback_mode, do: :handle_event_function
+
+  # The state name and data are persisted together, using your chosen encoding.
+  def dump_state({state, count}), do: %{"state" => Atom.to_string(state), "count" => count}
+  def load_state(_, %{"state" => "off", "count" => count}), do: {:off, count}
+  def load_state(_, %{"state" => "on", "count" => count}), do: {:on, count}
+
+  def init({state, count}) do
+    {:ok, state, count, [{:durable, [permanent: true]}]}
+  end
+
+  def handle_event({:call, from}, :toggle, state, count) do
+    next = if state == :off, do: :on, else: :off
+
+    {:next_state, next, count + 1,
+     [{:durable, [sync: true, meta: %{state: next}]}, {:reply, from, next}]}
+  end
+end
+
+{:ok, {pid, _meta}} = DurableServer.Supervisor.start_child(
+  MyDurableSup,
+  {DurableSwitch, key: "switch_123", initial_state: {:off, 0}}
+)
+
+:gen_statem.call(pid, :toggle) # => :on
+```
+
+`:initial_state`, `load_state/2`, and `dump_state/1` use `{state_name, data}`.
+The data can be any term your serialization callbacks can encode into a plain
+map. Without a custom `init/1`, the loaded pair becomes the initial state and
+data. `init/2` is also supported and receives the usual supervisor info map.
+
+Use `{:durable, options}` in a native action list for durability options:
+
+- In `init/1` or `init/2`: `:auto_sync`, `:sync_every_ms`, `:meta`, and `:permanent`.
+- In event callbacks: `:sync` and `:meta`.
+
+`sync: true` persists the transition before any native actions execute, including
+replies and `:next_event`. A failed explicit write terminates the owner without
+running those actions. `handle_sync/3` receives the old and new state/data pairs
+and has the same post-write semantics as with GenServer. Native timers and
+postponed events remain in memory; reconstruct any required work on cold starts.
+
+Use the supervisor's existing lifecycle API for stopping, deleting, and cordoning.
+Supervisor stop calls wait for `terminate/3` and final persistence. A user callback's
+native `:stop_and_reply` retains OTP's reply-before-termination semantics.
+`code_change/4` receives the state name and data separately for hot upgrades.
+For inspection, `:sys.get_state/1` returns
+`{state_name, %DurableServer{user_state: {state_name, data}}}`.
 
 ## Administrative Cordon
 

@@ -2612,6 +2612,13 @@ defmodule DurableServer.LifecycleManager do
 
   defp try_restart_child(%LifecycleManager{} = state, {module, init_arg}, preloaded) do
     if Code.ensure_loaded?(module) do
+      # Recovery loads the real state from the preloaded object. Keep the unused
+      # initial-state placeholder compatible with the child's callback engine.
+      init_arg =
+        if DurableServer.__callback_behaviour__(module) == :gen_statem,
+          do: Keyword.put(init_arg, :initial_state, {nil, nil}),
+          else: init_arg
+
       # note: we must pass max_placement_retries: 0 to prevent remote placement
       # because lifecycle manager is only concered with its own local node
       DurableServer.Supervisor.__start_child__(
