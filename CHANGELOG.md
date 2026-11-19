@@ -1,3 +1,8 @@
+## 0.1.8 (2026-11-19)
+
+- Add durable state machines backed by native `:gen_statem`. A module selects `GenServer` or `:gen_statem` with the `:behaviour` option (`GenServer` stays the default), and state machines use the same supervisor, persistence, placement and lifecycle APIs. Both `handle_event_function` and `state_functions` callback modes are supported, with state-entry callbacks; the state name and data are persisted together as `{state_name, data}` through `dump_state/1` and `load_state/2`.
+- Require Group `~> 0.3.2`.
+
 ## 0.1.7 (2026-10-26)
 
 - Stop reporting a stored-state read failure as a missing child. `start_child/3` and `ensure_started_child/3` with `existing: true` returned `{:error, :not_found}` for any read error: a throttled or failed store response, a timeout, a dropped connection, an undecodable object. They now return `{:error, :not_found}` only when the store says the object doesn't exist. A read error that may pass is retried (3 attempts in all, with a short backoff, within the caller's `:timeout`), and one that persists returns `{:error, {:storage_unavailable, reason}}` without starting anything. Without `existing: true`, an unreadable stored state is retried the same way and then starts as before, with the child's init reading and claiming its state itself.

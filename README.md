@@ -23,7 +23,7 @@ Add `durable_server` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:durable_server, "~> 0.1.7"}
+    {:durable_server, "~> 0.1.8"}
   ]
 end
 ```
