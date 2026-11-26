@@ -697,7 +697,7 @@ defmodule DurableServer.LifecycleTest do
       do: StorageBackend.unsubscribe(delegate, subscription_ref)
   end
 
-  setup do
+  setup context do
     # Create test supervisor for this test
     supervisor_name = :"test_supervisor_#{DurableServer.UUID.uuid4()}"
     prefix = "test_#{DurableServer.UUID.uuid4()}/"
@@ -705,7 +705,8 @@ defmodule DurableServer.LifecycleTest do
     _supervisor_pid =
       start_supervised!({
         DurableServer.Supervisor,
-        name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()
+        [name: supervisor_name, prefix: prefix, object_store: test_object_store_opts()] ++
+          Map.get(context, :discovery_opts, [])
       })
 
     object_store = test_object_store()
@@ -752,6 +753,172 @@ defmodule DurableServer.LifecycleTest do
       {:error, reason} ->
         {:skip, "Failed to create test bucket: #{inspect(reason)}"}
     end
+  end
+
+  describe "discovery skip cache" do
+    @describetag discovery_opts: [
+                   discovery_burst_count: 0,
+                   initial_discovery_delay_ms: 60_000,
+                   discovery_interval_ms: 60_000
+                 ]
+
+    setup %{supervisor_name: name} do
+      {:ok, manager} = get_supervisor_lifecycle_manager(name)
+      %{storage_backend: backend} = DurableServer.Supervisor.__get_config__(name)
+      %{manager: manager, cache: :sys.get_state(manager).discovery_skip_table, backend: backend}
+    end
+
+    test "keeps listed stopped records across sweeps and restarts when their ETag changes",
+         %{
+           manager: manager,
+           cache: cache,
+           backend: backend,
+           supervisor_name: name,
+           prefix: prefix
+         } do
+      key = "stopped"
+
+      pid = start_test_server(name, key)
+      assert GenServer.call(pid, :increment) == 1
+      ref = Process.monitor(pid)
+      assert :ok = DurableServer.Supervisor.terminate_child_permanent(name, pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+      assert {:ok, %{etag: etag} = record} =
+               DurableServer.fetch_stored_state(backend, %{key: key, prefix: prefix})
+
+      gets = :counters.new(1, [])
+      handler = make_ref()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:finch, :request, :start],
+          fn _, _, %{request: request}, {suffix, gets} ->
+            if request.method == "GET" and String.ends_with?(request.path, suffix) do
+              :counters.add(gets, 1, 1)
+            end
+          end,
+          {"/" <> prefix <> key, gets}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      discover(manager)
+      assert :counters.get(gets, 1) > 0
+      assert [{^key, ^etag, _, _}] = :ets.lookup(cache, key)
+
+      # Recent observations need no ETS write. Only age the timestamp to exercise the real sweeper.
+      recent = System.monotonic_time(:millisecond) - :timer.seconds(30)
+      :ets.update_element(cache, key, {4, recent})
+      discover(manager)
+      assert [{^key, ^etag, _, ^recent}] = :ets.lookup(cache, key)
+
+      :ets.update_element(cache, key, {4, recent - :timer.minutes(11)})
+      gets_before_renewal = :counters.get(gets, 1)
+      discover(manager)
+      assert :counters.get(gets, 1) == gets_before_renewal
+      send(manager, :sweep_discovery_skip_set)
+      :sys.get_state(manager)
+      assert [{^key, ^etag, _, _}] = :ets.lookup(cache, key)
+
+      restartable = %{record | meta: %{record.meta | permanent: true, status: :stopped_graceful}}
+
+      assert {:ok, %{etag: new_etag}} =
+               DurableServer.StorageBackend.put_object(backend, prefix <> key, restartable)
+
+      assert new_etag != etag
+      discover(manager)
+      assert {pid, _} = DurableServer.Supervisor.lookup(name, key)
+      assert GenServer.call(pid, :get_count) == 1
+    end
+
+    test "caches the version that was read when an object changes between LIST and GET",
+         %{manager: manager, cache: cache, backend: backend, prefix: prefix} do
+      key = "changing"
+      record = %DurableServer.StoredState{vsn: 1, state: %{}, meta: %Meta{permanent: false}}
+
+      assert {:ok, %{etag: listed}} =
+               DurableServer.StorageBackend.put_object(backend, prefix <> key, record)
+
+      ref = make_ref()
+      test_pid = self()
+
+      :telemetry.attach(
+        ref,
+        [:finch, :request, :start],
+        fn _, _, %{request: request}, _ ->
+          if request.method == "GET" and String.ends_with?(request.path, "/" <> prefix <> key) do
+            send(test_pid, {:reading, ref, self()})
+
+            receive do
+              ^ref -> :ok
+            after
+              5_000 -> :ok
+            end
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      send(manager, :discover_and_restart)
+      assert_receive {:reading, ^ref, reader}, 5_000
+      :telemetry.detach(ref)
+
+      assert {:ok, %{etag: fetched}} =
+               DurableServer.StorageBackend.put_object(backend, prefix <> key, %{
+                 record
+                 | state: %{"updated" => true}
+               })
+
+      assert fetched != listed
+      send(reader, ref)
+      wait_for_discovery_completion(manager, 5_000)
+      assert [{^key, ^fetched, _, _}] = :ets.lookup(cache, key)
+    end
+
+    test "sweeps deleted records and retries unavailable modules with unchanged ETags",
+         %{manager: manager, cache: cache, backend: backend, prefix: prefix} do
+      records = [
+        {"deleted", TestServer, :stopped_permanent},
+        {"retry", MissingModule, :stopped_graceful}
+      ]
+
+      for {key, module, status} <- records do
+        record = %DurableServer.StoredState{
+          vsn: 1,
+          state: %{},
+          meta: %Meta{module: module, permanent: true, status: status}
+        }
+
+        assert {:ok, _} = DurableServer.StorageBackend.put_object(backend, prefix <> key, record)
+      end
+
+      discover(manager)
+      assert :ok = DurableServer.StorageBackend.delete_object(backend, prefix <> "deleted")
+
+      for {key, _, _} <- records do
+        assert :ets.update_element(
+                 cache,
+                 key,
+                 {4, System.monotonic_time(:millisecond) - :timer.minutes(11)}
+               )
+      end
+
+      discover(manager)
+      send(manager, :sweep_discovery_skip_set)
+      :sys.get_state(manager)
+      assert :ets.tab2list(cache) == []
+      discover(manager)
+      assert [{"retry", _, _, _}] = :ets.tab2list(cache)
+    end
+  end
+
+  defp discover(manager) do
+    send(manager, :discover_and_restart)
+    wait_for_discovery_completion(manager, 5_000)
   end
 
   describe "stop modes" do

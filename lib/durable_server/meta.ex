@@ -317,6 +317,12 @@ defmodule DurableServer.Meta do
 
   def permanently_crashed?(%Meta{} = meta), do: meta.status == @permanently_crashed
 
+  def automatic_restart_disabled?(%Meta{permanent: false}), do: true
+
+  def automatic_restart_disabled?(%Meta{permanent: true, status: status}) do
+    status in [@deleting, @cordoned, @permanently_crashed, @stopped_permanent]
+  end
+
   def put_status(%Meta{} = meta, status) when status in @statuses do
     %{meta | status: status}
   end

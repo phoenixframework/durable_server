@@ -6,6 +6,17 @@ defmodule DurableServer.MetaTest do
 
   @context %{key: "server-key", prefix: "tenant/"}
 
+  test "stored metadata can disable automatic restart" do
+    for status <- [:running, :crashed, :stopped_graceful] do
+      assert Meta.automatic_restart_disabled?(%Meta{permanent: false, status: status})
+      refute Meta.automatic_restart_disabled?(%Meta{permanent: true, status: status})
+    end
+
+    for status <- [:deleting, :cordoned, :permanently_crashed, :stopped_permanent] do
+      assert Meta.automatic_restart_disabled?(%Meta{permanent: true, status: status})
+    end
+  end
+
   test "round-trips valid metadata through the hardened decoder" do
     meta = %Meta{
       module: __MODULE__,
