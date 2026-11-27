@@ -2040,7 +2040,7 @@ defmodule DurableServer.LifecycleManager do
     end
 
     # list all keys with this supervisor's prefix, but exclude __nodes/ heartbeat objects
-    StorageBackend.list_all_objects_stream(state.object_store, state.prefix,
+    DurableServer.DiscoveryListing.stream(state.supervisor_name, state.object_store, state.prefix,
       consistent: false,
       include_objects: true,
       error_handler: fn reason ->
