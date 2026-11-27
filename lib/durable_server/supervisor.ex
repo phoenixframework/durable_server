@@ -75,6 +75,10 @@ defmodule DurableServer.Supervisor do
   - `:initial_discovery_delay_ms` - Initial delay before the first discovery sweep.
     Accepts either a fixed integer delay or a `{min_ms, max_ms}` jitter tuple
     (default: `{1_000, 6_000}`)
+  - `:shared_discovery` - Set to true to share S3 discovery LIST pages (default: false).
+    When three or more compatible nodes opt in, two serve pages and every node evaluates the
+    keys locally. A follower may reuse a page up to one discovery interval old, once per node.
+    If a scanner goes away, discovery continues from the same cursor directly against S3.
   - `:discovery_burst_count` - Number of initial discovery sweeps to run back-to-back
     without waiting for the discovery interval (default: 3)
   - `:discovery_shuffle_batch_size` - Number of candidate keys to accumulate before
@@ -3549,6 +3553,7 @@ defmodule DurableServer.Supervisor do
         :max_disk,
         :discovery_interval_ms,
         :initial_discovery_delay_ms,
+        :shared_discovery,
         :discovery_burst_count,
         :discovery_shuffle_batch_size,
         :parallel_restart_batch_size,
@@ -3890,6 +3895,9 @@ defmodule DurableServer.Supervisor do
            keys: :duplicate, name: ensure_started_singleflight_waiters_registry_name(name)},
           {SingleflightGuard, supervisor_name: name},
           {Task.Supervisor, name: task_sup_name},
+          {DurableServer.DiscoveryListing,
+           {name, storage_backend, prefix, discovery_interval_ms,
+            Keyword.get(opts, :shared_discovery, false)}},
           {DynamicSupervisor,
            name: dynamic_sup_name,
            strategy: :one_for_one,
